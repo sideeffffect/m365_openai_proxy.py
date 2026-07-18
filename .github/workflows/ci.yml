@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: python -m pip install --upgrade ruff
+
+      - name: ruff check
+        run: ruff check .
+
+  compatibility:
+    name: Smoke test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The script is stdlib-only by design (see README's "Requirements"
+      # section) -- no `pip install` step here on purpose.
+      - name: Compile check
+        run: python -m py_compile m365_openai_proxy.py
+
+      # Imports the module (exercising the pure-Python AES-256-GCM
+      # self-check assertion at line ~380) and validates argument parsing.
+      - name: Run --help
+        run: python m365_openai_proxy.py --help
