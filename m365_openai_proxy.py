@@ -286,10 +286,21 @@ KNOWN LIMITATIONS
       context instead of a fabricated assistant/tool history entry fixed
       this specific failure mode.
   See REVERSE_ENGINEERING.md's "Tool-calling emulation" section for the
-  full trial-by-trial account. Net assessment: usable for occasional/low-
-  stakes tool use, but NOT reliable enough to assume a long agentic loop
-  (the kind OpenCode or OpenHands actually run -- many tool calls in a row)
-  will complete without derailing into a plain-text non-call at some point.
+  full trial-by-trial account. **Real end-to-end testing against the actual
+  OpenHands CLI and OpenCode CLI** (not just synthetic curl requests)
+  found a stark asymmetry, documented in REVERSE_ENGINEERING.md's
+  "production-scale end-to-end validation" section: OpenHands CLI achieved
+  one genuine, fully verified success (the agent read a real file, edited
+  it for real via a real tool call, and gave a correct final summary) out
+  of two full sessions tried; OpenCode CLI failed in all three full
+  sessions tried (never once produced a working tool call), even after
+  adding a recency-bias mitigation and raising the retry budget to 5 -- its
+  real system prompt plus full tool schema list runs 30-40KB, and neither
+  fix changed the outcome. Net assessment, revised in light of this: usable
+  for occasional/low-stakes tool use and has demonstrated real (if
+  unreliable) success with OpenHands specifically, but should NOT be
+  assumed to work with OpenCode as currently implemented, and NOT be relied
+  on for any long unattended agentic loop regardless of client.
   Sydney's own REAL tool-invocation mechanism (Local MCP, over the same
   Chathub connection -- `mcp_discover`/`mcp_describe`/`invoke_local_plugin`
   SignalR targets, reverse-engineered from the officeweb client's own
@@ -376,7 +387,7 @@ import uuid
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.5"
+PROXY_VERSION = "0.6"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -2053,6 +2064,28 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
             lines.append(f"{label}: {text}")
         lines.append("")
     last_label, last_text = turns[-1]
+    if tools_block:
+        # Repeat a SHORT version of the instructions block immediately before
+        # the final message, in addition to the full version placed earlier
+        # (see `tools_block` above). This is a deliberate recency-bias
+        # mitigation, not redundancy for its own sake: real coding-agent
+        # system prompts (OpenCode's, OpenHands') run 30-60KB+ once their
+        # full tool schema list is included, which puts a lot of unrelated
+        # content between the original reminder and the point where the
+        # model actually starts generating -- live-tested during development
+        # to correlate with the convention being followed far less reliably
+        # at that scale than in this proxy's small (~2KB) test prompts (see
+        # REVERSE_ENGINEERING.md's "Tool-calling emulation at production
+        # scale" section). Kept short on purpose so it doesn't itself become
+        # a wall of buried text.
+        lines.append(
+            "### Reminder before you reply\n"
+            "You have no internet access or code execution this turn. If you "
+            "need information or to take an action, reply with ONLY one or "
+            f"more {_TOOL_CALL_OPEN}...{_TOOL_CALL_CLOSE} blocks as described "
+            "above and nothing else. Otherwise, reply normally in plain text."
+        )
+        lines.append("")
     lines.append("### Respond to this message")
     lines.append(f"{last_label}: {last_text}")
     return "\n".join(lines)

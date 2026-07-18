@@ -54,7 +54,8 @@ sections below are where that lives.
   synchronous and mid-turn with a server-side timeout; OpenAI tool-calling is
   asynchronous across separate HTTP requests) — see that section for the
   full writeup and why this is a real next-phase project, not a quick patch.
-- **Tool-calling emulation (implemented, IS shipped, but probabilistic)**:
+- **Tool-calling emulation (implemented, IS shipped, but probabilistic --
+  and validated end-to-end against real CLIs, with a real asymmetry)**:
   instead of the Local MCP bridge above, `m365_openai_proxy.py` emulates
   OpenAI `tools`/`tool_calls` entirely by prompting — inject a plain-text
   convention (`<action_request>{"name":...,"arguments":{...}}
@@ -65,10 +66,15 @@ sections below are where that lives.
   can't be controlled) measurably makes this worse — this proxy launders
   that word out and retries up to 3x per turn, which helps substantially
   but still tops out around a coin-flip on a single attempt even under the
-  best measured conditions. See the "tool-calling emulation implemented and
-  live-tested" update for the full trial-by-trial account, including a
-  separate refusal-triggering failure mode (found and fixed) around how a
-  tool *result* gets rendered back into the conversation on the next turn.
+  best measured conditions. **Real end-to-end testing against the actual
+  OpenHands and OpenCode CLIs** (not just synthetic curl requests) found: 1
+  of 2 full OpenHands sessions succeeded completely and verifiably (a real
+  file was read and edited via real tool calls, confirmed on disk); 0 of 3
+  full OpenCode sessions succeeded, even after adding a recency-bias
+  mitigation and raising the retry budget to 5 — see the "production-scale
+  end-to-end validation" update near the end of this document. Treat
+  OpenHands as demonstrated-but-unreliable and OpenCode as
+  not-currently-working, not both as equally "probabilistic."
 - **Not actually in this repo**: none of the `.har` capture files or
   `Chathub.log.jsonl` referenced throughout this document were ever committed
   (they carry live session cookies/tokens and are `.gitignore`d) — this
@@ -1305,3 +1311,193 @@ source -- treat it as a strong empirical pattern, not a proven mechanism.
   the margin beyond avoiding "tool" -- only one alternative phrasing/tag
   pair was tried once it started working; no systematic sweep across
   taggings was done.
+
+## Update: production-scale end-to-end validation against real OpenCode and OpenHands CLIs
+
+Everything in the "tool-calling emulation implemented and live-tested"
+section above was validated with synthetic curl requests against
+`/v1/chat/completions` directly -- small, hand-written `messages`/`tools`
+payloads (a few hundred bytes to ~2KB) meant to isolate one variable at a
+time. That is not the same thing as "this works with a real coding agent."
+Following the user's explicit correction ("forget aider, we need a working
+opencode (or similar tools, like OpenHands CLI)... seems like the best way
+would be to emulate the tool-calling"), both real CLIs were actually
+installed and run end-to-end against a live instance of this proxy, on the
+same simple task each time: *"Read main.py and add a subtract(a, b)
+function that returns a - b. Then print the final contents of main.py."*
+against a real two-line `main.py` on disk, with the file's actual on-disk
+state checked afterward as the ground truth (not just the CLI's own
+claimed summary).
+
+### OpenHands CLI: real success, but unreliable (1 of 2 full sessions)
+
+Installed via `pip`/the `openhands` console script already present
+(`openhands` 1.13.1). Invoked as:
+
+```bash
+LLM_API_KEY=sk-unused LLM_BASE_URL=http://127.0.0.1:8123/v1 \
+  LLM_MODEL=openai/m365-copilot \
+  openhands --headless --json --override-with-envs --always-approve \
+  -t "Read main.py and add a subtract(a, b) function that returns a - b. Then print the final contents of main.py."
+```
+
+(`--override-with-envs` makes OpenHands read `LLM_BASE_URL`/`LLM_MODEL`/
+`LLM_API_KEY` instead of its normal `~/.openhands` settings -- the only
+config surface needed; no `config.toml` required.)
+
+- **Session 1**: the agent's single real "main turn" request carried the
+  full OpenHands system prompt (`<ROLE>`/`<MEMORY>`/`<EFFICIENCY>`/
+  `<FILE_SYSTEM_GUIDELINES>`/`<CODE_QUALITY>`/etc. -- OpenHands' actual,
+  unmodified production system prompt) plus 6 tool schemas, rendering to
+  **59,393 characters**. All 3 internal retry attempts failed to produce an
+  `<action_request>` block; this proxy correctly fell back to plain content,
+  but that plain content was Sydney inventing an answer ("I can't see the
+  repository or the correct `main.py` file from here...") with no basis in
+  reality -- the file was never touched. OpenHands displayed this
+  incorrect answer as its final message and exited. **Full failure.**
+- **Session 2**: same task, fresh conversation, same proxy, no code
+  changes. This time the captured final request's own "conversation so
+  far" showed the agent had ALREADY succeeded on two earlier tool calls
+  within the same session -- a real `terminal`/execute-bash call to `cat`
+  the file, and a real `file_editor` call that actually edited it (its own
+  tool result was a `cat -n` snippet showing the `subtract` function
+  correctly inserted). Checking `main.py` on disk afterward confirmed
+  it: the file genuinely now contained the added function. The final
+  request (asking the model to just summarize, given tools were still
+  offered) itself failed all 3 retry attempts and fell back to plain
+  content -- but in this case the plain-text fallback WAS the correct
+  final answer ("The change looks correct. The final contents of `main.py`
+  are: ..."), since summarizing needs no tool call at all. **Full,
+  independently verified success**: two real tool calls executed correctly
+  against the real file, correct final summary, file modified on disk
+  exactly as asked.
+
+Net for OpenHands: 1 of 2 full sessions succeeded completely and
+verifiably; the other failed completely. This is a small sample (n=2) but
+consistent with the "roughly a coin flip per attempt, better but not
+perfect with retries" characterization already documented above --
+multiple independent tool calls within a working session compounds that
+per-attempt uncertainty, so whether a given session succeeds end-to-end
+depends on every individual call in the chain landing on the "convention
+followed" side.
+
+### OpenCode CLI: 0 of 3 full sessions succeeded, even after two attempted fixes
+
+Installed via `npm install opencode-ai@1.18.3` (its postinstall script,
+which downloads the actual platform binary, needed to be run manually once
+due to npm's script-approval prompt in this environment) then configured as
+a custom OpenAI-compatible provider:
+
+```json title="opencode.json"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "m365": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "M365 Copilot (local proxy)",
+      "options": { "baseURL": "http://127.0.0.1:8123/v1", "apiKey": "sk-unused" },
+      "models": { "m365-copilot": { "name": "M365 Copilot" } }
+    }
+  },
+  "model": "m365/m365-copilot"
+}
+```
+
+```bash
+opencode run --auto -m m365/m365-copilot \
+  "Read main.py and add a subtract(a, b) function that returns a - b. Then print the final contents of main.py."
+```
+
+(`--auto` auto-approves permissions so it runs fully headless; `options.
+apiKey` set directly in the config means no `/connect`/`auth.json` step is
+needed at all, since this proxy ignores the key's value entirely.)
+
+- **Session 1** (baseline, before either fix below): the real main-turn
+  request carried OpenCode's own system prompt plus 10 tool schemas,
+  rendering to **36,869 characters**. All 3 retry attempts failed; fell
+  back to plain content. Sydney's own code interpreter self-preempted
+  again, this time in an unusually elaborate way -- it wrote and ran an
+  actual Python snippet searching for `main.py` with `pathlib.Path.rglob`
+  inside its OWN sandboxed environment (which of course could never see
+  the user's real file), got `NO_MAIN_PY`, and reported that as the answer.
+  `main.py` on disk was untouched. **Full failure.**
+- **Fix attempted**: a recency-bias mitigation was added to
+  `_render_conversation_prompt()` -- a short reminder of the
+  `<action_request>` convention repeated immediately before the final
+  "Respond to this message" section, in addition to the original full
+  instructions block placed earlier (see `_render_conversation_prompt`'s
+  updated docstring and inline comment). Rationale: a 30-60KB rendered
+  prompt puts a lot of unrelated content between the original reminder and
+  the point of generation, which is exactly the situation where LLMs are
+  known to weight recent context more heavily than distant context.
+- **Session 2** (same task, same proxy, with the recency-bias fix, fresh
+  session/file): all 3 retry attempts failed again -- this time as the flat
+  refusal ("Hmm...it looks like I can't chat about this...") rather than
+  code-interpreter self-preemption, so the SHAPE of the failure changed but
+  the outcome didn't. `main.py` untouched. **Full failure.**
+- **Second fix attempted**: `_TOOL_CALL_MAX_ATTEMPTS` temporarily raised
+  from 3 to 5, to test whether OpenCode's case just needed a larger retry
+  budget rather than a different prompt structure.
+- **Session 3** (same task, same proxy, recency-bias fix AND 5 retry
+  attempts): all 5 attempts failed (confirmed via the log: "attempt 1/5"
+  through "attempt 5/5", each logged individually), same flat refusal as
+  session 2. `main.py` untouched. **Full failure.** `_TOOL_CALL_MAX_ATTEMPTS`
+  was reverted back to 3 afterward, since 5 attempts cost noticeably more
+  latency (roughly +15-25s per turn) with zero observed benefit in this
+  trial.
+
+Net for OpenCode: **0 of 3 full sessions succeeded**, across two
+genuinely different failure shapes (code-interpreter self-preemption,
+flat refusal) and two different attempted fixes (recency mitigation, more
+retries), neither of which changed the outcome. This is a small sample
+(n=3) and does not prove the emulation can NEVER work with OpenCode, but it
+is a real, reproduced pattern, not a one-off fluke -- treat "OpenCode does
+not currently work against this proxy" as the honest, evidence-based
+default assumption rather than "probably works with some tuning."
+
+### Why might OpenCode fare worse than OpenHands? (speculative, unconfirmed)
+
+Both system prompts are large (OpenHands ~59KB w/ 6 tools measured;
+OpenCode ~37KB w/ 10 tools measured) and both got the same
+`_neutralize_tool_word()` and recency-bias treatment. Two differences stood
+out but were NOT isolated/confirmed as causal:
+- OpenCode's system prompt and tool set appeared to lean more heavily on
+  framing the agent as directly, autonomously executing code/commands
+  (consistent with its self-written Python-snippet-searching-for-the-file
+  behavior in session 1) -- if so, that framing may itself be pulling
+  Sydney toward reaching for its OWN code interpreter regardless of what
+  this proxy's injected instructions say, independent of anything
+  keyword-related.
+- OpenCode's 10 tools vs. OpenHands' 6 means proportionally more of the
+  rendered prompt is tool-schema JSON (which cannot be neutralized/
+  shortened without breaking the schema this proxy needs to echo back
+  faithfully), further diluting the instructional text relative to
+  content that looks like "this agent runs code."
+
+Neither theory was tested in isolation (e.g., stripping OpenCode's tool
+count down to 1-2 to see if that alone flips the outcome) -- flagged as the
+natural next experiment if this is worth pursuing further, rather than
+something already ruled in or out.
+
+### Net assessment after this validation
+
+- This proxy's tool-calling emulation has now been shown to produce a
+  **real, independently verified, correct end-to-end result** (a file
+  genuinely read and edited via real tool calls) with a real production
+  coding-agent CLI (OpenHands) -- this is a materially stronger claim than
+  the earlier section's synthetic curl-only trials, and is the strongest
+  evidence yet that the overall approach (prompt-level tool-calling
+  emulation on a backend with none natively) is viable in principle for
+  this backend.
+- The same approach has NOT been shown to work with OpenCode specifically,
+  across 3 independent attempts and 2 different fixes. Given the user's
+  original ask named OpenCode as the primary target, this is a real,
+  currently-unresolved gap, not a hypothetical one.
+- If OpenCode support specifically is worth pursuing further, the two
+  untested hypotheses above (tool-count/schema-size dilution; OpenCode's
+  "autonomous execution" framing specifically, independent of prompt size)
+  are the next things to isolate -- ideally by constructing a synthetic
+  prompt that mimics OpenCode's real one but varies one of these two
+  factors at a time, rather than more trial-and-error against the full
+  real CLI (each full OpenCode session costs several minutes and several
+  Sydney round trips just to get one data point).
