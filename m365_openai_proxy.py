@@ -287,20 +287,25 @@ KNOWN LIMITATIONS
       this specific failure mode.
   See REVERSE_ENGINEERING.md's "Tool-calling emulation" section for the
   full trial-by-trial account. **Real end-to-end testing against the actual
-  OpenHands CLI and OpenCode CLI** (not just synthetic curl requests)
+  OpenHands, OpenCode, and Goose CLIs** (not just synthetic curl requests)
   found a stark asymmetry, documented in REVERSE_ENGINEERING.md's
-  "production-scale end-to-end validation" section: OpenHands CLI achieved
-  one genuine, fully verified success (the agent read a real file, edited
-  it for real via a real tool call, and gave a correct final summary) out
-  of two full sessions tried; OpenCode CLI failed in all three full
-  sessions tried (never once produced a working tool call), even after
-  adding a recency-bias mitigation and raising the retry budget to 5 -- its
-  real system prompt plus full tool schema list runs 30-40KB, and neither
-  fix changed the outcome. Net assessment, revised in light of this: usable
-  for occasional/low-stakes tool use and has demonstrated real (if
-  unreliable) success with OpenHands specifically, but should NOT be
-  assumed to work with OpenCode as currently implemented, and NOT be relied
-  on for any long unattended agentic loop regardless of client.
+  "production-scale end-to-end validation" and "Goose CLI validation"
+  sections: OpenHands CLI achieved one genuine, fully verified success (the
+  agent read a real file, edited it for real via a real tool call, and gave
+  a correct final summary) out of two full sessions tried; OpenCode CLI
+  failed in all three full sessions tried (never once produced a working
+  tool call), even after adding a recency-bias mitigation and raising the
+  retry budget to 5 -- its real system prompt plus full tool schema list
+  runs 30-40KB; Goose CLI failed in all four full sessions tried, across
+  two different tool-count configurations (18 tools -> flat refusal; 5
+  tools -> code-interpreter self-preemption instead), suggesting tool
+  count/prompt size affects *which* avoidance behavior Sydney reaches for
+  without being sufficient on its own to fix the underlying problem. Net
+  assessment, revised in light of this: usable for occasional/low-stakes
+  tool use and has demonstrated real (if unreliable) success with OpenHands
+  specifically, but should NOT be assumed to work with OpenCode or Goose as
+  currently implemented, and NOT be relied on for any long unattended
+  agentic loop regardless of client.
   Sydney's own REAL tool-invocation mechanism (Local MCP, over the same
   Chathub connection -- `mcp_discover`/`mcp_describe`/`invoke_local_plugin`
   SignalR targets, reverse-engineered from the officeweb client's own

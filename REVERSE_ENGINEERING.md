@@ -67,14 +67,17 @@ sections below are where that lives.
   that word out and retries up to 3x per turn, which helps substantially
   but still tops out around a coin-flip on a single attempt even under the
   best measured conditions. **Real end-to-end testing against the actual
-  OpenHands and OpenCode CLIs** (not just synthetic curl requests) found: 1
-  of 2 full OpenHands sessions succeeded completely and verifiably (a real
-  file was read and edited via real tool calls, confirmed on disk); 0 of 3
-  full OpenCode sessions succeeded, even after adding a recency-bias
-  mitigation and raising the retry budget to 5 — see the "production-scale
-  end-to-end validation" update near the end of this document. Treat
-  OpenHands as demonstrated-but-unreliable and OpenCode as
-  not-currently-working, not both as equally "probabilistic."
+  OpenHands, OpenCode, and Goose CLIs** (not just synthetic curl requests)
+  found: 1 of 2 full OpenHands sessions succeeded completely and verifiably
+  (a real file was read and edited via real tool calls, confirmed on disk);
+  0 of 3 full OpenCode sessions succeeded, even after adding a recency-bias
+  mitigation and raising the retry budget to 5; 0 of 4 full Goose sessions
+  succeeded, across two different tool-count configurations (18 tools →
+  flat refusal; 5 tools → code-interpreter self-preemption) — see the
+  "production-scale end-to-end validation" and "Goose CLI validation"
+  updates near the end of this document. Treat OpenHands as demonstrated-
+  but-unreliable and OpenCode/Goose as not-currently-working, not all three
+  as equally "probabilistic."
 - **Not actually in this repo**: none of the `.har` capture files or
   `Chathub.log.jsonl` referenced throughout this document were ever committed
   (they carry live session cookies/tokens and are `.gitignore`d) — this
@@ -1501,3 +1504,97 @@ something already ruled in or out.
   factors at a time, rather than more trial-and-error against the full
   real CLI (each full OpenCode session costs several minutes and several
   Sydney round trips just to get one data point).
+
+## Update: Goose CLI validation -- 0 of 4 sessions succeeded, but a useful data point on the size hypothesis
+
+The user asked to also try [Goose](https://github.com/aaif-goose/goose/)
+("besides aider, opencode and openhands, give this a try with Goose CLI").
+Two setup snags surfaced before any real test could run, both worth
+recording:
+
+- **`goose` alone launched the Electron Desktop app, not the CLI.** This
+  machine had `block-goose` (the Desktop app) installed system-wide at
+  `/usr/bin/goose -> ../lib/goose/Goose`, which took priority on `PATH`.
+  The actual CLI is a separate Rust binary distributed via
+  `download_cli.sh` (per goose's own install docs) and was installed to
+  `~/.local/bin/goose` with
+  `curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash`.
+  Since `~/.local/bin` outranks `/usr/bin` on `PATH` for an interactive
+  shell but NOT necessarily for a shell tool's `PATH`, the CLI was invoked
+  via its full path (`~/.local/bin/goose`) throughout to avoid ambiguity.
+- **First real invocation crashed with a SQLite panic**, not a proxy issue:
+  `thread 'sqlx-sqlite-worker-0' panicked ... index out of bounds: the len
+  is 24 but the index is 24` / `error: Could not create session: no rows
+  returned by a query that expected to return at least one row`. Root
+  cause: the Desktop app (bundling an older goose version) and this
+  freshly-installed CLI (1.43.0) share the same `~/.config/goose` and
+  `~/.local/share/goose/sessions/sessions.db`, and the schemas didn't
+  match. Fixed by moving the stale `sessions.db`/`-wal`/`-shm` files aside
+  and letting the CLI recreate a fresh, version-matched database -- this is
+  a goose installation quirk unrelated to this proxy, noted here only
+  because it looked at first like our own bug.
+
+**Configuration used** -- a custom-provider JSON, since Goose has no
+built-in "point at any OpenAI-compatible URL" flag on the command line
+(only via `/connect` + config, mirroring OpenCode's approach):
+
+```json title="~/.config/goose/custom_providers/m365_copilot.json"
+{
+  "name": "m365_copilot",
+  "engine": "openai",
+  "display_name": "M365 Copilot (local proxy)",
+  "description": "Local m365_openai_proxy.py backend",
+  "api_key_env": "M365_PROXY_API_KEY",
+  "base_url": "http://127.0.0.1:8123/v1/chat/completions",
+  "models": [{"name": "m365-copilot", "context_limit": 32000}],
+  "supports_streaming": true,
+  "requires_auth": false
+}
+```
+
+```bash
+M365_PROXY_API_KEY=sk-unused GOOSE_PROVIDER=m365_copilot GOOSE_MODEL=m365-copilot \
+  goose run --no-session -t "Read main.py and add a subtract(a, b) function that returns a - b. Then print the final contents of main.py."
+```
+
+(`requires_auth: false` means no API key value is actually needed;
+`M365_PROXY_API_KEY` was set anyway out of caution and is ignored by this
+proxy regardless, consistent with its no-per-request-auth design.)
+
+**Results, same task as the OpenCode/OpenHands validation above:**
+
+- **3 sessions at Goose's default extension set**: every session made two
+  requests to this proxy per Goose's own internal flow -- a small,
+  `tools=0` request (~634 chars, evidently a session-title-generation call)
+  followed by the real agentic turn carrying **18 tools** and rendering to
+  **~19.6KB**. All 3 of these agentic-turn requests exhausted all 3 retry
+  attempts and fell back to plain content, and in all 3 cases that
+  fallback content was the same flat, content-policy-style refusal seen
+  with OpenCode ("Sorry, it looks like I can't chat about this...").
+  `main.py` was untouched in every session. **3/3 full failure.**
+- **1 session restricted to just the `developer` extension**
+  (`--no-profile --with-builtin developer`), to isolate whether Goose's
+  unusually large default tool count (18, the largest of any client tested
+  so far) was a specific factor: this dropped the offered tool count to
+  **5** and the rendered prompt to **~6.7KB** -- smaller than either
+  OpenHands' (~59KB/6 tools) or OpenCode's (~37KB/10 tools) prompts tested
+  earlier. The failure *shape* changed as a direct result: instead of the
+  flat refusal, Sydney's own code interpreter self-preempted again (same
+  pattern as OpenCode's very first trial), writing and running a Python
+  snippet that searched for `main.py` inside its own sandboxed environment,
+  found nothing, and reported that as the answer. Still **0/1 for this
+  configuration** -- the failure mode changed, the outcome didn't.
+
+**Net for Goose: 0 of 4 total sessions succeeded.** This adds a useful,
+if still inconclusive, data point to the "why does tool count/prompt size
+matter" question raised in the OpenCode section above: going from 18 tools
+(~19.6KB, refusal) down to 5 tools (~6.7KB, code-interpreter self-
+preemption) changed *how* Sydney avoided this proxy's convention without
+ever actually following it. That's consistent with size/dilution being A
+factor in *which* avoidance behavior Sydney reaches for, but it is NOT
+evidence that reducing tool count alone is sufficient to get a working call
+-- the 5-tool configuration still failed outright, same as every other
+configuration tested across all four coding-agent CLIs so far (Aider is the
+only one of the five clients validated in this document that reliably
+works, precisely because it needs none of this).
+

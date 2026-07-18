@@ -189,6 +189,24 @@ will actually work:
   you hit reliability problems (configure OpenHands for non-native tool
   calling so it never sends `tools` to this proxy at all).
 
+- **[Goose CLI](https://github.com/aaif-goose/goose/)** — **tested against
+  the real Goose CLI (the `goose` Rust binary from `download_cli.sh`, not
+  the Electron Desktop app — the `goose` command can resolve to either
+  depending on install order) and did not work: 0 of 4 full sessions
+  succeeded** on the same task. Goose's default extension set offers the
+  model **18 tools** at once (more than either OpenCode's 10 or OpenHands'
+  6), rendering to a ~19.6KB prompt, and every attempt across 3 sessions
+  fell back to the flat-refusal failure mode. Restricting Goose to just its
+  `developer` extension (`--no-profile --with-builtin developer`, 5 tools,
+  ~6.7KB prompt) changed the failure *shape* to Sydney's own code-
+  interpreter self-preempting instead of refusing — consistent with the
+  tool-count/prompt-size hypothesis noted in the OpenCode section above —
+  but still did not produce a working tool call in that trial either.
+  Configure Goose against this proxy via a custom-provider JSON (see
+  REVERSE_ENGINEERING.md for the exact config and invocations used) if you
+  want to experiment further, but the honest current answer is the same as
+  OpenCode's: it does not work yet.
+
 ## Quick start
 
 ```bash
