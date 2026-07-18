@@ -306,6 +306,22 @@ KNOWN LIMITATIONS
   specifically, but should NOT be assumed to work with OpenCode or Goose as
   currently implemented, and NOT be relied on for any long unattended
   agentic loop regardless of client.
+
+  **IMPORTANT if your client is OpenHands: prefer OpenHands' own
+  client-side "mock function calling" mode over this proxy's emulation
+  above.** OpenHands' SDK has a `native_tool_calling=False` flag on its
+  `LLM` config that converts tools to text and parses the reply entirely
+  on OpenHands' own side, sending this proxy NO `tools` field at all (so
+  this proxy's emulation above never runs). Tested 3 of 3 full sessions
+  succeeded, all verified correct on disk -- dramatically more reliable
+  than either this proxy's emulation or OpenHands' native tool-calling
+  mode (1 of 2 sessions). This flag isn't exposed through the OpenHands
+  CLI's normal settings/env-var surface in the tested version -- it
+  requires directly seeding a persisted `agent_settings.json` file -- see
+  REVERSE_ENGINEERING.md's "OpenHands' own client-side 'mock function
+  calling'" section for the exact setup. Does not transfer to OpenCode or
+  Goose, neither of which has an equivalent client-side fallback.
+
   Sydney's own REAL tool-invocation mechanism (Local MCP, over the same
   Chathub connection -- `mcp_discover`/`mcp_describe`/`invoke_local_plugin`
   SignalR targets, reverse-engineered from the officeweb client's own

@@ -78,6 +78,19 @@ sections below are where that lives.
   updates near the end of this document. Treat OpenHands as demonstrated-
   but-unreliable and OpenCode/Goose as not-currently-working, not all three
   as equally "probabilistic."
+- **OpenHands' own client-side "mock function calling" — dramatically more
+  reliable, and the recommended configuration**: OpenHands' SDK has a
+  `native_tool_calling=False` flag that converts tools to text and parses
+  the reply entirely on OpenHands' own side, sending this proxy NO `tools`
+  field at all (bypassing this proxy's emulation above completely). Tested
+  3 of 3 full sessions succeeded, all verified correct on disk, all
+  confirmed via the proxy log to have sent `tools=0` throughout. This flag
+  isn't exposed through the OpenHands CLI's normal settings/env-var
+  surface in the installed version — it requires directly seeding a
+  persisted `agent_settings.json` — see the "OpenHands' own client-side
+  'mock function calling'" update near the end of this document for the
+  exact setup and full trial data. Does not transfer to OpenCode or Goose,
+  neither of which has an equivalent client-side fallback.
 - **Not actually in this repo**: none of the `.har` capture files or
   `Chathub.log.jsonl` referenced throughout this document were ever committed
   (they carry live session cookies/tokens and are `.gitignore`d) — this
@@ -1597,4 +1610,178 @@ evidence that reducing tool count alone is sufficient to get a working call
 configuration tested across all four coding-agent CLIs so far (Aider is the
 only one of the five clients validated in this document that reliably
 works, precisely because it needs none of this).
+
+## Update: OpenHands' own client-side "mock function calling" -- 3/3, dramatically more reliable than this proxy's emulation
+
+Following the Goose validation, the user asked to try OpenHands CLI's own
+built-in "mock function calling" mode specifically, instead of relying on
+this proxy's `tools` emulation. This turned out to be the single best
+result of the entire tool-calling investigation.
+
+### Background: what OpenHands' mock function calling actually is
+
+OpenHands' underlying SDK (the newer `openhands`/`openhands-sdk`/
+`openhands-cli` package, distinct from the older `openhands-ai`/LiteLLM
+monolith referenced in earlier updates, but implementing the same idea) has
+a `native_tool_calling: bool` field on its `LLM` pydantic model (source:
+`openhands/sdk/llm/llm.py`), default `True`. When `False`:
+
+- `should_mock_tool_calls()` (in `openhands/sdk/llm/mixins/non_native_fc.py`)
+  returns `True` whenever `tools` are present.
+- `pre_request_prompt_mock()` converts the tool schemas + conversation into
+  plain-text prompting via `convert_fncall_messages_to_non_fncall_messages()`
+  (in `fn_call_converter.py`) -- including an in-context-learning example
+  demonstrating the expected reply format, unless the model name contains
+  `openhands-lm`/`devstral`/`nemotron`.
+- Critically, in `LLM.completion()`: `kwargs["tools"] = cc_tools if
+  (bool(cc_tools) and use_native_fc) else None` -- with `native_tool_calling
+  =False`, `use_native_fc` is `False`, so **`tools` is never sent to the
+  backend API at all**. The backend (this proxy) sees a completely ordinary
+  chat-completion request with no `tools` field, and OpenHands parses the
+  plain-text reply back into real tool calls entirely on its own side via
+  `convert_non_fncall_messages_to_fncall_messages()`.
+
+This is architecturally the same idea as this proxy's own `tools` emulation
+(`_render_tools_block()`/`_extract_tool_calls()`) -- prompt the model with a
+textual convention, parse the reply back into structured calls -- except
+performed by OpenHands itself, using OpenHands' own convention and its own
+in-context-learning example, with zero involvement from this proxy's
+emulation layer. The natural question: does OpenHands' own version of this
+trick work better against Sydney than this proxy's version?
+
+### The catch: this flag isn't exposed through the CLI's normal configuration surface
+
+The installed `openhands` CLI package (`openhands` 1.13.1 / `openhands-sdk`
+1.11.5 / `openhands-cli`, installed via `uv tool install openhands`, at
+`~/.local/share/uv/tools/openhands/`) has **no** occurrence of
+`native_tool_calling` anywhere in its own `openhands_cli` package -- not in
+the TUI settings modal, not in `~/.openhands/settings.json`'s schema, and
+not as an environment variable recognized by `--override-with-envs` (which
+only reads `LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL`, per
+`openhands_cli/stores/agent_store.py`'s `LLMEnvOverrides.from_env()`). The
+flag exists and works correctly at the SDK/`LLM` class level -- it's simply
+not wired up to any user-facing CLI configuration option in this version.
+
+The workaround, found by reading `openhands_cli/stores/agent_store.py`'s
+`AgentStore` class: OpenHands persists its agent configuration (including
+the full `LLM` object, `native_tool_calling` included) as JSON at
+`<persistence_dir>/agent_settings.json` (`AGENT_SETTINGS_PATH`,
+`persistence_dir` defaults to `~/.openhands`, overridable via the
+`OPENHANDS_PERSISTENCE_DIR` environment variable). Critically, when a
+persisted agent already exists on disk, `AgentStore.get_agent()`'s flow is:
+
+```python
+agent = self.load_from_disk()               # returns the persisted Agent as-is
+if env_overrides_enabled:
+    agent = self._ensure_agent(agent, overrides)   # agent is not None -> returned unchanged
+    agent = self._apply_env_overrides(agent, overrides)  # model_copy(update={api_key, base_url, model})
+```
+
+`_apply_env_overrides()` -> `apply_llm_overrides()` uses
+`llm.model_copy(update=overrides.model_dump(exclude_none=True))`, which
+**only overwrites the specific fields present in `LLMEnvOverrides`**
+(`api_key`, `base_url`, `model`) and leaves every other field of the
+persisted `LLM` -- including `native_tool_calling` -- untouched. So: if a
+persisted `agent_settings.json` already has `native_tool_calling: false`,
+running `openhands --override-with-envs` (or omitting that flag entirely,
+which skips the override step altogether and just uses the persisted agent
+verbatim) preserves that flag while still letting you point `LLM_BASE_URL`/
+`LLM_API_KEY`/`LLM_MODEL` at this proxy.
+
+**Setup used** (via the CLI's own bundled Python interpreter, to guarantee
+the correct Pydantic schema rather than hand-writing JSON):
+
+```python
+import os
+os.environ["OPENHANDS_PERSISTENCE_DIR"] = "/tmp/openhands-mockfc-persist"  # isolated test dir
+
+from openhands.sdk.llm import LLM
+from openhands_cli.utils import get_default_cli_agent
+from openhands_cli.stores.agent_store import AgentStore
+
+llm = LLM(
+    model="openai/m365-copilot",
+    api_key="sk-unused",
+    base_url="http://127.0.0.1:8123/v1",
+    usage_id="agent",
+    native_tool_calling=False,   # <-- the whole trick
+)
+agent = get_default_cli_agent(llm)   # same helper the CLI itself uses for its default agent
+AgentStore().save(agent)             # writes <persistence_dir>/agent_settings.json
+```
+
+Then simply:
+
+```bash
+OPENHANDS_PERSISTENCE_DIR=/tmp/openhands-mockfc-persist \
+  openhands --headless --json --always-approve \
+  -t "Read main.py and add a subtract(a, b) function that returns a - b. Then print the final contents of main.py."
+```
+
+(`--override-with-envs` is not even required here, since the persisted
+config already has the right `api_key`/`base_url`/`model` baked in --
+omitting it just means the loaded agent is used completely as-is.)
+
+### Results: 3 of 3 full sessions succeeded, fully verified on disk
+
+Three independent trials, each in a fresh `OPENHANDS_PERSISTENCE_DIR` +
+fresh project directory (to guarantee no state leakage between trials),
+same task as every other CLI validation in this document: **all three
+succeeded completely** -- each session genuinely read the real `main.py`
+via a real tool call, genuinely edited it via a real tool call to add the
+`subtract` function, and gave a correct final `finish` summary. The
+resulting file on disk was checked after every single trial and matched
+the requested change exactly, byte for byte, all three times.
+
+Crucially, checked in the proxy's own log across all three sessions:
+**every single request carried `tools=0`** -- confirming OpenHands' mock
+function calling truly never sends `tools` to this proxy at all; this
+proxy's own emulation layer (`_render_tools_block`/`_extract_tool_calls`/
+`_run_tool_call_turn`) was never invoked, not even once, across any of the
+three sessions. Whatever is making this reliable is entirely OpenHands'
+own prompting/parsing, not anything in this proxy.
+
+### Why this is so much more reliable than this proxy's own emulation (partially explained, not fully confirmed)
+
+Two plausible factors, neither confirmed in isolation:
+
+- **OpenHands' mock-function-calling convention may simply be a better fit
+  for whatever underlying model Sydney is serving** than this proxy's
+  invented `<action_request>` tag convention -- OpenHands' converter targets
+  a well-established, widely-used prompting pattern (it's the same
+  machinery LiteLLM/vLLM-style "non-native function calling" tooling uses
+  broadly across many backends), including a proper in-context-learning
+  example demonstrating correct usage, which this proxy's emulation does
+  not include at all.
+- OpenHands' approach does not need to fight Sydney's own built-in
+  capabilities (BingWebSearch, code interpreter) the way this proxy's
+  emulation does, because OpenHands never sends the word "tool" bare either
+  -- its converted prompt format uses its own established phrasing that
+  happens to not trigger the same self-preemption behavior this document's
+  earlier sections found with naive phrasing.
+
+Neither theory was tested by directly diffing OpenHands' exact rendered
+prompt text against this proxy's own -- that would be the natural next
+step to actually explain (rather than just observe) the reliability gap,
+if this is worth investigating further.
+
+### Practical implication
+
+For any OpenHands-based use case, **this is now the recommended
+configuration** -- reliably better than OpenHands' own native tool-calling
+mode (1 of 2 sessions, tested earlier) and dramatically better than relying
+on this proxy's own `tools` emulation. It does require the
+`OPENHANDS_PERSISTENCE_DIR` + hand-seeded `agent_settings.json` workaround
+described above, since the CLI doesn't expose `native_tool_calling` through
+its normal configuration surface in this version -- future OpenHands
+releases may add a more direct way to set this (worth checking the CLI's
+`--help`/settings UI for a `native_tool_calling`-equivalent option before
+repeating this workaround).
+
+This finding does NOT transfer to OpenCode or Goose: neither has anything
+equivalent to OpenHands' client-side mock-function-calling fallback --
+both hard-depend on the model actually emitting native `tool_calls`, which
+is exactly the API-level feature this proxy has to emulate (imperfectly)
+in the first place.
+
 

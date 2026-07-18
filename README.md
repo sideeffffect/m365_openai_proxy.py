@@ -14,7 +14,10 @@ OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`) backed by
 > `tool_calls`) is now implemented, but it is **emulated by prompting, on
 > a backend with no native concept of it, and it is probabilistic — not a
 > guarantee**. See "Known limitations" before depending on it for a real
-> agent loop (OpenCode, OpenHands, etc.).
+> agent loop. **If your client is OpenHands, prefer its own client-side
+> "mock function calling" mode over this proxy's `tools` emulation — it is
+> dramatically more reliable (3/3 vs. ~coin-flip in testing); see "Using
+> this with a coding agent" below.**
 
 **Fully self-contained.** The entire project is the one file,
 `m365_openai_proxy.py`. It uses only the Python 3 standard library — no
@@ -167,27 +170,35 @@ will actually work:
   validation" section for the full account, including the exact config
   used). Configuring OpenCode against this proxy is described there if you
   want to try it yourself, but the honest current answer is: it does not
-  work yet.
+  work yet — unlike OpenHands, OpenCode has no equivalent client-side "mock
+  function calling" fallback to fall back on.
 
-- **[OpenHands CLI](https://docs.openhands.dev/)** — **tested against the
-  real OpenHands CLI and achieved one genuine, fully verified success** out
-  of two full end-to-end sessions tried on the same task. In the successful
-  session, OpenHands (via `--override-with-envs` pointed at this proxy)
-  actually read a real file through a real tool call, actually edited it
-  through a real tool call, and gave a correct final summary — confirmed by
-  inspecting the file on disk afterward. The other session never produced a
-  working tool call and gave an incorrect final answer. This is real,
-  demonstrated, but unreliable success, consistent with this proxy's
-  "roughly a coin flip per attempt, better with retries, still not
-  guaranteed" self-assessment above — see REVERSE_ENGINEERING.md for the
-  full account and the exact invocation used. OpenHands/LiteLLM also has
-  its own client-side "mock function calling" mode for backends without
-  native tool support (converts tool schemas to text and parses a
-  different, LiteLLM-specific convention back out on the *client* side) —
-  untested against this proxy, and would be redundant with this proxy's own
-  emulation if both were active at once; worth trying as an alternative if
-  you hit reliability problems (configure OpenHands for non-native tool
-  calling so it never sends `tools` to this proxy at all).
+- **[OpenHands CLI](https://docs.openhands.dev/)** — **the recommended way
+  to use this proxy with an agentic coding CLI, via its own client-side
+  "mock function calling" mode rather than this proxy's `tools` emulation.**
+  OpenHands' SDK has a `native_tool_calling=False` flag on its `LLM` config
+  that converts tool schemas to text in the prompt itself and parses the
+  reply back into real tool calls **entirely on the OpenHands side** —
+  it sends this proxy plain `messages` with no `tools` field at all, so
+  this proxy's own probabilistic emulation never even runs. Tested
+  end-to-end: **3 out of 3 full sessions succeeded**, each one genuinely
+  reading and editing a real file via real tool calls and verified correct
+  on disk every time — confirmed via the proxy's own log that every request
+  across all three sessions carried `tools=0`. This is dramatically more
+  reliable than either this proxy's own emulation (a roughly-coin-flip
+  per-attempt rate) or OpenHands' *native* tool-calling mode (the default,
+  tested separately at 1 of 2 sessions succeeding). See
+  REVERSE_ENGINEERING.md's "OpenHands mock function calling" section for
+  the exact setup — the OpenHands CLI package doesn't expose this flag
+  through its normal settings/env-var surface, so it requires directly
+  seeding a persisted `agent_settings.json` with the flag set — and the
+  full trial data.
+
+  If you don't want to go through that persisted-config route, OpenHands'
+  *native* tool-calling mode (the default, via `--override-with-envs`
+  pointed at this proxy) does still work sometimes — 1 of 2 sessions
+  succeeded — but is subject to this proxy's own emulation reliability
+  caveats above.
 
 - **[Goose CLI](https://github.com/aaif-goose/goose/)** — **tested against
   the real Goose CLI (the `goose` Rust binary from `download_cli.sh`, not
