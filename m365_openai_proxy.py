@@ -411,6 +411,7 @@ PROXY_VERSION = "0.6"
 # MSAL cache entry (reproducing the exact previously-confirmed plaintext) --
 # see REVERSE_ENGINEERING.md.
 
+
 def _gf8_mul(a, b):
     """Multiply two bytes in GF(2^8) with the AES reducing polynomial
     x^8+x^4+x^3+x+1 (0x11B)."""
@@ -449,8 +450,9 @@ def _aes_build_sbox():
 
 
 _AES_SBOX = _aes_build_sbox()
-assert _AES_SBOX[0x00] == 0x63 and _AES_SBOX[0x53] == 0xED and _AES_SBOX[0xFF] == 0x16, \
-    "computed AES S-box failed a sanity check against known values"
+assert (
+    _AES_SBOX[0x00] == 0x63 and _AES_SBOX[0x53] == 0xED and _AES_SBOX[0xFF] == 0x16
+), "computed AES S-box failed a sanity check against known values"
 
 
 def _aes_xtime(a):
@@ -474,7 +476,7 @@ _AES_RCON = _aes_build_rcon()
 def _aes256_key_expansion(key):
     """AES-256 key schedule (Nk=8, Nr=14): returns 15 round keys, 16 bytes each."""
     Nk, Nr, Nb = 8, 14, 4
-    w = [list(key[4 * i:4 * i + 4]) for i in range(Nk)]
+    w = [list(key[4 * i : 4 * i + 4]) for i in range(Nk)]
     for i in range(Nk, Nb * (Nr + 1)):
         temp = list(w[i - 1])
         if i % Nk == 0:
@@ -508,7 +510,12 @@ def _aes_shift_rows(state):
 def _aes_mix_columns(state):
     new = bytearray(16)
     for c in range(4):
-        s0, s1, s2, s3 = state[4 * c], state[4 * c + 1], state[4 * c + 2], state[4 * c + 3]
+        s0, s1, s2, s3 = (
+            state[4 * c],
+            state[4 * c + 1],
+            state[4 * c + 2],
+            state[4 * c + 3],
+        )
         new[4 * c + 0] = _gf8_mul(s0, 2) ^ _gf8_mul(s1, 3) ^ s2 ^ s3
         new[4 * c + 1] = s0 ^ _gf8_mul(s1, 2) ^ _gf8_mul(s2, 3) ^ s3
         new[4 * c + 2] = s0 ^ s1 ^ _gf8_mul(s2, 2) ^ _gf8_mul(s3, 3)
@@ -558,7 +565,7 @@ def _ghash(h_int, data):
     """`data` must already be zero-padded to a multiple of 16 bytes."""
     y = 0
     for i in range(0, len(data), 16):
-        y = _gf128_mul(y ^ int.from_bytes(data[i:i + 16], "big"), h_int)
+        y = _gf128_mul(y ^ int.from_bytes(data[i : i + 16], "big"), h_int)
     return y
 
 
@@ -594,21 +601,25 @@ def aes256_gcm_decrypt(key, iv, ciphertext_and_tag, aad=b"", tag_length=16):
     j0 = iv + b"\x00\x00\x00\x01"
 
     ghash_input = _gcm_pad16(aad) + _gcm_pad16(ciphertext)
-    ghash_input += (len(aad) * 8).to_bytes(8, "big") + (len(ciphertext) * 8).to_bytes(8, "big")
+    ghash_input += (len(aad) * 8).to_bytes(8, "big") + (len(ciphertext) * 8).to_bytes(
+        8, "big"
+    )
     s_bytes = _ghash(h_int, ghash_input).to_bytes(16, "big")
 
     tag_keystream = _aes256_encrypt_block(round_keys, j0)
     expected_tag = bytes(a ^ b for a, b in zip(s_bytes, tag_keystream))[:tag_length]
 
     if not hmac.compare_digest(expected_tag, received_tag):
-        raise ValueError("AES-GCM authentication failed (tag mismatch) -- wrong key or tampered/corrupt ciphertext")
+        raise ValueError(
+            "AES-GCM authentication failed (tag mismatch) -- wrong key or tampered/corrupt ciphertext"
+        )
 
     counter = _gcm_inc32(j0)
     plaintext = bytearray()
     for i in range(0, len(ciphertext), 16):
         ks = _aes256_encrypt_block(round_keys, counter)
-        chunk = ciphertext[i:i + 16]
-        plaintext += bytes(a ^ b for a, b in zip(chunk, ks[:len(chunk)]))
+        chunk = ciphertext[i : i + 16]
+        plaintext += bytes(a ^ b for a, b in zip(chunk, ks[: len(chunk)]))
         counter = _gcm_inc32(counter)
     return bytes(plaintext)
 
@@ -617,7 +628,9 @@ def aes256_gcm_decrypt(key, iv, ciphertext_and_tag, aad=b"", tag_length=16):
 # Constants reverse-engineered from live captures -- see REVERSE_ENGINEERING.md
 # ==============================================================================
 
-USER_AGENT = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0"
+)
 
 # The AAD app registration observed minting the Sydney/Chathub access token.
 # Part of Microsoft's "Family of Client IDs" (FOCI): a refresh token obtained
@@ -640,7 +653,9 @@ TOKEN_REDIRECT_URI = "brk-multihub://outlook.office.com"
 # ahead of the first exchange.
 TOKEN_URL_TEMPLATE = "https://login.microsoftonline.com/{tid}/oauth2/v2.0/token"
 TOKEN_URL_COMMON = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-SYDNEY_SCOPE = "https://substrate.office.com/sydney/.default openid profile offline_access"
+SYDNEY_SCOPE = (
+    "https://substrate.office.com/sydney/.default openid profile offline_access"
+)
 
 # Static MSAL-Browser telemetry/capability fields observed on every single
 # captured refresh_token-grant request, regardless of scope or session --
@@ -727,13 +742,36 @@ OPTIONS_SETS = [
 ]
 
 ALLOWED_MESSAGE_TYPES = [
-    "Chat", "Suggestion", "InternalSearchQuery", "Disengaged", "InternalLoaderMessage",
-    "Progress", "GeneratedCode", "RenderCardRequest", "AdsQuery", "SemanticSerp",
-    "GenerateContentQuery", "GenerateGraphicArt", "SearchQuery", "ConfirmationCard",
-    "AuthError", "DeveloperLogs", "TriggerPlugin", "HintInvocation", "MemoryUpdate",
-    "EndOfRequest", "TriggerConfirmation", "ResumeInvokeAction", "ResumeUserInputRequest",
-    "TriggerUserInputRequest", "EscapeHatch", "TriggerPluginAuth", "ResumePluginAuth",
-    "SideBySide", "ReferencesListComplete", "SwitchRespondingEndpoint",
+    "Chat",
+    "Suggestion",
+    "InternalSearchQuery",
+    "Disengaged",
+    "InternalLoaderMessage",
+    "Progress",
+    "GeneratedCode",
+    "RenderCardRequest",
+    "AdsQuery",
+    "SemanticSerp",
+    "GenerateContentQuery",
+    "GenerateGraphicArt",
+    "SearchQuery",
+    "ConfirmationCard",
+    "AuthError",
+    "DeveloperLogs",
+    "TriggerPlugin",
+    "HintInvocation",
+    "MemoryUpdate",
+    "EndOfRequest",
+    "TriggerConfirmation",
+    "ResumeInvokeAction",
+    "ResumeUserInputRequest",
+    "TriggerUserInputRequest",
+    "EscapeHatch",
+    "TriggerPluginAuth",
+    "ResumePluginAuth",
+    "SideBySide",
+    "ReferencesListComplete",
+    "SwitchRespondingEndpoint",
 ]
 
 SIGNALR_RS = "\x1e"  # SignalR JSON Hub Protocol record separator
@@ -749,13 +787,16 @@ SIGNALR_RS = "\x1e"  # SignalR JSON Hub Protocol record separator
 # includes `tools`, this proxy asks Sydney with these capabilities stripped,
 # so the model has nothing to reach for except our injected convention.
 TOOL_MODE_OPTIONS_SETS = [
-    o for o in OPTIONS_SETS if not any(kw in o for kw in ("code_interpreter", "flux", "gptv"))
+    o
+    for o in OPTIONS_SETS
+    if not any(kw in o for kw in ("code_interpreter", "flux", "gptv"))
 ]
 
 
 # ==============================================================================
 # Errors
 # ==============================================================================
+
 
 class AuthError(Exception):
     """Refresh-token/access-token acquisition failed."""
@@ -778,6 +819,7 @@ class WSError(Exception):
 # no permessage-deflate -- confirmed from captures that the real server does
 # not require compression, so we simply never offer the extension).
 # ==============================================================================
+
 
 class WebSocketClient:
     _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -826,10 +868,12 @@ class WebSocketClient:
         if status != 101:
             raise WSError(f"WebSocket handshake failed: HTTP {status}")
         expected_accept = base64.b64encode(
-            hashlib.sha1((key + self._GUID).encode()).digest()
+            hashlib.sha1((key + self._GUID).encode(), usedforsecurity=False).digest()
         ).decode()
         if resp_headers.get("sec-websocket-accept") != expected_accept:
-            raise WSError("Sec-WebSocket-Accept did not match -- handshake not trustworthy")
+            raise WSError(
+                "Sec-WebSocket-Accept did not match -- handshake not trustworthy"
+            )
 
         self._buf = leftover
 
@@ -914,7 +958,9 @@ class WebSocketClient:
             if fin:
                 break
         data = b"".join(parts)
-        return data.decode("utf-8", errors="replace") if opcode == self.OPCODE_TEXT else ""
+        return (
+            data.decode("utf-8", errors="replace") if opcode == self.OPCODE_TEXT else ""
+        )
 
     def close(self):
         try:
@@ -946,6 +992,7 @@ class SignalRBuffer:
 # ==============================================================================
 # Credential file: load, optionally decrypt, and persist rotated refresh tokens
 # ==============================================================================
+
 
 def _b64url_decode(segment):
     segment += "=" * (-len(segment) % 4)
@@ -1033,7 +1080,8 @@ def _decrypt_msal_cache_entry(encrypted_entry, encryption_key, local_storage_key
     """
     logging.debug(
         "decrypting MSAL cache entry: entry_id=%s local_storage_key=%r",
-        encrypted_entry.get("id"), local_storage_key,
+        encrypted_entry.get("id"),
+        local_storage_key,
     )
     if encrypted_entry.get("id") != encryption_key.get("id"):
         raise CredentialError(
@@ -1045,7 +1093,9 @@ def _decrypt_msal_cache_entry(encrypted_entry, encryption_key, local_storage_key
         nonce = _b64url_decode(encrypted_entry["nonce"])
         data = _b64url_decode(encrypted_entry["data"])
         context = _msal_cache_context(local_storage_key)
-        derived_key = _hkdf_sha256(raw_key, salt=nonce, info=context.encode("utf-8"), length=32)
+        derived_key = _hkdf_sha256(
+            raw_key, salt=nonce, info=context.encode("utf-8"), length=32
+        )
         plaintext = aes256_gcm_decrypt(derived_key, bytes(12), data, aad=b"")
         cred = json.loads(plaintext.decode("utf-8"))
         secret = cred["secret"]
@@ -1056,11 +1106,13 @@ def _decrypt_msal_cache_entry(encrypted_entry, encryption_key, local_storage_key
             "Most likely cause: the cache entry has already rotated past the localStorage "
             "snapshot you copied (MSAL rotates this in the background continuously) -- "
             "recapture all of local_storage_key/encrypted_refresh_token/cache_encryption_key "
-            "at the same moment and try again, or use a plaintext \"refresh_token\" instead."
+            'at the same moment and try again, or use a plaintext "refresh_token" instead.'
         ) from e
     logging.info(
         "MSAL cache entry decrypted successfully: credentialType=%s clientId=%s (secret length=%d chars)",
-        cred.get("credentialType"), cred.get("clientId"), len(secret),
+        cred.get("credentialType"),
+        cred.get("clientId"),
+        len(secret),
     )
     return secret
 
@@ -1068,7 +1120,12 @@ def _decrypt_msal_cache_entry(encrypted_entry, encryption_key, local_storage_key
 #: The four credential fields, in the order they're presented everywhere
 #: (docstring, templates, error messages). A file's actual path is always
 #: `f"{prefix}.{field_name}"` -- see CredentialStore.
-FIELD_NAMES = ("refresh_token", "encrypted_refresh_token", "cache_encryption_key", "local_storage_key")
+FIELD_NAMES = (
+    "refresh_token",
+    "encrypted_refresh_token",
+    "cache_encryption_key",
+    "local_storage_key",
+)
 
 #: Explanatory text for each field, embedded as the "#"-comment header of
 #: its freshly-written template file (see write_credentials_template) and
@@ -1098,7 +1155,7 @@ FIELD_COMMENTS = {
         "Local Storage -> m365.cloud.microsoft origin -> find the KEY "
         "whose NAME contains 'refreshtoken' -- copy that key's VALUE here "
         "verbatim (an object shaped like "
-        "{\"id\":...,\"nonce\":...,\"data\":...,\"lastUpdatedAt\":...}). "
+        '{"id":...,"nonce":...,"data":...,"lastUpdatedAt":...}). '
         "Also copy that same key's NAME into the local_storage_key file -- "
         "both are required together. Must be captured at essentially the "
         "same moment as the cache_encryption_key file's value (matching "
@@ -1110,7 +1167,7 @@ FIELD_COMMENTS = {
         "held in the msal.cache.encryption cookie. Where to get it: "
         "DevTools -> Application/Storage -> Cookies -> m365.cloud.microsoft "
         "-> cookie named 'msal.cache.encryption' -> copy its value here -- "
-        "an object shaped like {\"id\":...,\"key\":...}. Paste it exactly as "
+        'an object shaped like {"id":...,"key":...}. Paste it exactly as '
         "shown, whether that's the plain {...} form or the URL-encoded "
         "%7B...%7D form some DevTools views show instead -- either works, "
         "the proxy detects and decodes URL-encoding automatically. Its "
@@ -1200,7 +1257,9 @@ def _decode_json_field(value, field_label):
     try:
         return json.loads(candidate)
     except json.JSONDecodeError as e:
-        raise CredentialError(f"{field_label}: pasted value is not valid JSON: {e}") from e
+        raise CredentialError(
+            f"{field_label}: pasted value is not valid JSON: {e}"
+        ) from e
 
 
 class CredentialStore:
@@ -1244,10 +1303,11 @@ class CredentialStore:
             write_credentials_template(self.prefix)
             raise CredentialError(
                 "no credential files existed yet, so starter templates were just "
-                "created:\n" + "\n".join(f"  {p}" for p in self.paths.values())
-                + "\nFill in either \"refresh_token\" alone, or all three of "
-                "\"encrypted_refresh_token\"/\"cache_encryption_key\"/"
-                "\"local_storage_key\" (see each file's own comment header for "
+                "created:\n"
+                + "\n".join(f"  {p}" for p in self.paths.values())
+                + '\nFill in either "refresh_token" alone, or all three of '
+                '"encrypted_refresh_token"/"cache_encryption_key"/'
+                '"local_storage_key" (see each file\'s own comment header for '
                 "exactly where to get its value from), then restart."
             )
         logging.info(
@@ -1262,11 +1322,19 @@ class CredentialStore:
         local_storage_key = _load_credential_file(self.paths["local_storage_key"]) or ""
         self.oid_hint, self.tid_hint = parse_home_account_id(local_storage_key)
         if self.oid_hint and self.tid_hint:
-            logging.info("derived oid/tid hint from %s (tid=%s)", self.paths["local_storage_key"], self.tid_hint)
+            logging.info(
+                "derived oid/tid hint from %s (tid=%s)",
+                self.paths["local_storage_key"],
+                self.tid_hint,
+            )
 
         rt = _load_credential_file(self.paths["refresh_token"])
         if rt:
-            logging.info("using plaintext refresh_token from %s (length=%d chars)", self.paths["refresh_token"], len(rt))
+            logging.info(
+                "using plaintext refresh_token from %s (length=%d chars)",
+                self.paths["refresh_token"],
+                len(rt),
+            )
             return rt
 
         encrypted_raw = _load_credential_file(self.paths["encrypted_refresh_token"])
@@ -1278,15 +1346,17 @@ class CredentialStore:
                 "(encrypted_refresh_token + cache_encryption_key)",
                 self.paths["refresh_token"],
             )
-            encrypted = _decode_json_field(encrypted_raw, self.paths["encrypted_refresh_token"])
+            encrypted = _decode_json_field(
+                encrypted_raw, self.paths["encrypted_refresh_token"]
+            )
             key = _decode_json_field(key_raw, self.paths["cache_encryption_key"])
             return _decrypt_msal_cache_entry(encrypted, key, local_storage_key)
 
         raise CredentialError(
             f"no usable value found across {', '.join(self.paths.values())} -- "
-            "fill in either \"refresh_token\" alone, or all three of "
-            "\"encrypted_refresh_token\"/\"cache_encryption_key\"/"
-            "\"local_storage_key\" (see each file's own comment header for "
+            'fill in either "refresh_token" alone, or all three of '
+            '"encrypted_refresh_token"/"cache_encryption_key"/'
+            '"local_storage_key" (see each file\'s own comment header for '
             "exactly where to get its value from)"
         )
 
@@ -1305,14 +1375,19 @@ class CredentialStore:
         with self._lock:
             self._refresh_token = new_refresh_token
             path = self.paths["refresh_token"]
-            content = _render_credential_file_header("refresh_token") + new_refresh_token + "\n"
+            content = (
+                _render_credential_file_header("refresh_token")
+                + new_refresh_token
+                + "\n"
+            )
             tmp_path = path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(content)
             os.replace(tmp_path, path)
         logging.info(
             "refresh token rotated by Entra ID; persisted new value to %s (length=%d chars)",
-            path, len(new_refresh_token),
+            path,
+            len(new_refresh_token),
         )
 
 
@@ -1336,10 +1411,10 @@ def write_credentials_template(prefix):
         os.replace(tmp_path, path)
 
 
-
 # ==============================================================================
 # Auth: refresh_token -> Sydney access_token (FOCI silent redemption)
 # ==============================================================================
+
 
 def _redact_url(url):
     """Returns `url` with any `access_token` query-parameter value masked --
@@ -1350,7 +1425,9 @@ def _redact_url(url):
     qs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
     redacted_qs = [(k, "<redacted>" if k == "access_token" else v) for k, v in qs]
     new_query = urllib.parse.urlencode(redacted_qs)
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, new_query, parts.fragment)
+    )
 
 
 def parse_home_account_id(local_storage_key):
@@ -1402,7 +1479,9 @@ def exchange_refresh_token(refresh_token, oid=None, tid=None):
     /common/ endpoint and omits `X-AnchorMailbox`, which is still a
     documented-valid way to redeem a multi-tenant refresh token."""
     token_url = TOKEN_URL_TEMPLATE.format(tid=tid) if tid else TOKEN_URL_COMMON
-    logging.debug("exchanging refresh token for a Sydney/Chathub access token via %s", token_url)
+    logging.debug(
+        "exchanging refresh token for a Sydney/Chathub access token via %s", token_url
+    )
 
     query_params = {
         "brk_client_id": BROKER_CLIENT_ID,
@@ -1446,8 +1525,13 @@ def exchange_refresh_token(refresh_token, oid=None, tid=None):
             "Accept": "*/*",
         },
     )
+    # `req` above is built from `url`, which is always
+    # TOKEN_URL_TEMPLATE/TOKEN_URL_COMMON (fixed https://login.microsoftonline.com/...
+    # constants) -- the templated `tid` only fills a path segment, it can
+    # never change the scheme or host, so this isn't an arbitrary/
+    # attacker-controlled URL open.
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         # `detail` is Entra ID's own JSON error body (error code, description,
@@ -1456,9 +1540,13 @@ def exchange_refresh_token(refresh_token, oid=None, tid=None):
         # in full.
         detail = e.read().decode("utf-8", errors="replace")
         logging.warning("refresh_token exchange failed: HTTP %d", e.code)
-        raise AuthError(f"refresh_token exchange failed (HTTP {e.code}): {detail}") from e
+        raise AuthError(
+            f"refresh_token exchange failed (HTTP {e.code}): {detail}"
+        ) from e
     except urllib.error.URLError as e:
-        logging.warning("refresh_token exchange failed: could not reach %s: %s", token_url, e)
+        logging.warning(
+            "refresh_token exchange failed: could not reach %s: %s", token_url, e
+        )
         raise AuthError(f"could not reach {token_url}: {e}") from e
 
 
@@ -1487,13 +1575,18 @@ class TokenCache:
             if self._auth and self._auth.expires_at - 60 > time.time():
                 logging.debug(
                     "reusing cached Sydney access token (oid=%s, expires in %.0fs)",
-                    self._auth.oid, self._auth.expires_at - time.time(),
+                    self._auth.oid,
+                    self._auth.expires_at - time.time(),
                 )
                 return self._auth
 
-        logging.info("cached Sydney access token missing or near expiry; exchanging refresh token")
+        logging.info(
+            "cached Sydney access token missing or near expiry; exchanging refresh token"
+        )
         refresh_token = self.store.current()
-        body = exchange_refresh_token(refresh_token, oid=self.store.oid_hint, tid=self.store.tid_hint)
+        body = exchange_refresh_token(
+            refresh_token, oid=self.store.oid_hint, tid=self.store.tid_hint
+        )
 
         new_rt = body.get("refresh_token")
         if new_rt:
@@ -1507,8 +1600,13 @@ class TokenCache:
             # differently-shaped response), so including the dict verbatim
             # here would risk leaking a live credential into the exception
             # message (and from there, into logs).
-            logging.error("token exchange response had no access_token (response keys=%s)", list(body.keys()))
-            raise AuthError(f"token exchange response had no access_token (response keys={list(body.keys())})")
+            logging.error(
+                "token exchange response had no access_token (response keys=%s)",
+                list(body.keys()),
+            )
+            raise AuthError(
+                f"token exchange response had no access_token (response keys={list(body.keys())})"
+            )
         claims = jwt_claims(access_token)
         auth = SydneyAuth(
             access_token=access_token,
@@ -1519,12 +1617,19 @@ class TokenCache:
         if not auth.oid or not auth.tid:
             # Same reasoning as above: log only the claim NAMES present, not
             # their values (which can include the signed-in user's email/UPN).
-            logging.error("access_token was missing oid/tid claims (claims present=%s)", list(claims.keys()))
-            raise AuthError(f"access_token was missing oid/tid claims (claims present={list(claims.keys())})")
+            logging.error(
+                "access_token was missing oid/tid claims (claims present=%s)",
+                list(claims.keys()),
+            )
+            raise AuthError(
+                f"access_token was missing oid/tid claims (claims present={list(claims.keys())})"
+            )
 
         logging.info(
             "Sydney access token acquired: oid=%s tid=%s expires_in=%ss",
-            auth.oid, auth.tid, body.get("expires_in", "?"),
+            auth.oid,
+            auth.tid,
+            body.get("expires_in", "?"),
         )
         with self._lock:
             self._auth = auth
@@ -1535,32 +1640,38 @@ class TokenCache:
 # Chathub: open the WebSocket, send one `chat` invocation, stream the reply
 # ==============================================================================
 
+
 def open_chathub(auth):
     session_id = str(uuid.uuid4())
     session_id_nodash = session_id.replace("-", "")
     conversation_id = str(uuid.uuid4())
 
-    query = urllib.parse.urlencode({
-        "chatsessionid": session_id_nodash,
-        "XRoutingParameterSessionKey": session_id_nodash,
-        "clientrequestid": session_id_nodash,
-        "X-SessionId": session_id,
-        "ConversationId": conversation_id,
-        "access_token": auth.access_token,
-        "variants": CHATHUB_VARIANTS,
-        "source": '"officeweb"',
-        "product": "Office",
-        "agentHost": "Bizchat.FullScreen",
-        "licenseType": "Starter",
-        "isEdu": "false",
-        "agent": "web",
-        "scenario": "OfficeWebIncludedCopilot",
-    })
+    query = urllib.parse.urlencode(
+        {
+            "chatsessionid": session_id_nodash,
+            "XRoutingParameterSessionKey": session_id_nodash,
+            "clientrequestid": session_id_nodash,
+            "X-SessionId": session_id,
+            "ConversationId": conversation_id,
+            "access_token": auth.access_token,
+            "variants": CHATHUB_VARIANTS,
+            "source": '"officeweb"',
+            "product": "Office",
+            "agentHost": "Bizchat.FullScreen",
+            "licenseType": "Starter",
+            "isEdu": "false",
+            "agent": "web",
+            "scenario": "OfficeWebIncludedCopilot",
+        }
+    )
     url = f"wss://{CHATHUB_HOST}/m365Copilot/Chathub/{auth.oid}@{auth.tid}?{query}"
 
     logging.info(
         "opening Chathub WebSocket: oid=%s tid=%s session_id=%s conversation_id=%s",
-        auth.oid, auth.tid, session_id, conversation_id,
+        auth.oid,
+        auth.tid,
+        session_id,
+        conversation_id,
     )
     logging.debug("Chathub WS URL (access_token redacted): %s", _redact_url(url))
 
@@ -1571,17 +1682,34 @@ def open_chathub(auth):
     ack = ws.recv_text()
     if ack is None:
         logging.error("Chathub closed the connection during the SignalR handshake")
-        raise ProtocolError("Chathub closed the connection during the SignalR handshake")
+        raise ProtocolError(
+            "Chathub closed the connection during the SignalR handshake"
+        )
 
-    logging.info("Chathub WebSocket connected, SignalR handshake complete (session_id=%s)", session_id)
+    logging.info(
+        "Chathub WebSocket connected, SignalR handshake complete (session_id=%s)",
+        session_id,
+    )
     return ws, session_id
 
 
-def send_chat_message(ws, session_id, text, locale="en-US", timezone="UTC", timezone_offset=0, tools_requested=False):
+def send_chat_message(
+    ws,
+    session_id,
+    text,
+    locale="en-US",
+    timezone="UTC",
+    timezone_offset=0,
+    tools_requested=False,
+):
     trace_id = str(uuid.uuid4())
     logging.info(
         "sending chat message: session_id=%s trace_id=%s text_length=%d chars locale=%s tools_requested=%s",
-        session_id, trace_id, len(text), locale, tools_requested,
+        session_id,
+        trace_id,
+        len(text),
+        locale,
+        tools_requested,
     )
     # When the client wants OpenAI-style tool-calling, suppress Sydney's own
     # built-in plugins/capabilities (BingWebSearch, code interpreter, image
@@ -1592,51 +1720,62 @@ def send_chat_message(ws, session_id, text, locale="en-US", timezone="UTC", time
         "type": 4,
         "target": "chat",
         "invocationId": "0",
-        "arguments": [{
-            "source": "officeweb",
-            "clientCorrelationId": trace_id,
-            "sessionId": session_id,
-            "optionsSets": options_sets,
-            "streamingMode": "ConciseWithPadding",
-            "options": {},
-            "extraExtensionParameters": {},
-            "allowedMessageTypes": ALLOWED_MESSAGE_TYPES,
-            "sliceIds": [],
-            "threadLevelGptId": {},
-            "traceId": trace_id,
-            "isStartOfSession": False,
-            "clientInfo": {
-                "clientPlatform": "mcmcopilot-web",
-                "clientAppName": "Office",
-                "clientEntrypoint": "mcmcopilot-officeweb",
-                "clientSessionId": session_id,
-                "ProductCategory": "Chat",
-                "clientAppType": "Web",
-                "productEntryPoint": "ChatPanel",
-                "deviceOS": "Linux",
-                "deviceType": "Desktop",
-                "clientPlatformVersion": "Unknown",
-            },
-            "message": {
-                "author": "user",
-                "inputMethod": "Keyboard",
-                "text": text,
-                "entityAnnotationTypes": ["People", "File", "Event", "Email", "TeamsMessage"],
-                "requestId": trace_id,
-                "locationInfo": {"timeZoneOffset": timezone_offset, "timeZone": timezone},
-                "locale": locale,
-                "messageType": "Chat",
-                "experienceType": "Default",
-                "adaptiveCards": [],
-                "clientPreferences": {},
-                "connectedFederatedConnections": ["dummyId"],
-            },
-            "plugins": plugins,
-            "isSbsSupported": True,
-            "tone": "Magic",
-            "renderReferencesBehindEOS": True,
-            "disconnectBehavior": "continue",
-        }],
+        "arguments": [
+            {
+                "source": "officeweb",
+                "clientCorrelationId": trace_id,
+                "sessionId": session_id,
+                "optionsSets": options_sets,
+                "streamingMode": "ConciseWithPadding",
+                "options": {},
+                "extraExtensionParameters": {},
+                "allowedMessageTypes": ALLOWED_MESSAGE_TYPES,
+                "sliceIds": [],
+                "threadLevelGptId": {},
+                "traceId": trace_id,
+                "isStartOfSession": False,
+                "clientInfo": {
+                    "clientPlatform": "mcmcopilot-web",
+                    "clientAppName": "Office",
+                    "clientEntrypoint": "mcmcopilot-officeweb",
+                    "clientSessionId": session_id,
+                    "ProductCategory": "Chat",
+                    "clientAppType": "Web",
+                    "productEntryPoint": "ChatPanel",
+                    "deviceOS": "Linux",
+                    "deviceType": "Desktop",
+                    "clientPlatformVersion": "Unknown",
+                },
+                "message": {
+                    "author": "user",
+                    "inputMethod": "Keyboard",
+                    "text": text,
+                    "entityAnnotationTypes": [
+                        "People",
+                        "File",
+                        "Event",
+                        "Email",
+                        "TeamsMessage",
+                    ],
+                    "requestId": trace_id,
+                    "locationInfo": {
+                        "timeZoneOffset": timezone_offset,
+                        "timeZone": timezone,
+                    },
+                    "locale": locale,
+                    "messageType": "Chat",
+                    "experienceType": "Default",
+                    "adaptiveCards": [],
+                    "clientPreferences": {},
+                    "connectedFederatedConnections": ["dummyId"],
+                },
+                "plugins": plugins,
+                "isSbsSupported": True,
+                "tone": "Magic",
+                "renderReferencesBehindEOS": True,
+                "disconnectBehavior": "continue",
+            }
+        ],
     }
     ws.send_text(json.dumps(payload) + SIGNALR_RS)
 
@@ -1669,23 +1808,36 @@ def stream_chat_reply(ws, timeout_s=120):
                             # Log/raise only the server's own description text,
                             # not the whole message blob (unclear what else it
                             # might carry -- keep this narrow on principle).
-                            logging.error("Sydney rejected the chat request: %r", msg.get("text"))
-                            raise AuthError(f"Sydney rejected the request: {msg.get('text')!r}")
+                            logging.error(
+                                "Sydney rejected the chat request: %r", msg.get("text")
+                            )
+                            raise AuthError(
+                                f"Sydney rejected the request: {msg.get('text')!r}"
+                            )
                         if msg.get("author") != "bot":
                             continue
                         text = msg.get("text")
                         if text is None:
                             continue
-                        delta = text[len(last_text):] if text.startswith(last_text) else text
+                        delta = (
+                            text[len(last_text) :]
+                            if text.startswith(last_text)
+                            else text
+                        )
                         if delta:
                             yield delta
                         last_text = text
 
             elif ftype == 3:  # Completion frame: this invocation is done
-                logging.info("Chathub reply complete (total_length=%d chars)", len(last_text))
+                logging.info(
+                    "Chathub reply complete (total_length=%d chars)", len(last_text)
+                )
                 return
             elif ftype == 7:  # hub closed
-                logging.info("Chathub hub closed the connection (total_length so far=%d chars)", len(last_text))
+                logging.info(
+                    "Chathub hub closed the connection (total_length so far=%d chars)",
+                    len(last_text),
+                )
                 return
             # ignore: type 2 (StreamItem echo of our own message), type 6 (ping),
             # and Invocation frames with target "Metrics"
@@ -1711,6 +1863,7 @@ def run_chat_turn(token_cache, text, **kwargs):
 # OpenAI-compatible HTTP layer -- NO per-request auth (see module docstring)
 # ==============================================================================
 
+
 def _message_text(m):
     """Extracts the plain-text content of one OpenAI `messages[]` entry,
     handling both the plain-string `content` form and the "content parts"
@@ -1721,7 +1874,11 @@ def _message_text(m):
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+        parts = [
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
         return "\n".join(p for p in parts if p)
     return ""
 
@@ -1801,7 +1958,9 @@ def _render_tools_block(tools, tool_choice):
     ]
     for t in tools:
         fn = t.get("function") or {}
-        name = fn.get("name", "?")  # left untouched -- must round-trip verbatim, see _neutralize_tool_word's docstring
+        name = fn.get(
+            "name", "?"
+        )  # left untouched -- must round-trip verbatim, see _neutralize_tool_word's docstring
         desc = _neutralize_tool_word(fn.get("description", ""))
         params = fn.get("parameters", {})
         lines.append(f"- {name}: {desc}")
@@ -1811,10 +1970,14 @@ def _render_tools_block(tools, tool_choice):
         forced_name = (tool_choice.get("function") or {}).get("name")
         if forced_name:
             lines.append("")
-            lines.append(f'You MUST request "{forced_name}" now, using the format above.')
+            lines.append(
+                f'You MUST request "{forced_name}" now, using the format above.'
+            )
     elif tool_choice == "required":
         lines.append("")
-        lines.append("You MUST make one of the requests above now, using the format above.")
+        lines.append(
+            "You MUST make one of the requests above now, using the format above."
+        )
 
     return "\n".join(lines)
 
@@ -1843,10 +2006,12 @@ def _neutralize_tool_word(text):
     text (system/user/assistant/tool-result content and tool descriptions),
     never to the structural JSON (a tool's `name` field, argument/schema
     keys) that this proxy needs to parse back out of the reply verbatim."""
+
     def _repl(m):
         word = m.group(0)
         replacement = "capabilities" if word.lower() == "tools" else "capability"
         return replacement.capitalize() if word[0].isupper() else replacement
+
     return _TOOL_WORD_RE.sub(_repl, text)
 
 
@@ -1870,14 +2035,20 @@ def _extract_tool_calls(reply_text):
             obj = json.loads(raw)
             name = obj["name"]
         except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logging.warning("model emitted a %s block with unparseable content, skipping it: %r", _TOOL_CALL_OPEN, e)
+            logging.warning(
+                "model emitted a %s block with unparseable content, skipping it: %r",
+                _TOOL_CALL_OPEN,
+                e,
+            )
             return ""
         arguments = obj.get("arguments", {})
-        tool_calls.append({
-            "id": f"call_{uuid.uuid4().hex[:24]}",
-            "name": name,
-            "arguments_json": json.dumps(arguments),
-        })
+        tool_calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "name": name,
+                "arguments_json": json.dumps(arguments),
+            }
+        )
         return ""
 
     remaining = _TOOL_CALL_RE.sub(_handle, reply_text).strip()
@@ -1917,11 +2088,19 @@ def _run_tool_call_turn(token_cache, prompt, max_attempts=_TOOL_CALL_MAX_ATTEMPT
         _, tool_calls = _extract_tool_calls(text)
         if tool_calls:
             if attempt > 1:
-                logging.info("tool-call emulation succeeded on retry attempt %d/%d", attempt, max_attempts)
+                logging.info(
+                    "tool-call emulation succeeded on retry attempt %d/%d",
+                    attempt,
+                    max_attempts,
+                )
             return text, tool_calls
         logging.info(
             "tool-call emulation attempt %d/%d produced no action_request block%s",
-            attempt, max_attempts, "" if attempt < max_attempts else " -- giving up, falling back to plain content",
+            attempt,
+            max_attempts,
+            ""
+            if attempt < max_attempts
+            else " -- giving up, falling back to plain content",
         )
     return text, tool_calls
 
@@ -1995,7 +2174,9 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
         nonlocal pending_results
         if not pending_results:
             return text
-        preamble = "\n".join(f"(Result of your earlier {n} request: {t})" for n, t in pending_results)
+        preamble = "\n".join(
+            f"(Result of your earlier {n} request: {t})" for n, t in pending_results
+        )
         pending_results = []
         return f"{preamble}\n\n{text}" if text else preamble
 
@@ -2012,7 +2193,9 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
             tool_calls = m.get("tool_calls")
             if tool_calls:
                 for tc in tool_calls:
-                    tool_call_names[tc.get("id")] = (tc.get("function") or {}).get("name", "?")
+                    tool_call_names[tc.get("id")] = (tc.get("function") or {}).get(
+                        "name", "?"
+                    )
                 # Deliberately not rendered as a turn at all -- see the
                 # docstring above. Genuine assistant text alongside the
                 # tool_calls (rare, but possible) is still kept.
@@ -2050,7 +2233,12 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
 
     # Simple case: exactly one user message, no system prompt, no tools --
     # send it verbatim, unchanged from this proxy's original behavior.
-    if not system_parts and not tools_block and len(turns) == 1 and turns[0][0] == "User":
+    if (
+        not system_parts
+        and not tools_block
+        and len(turns) == 1
+        and turns[0][0] == "User"
+    ):
         return turns[0][1]
 
     lines = []
@@ -2129,20 +2317,37 @@ def make_handler(token_cache):
                 # still produces a diagnosable traceback in the log file
                 # instead of falling through to the server's generic
                 # per-thread error handler.
-                logging.exception("unhandled error in GET %s from %s", self.path, self.address_string())
+                logging.exception(
+                    "unhandled error in GET %s from %s",
+                    self.path,
+                    self.address_string(),
+                )
+                # Best-effort fallback: the real error is already logged
+                # above; if even sending a 500 fails (e.g. client already
+                # disconnected) there's nothing more useful to do than drop
+                # it.
                 try:
                     self._error(500, "internal error")
-                except Exception:
+                except Exception:  # nosec B110
                     pass
 
         def _do_GET(self):
             path = self.path.split("?", 1)[0].rstrip("/")
             logging.debug("GET %s from %s", path, self.address_string())
             if path == "/v1/models":
-                self._write_json(200, {
-                    "object": "list",
-                    "data": [{"id": "m365-copilot", "object": "model", "owned_by": "microsoft"}],
-                })
+                self._write_json(
+                    200,
+                    {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": "m365-copilot",
+                                "object": "model",
+                                "owned_by": "microsoft",
+                            }
+                        ],
+                    },
+                )
             elif path == "/healthz" or path == "":
                 self._write_json(200, {"status": "ok"})
             else:
@@ -2153,10 +2358,15 @@ def make_handler(token_cache):
                 self._do_POST()
             except Exception:
                 # See do_GET's comment -- same reasoning.
-                logging.exception("unhandled error in POST %s from %s", self.path, self.address_string())
+                logging.exception(
+                    "unhandled error in POST %s from %s",
+                    self.path,
+                    self.address_string(),
+                )
+                # See do_GET's comment above, same reasoning.
                 try:
                     self._error(500, "internal error")
-                except Exception:
+                except Exception:  # nosec B110
                     pass
 
         def _do_POST(self):
@@ -2181,7 +2391,9 @@ def make_handler(token_cache):
             messages = body.get("messages") or []
             tools = body.get("tools") or None
             tool_choice = body.get("tool_choice")
-            prompt = _render_conversation_prompt(messages, tools=tools, tool_choice=tool_choice)
+            prompt = _render_conversation_prompt(
+                messages, tools=tools, tool_choice=tool_choice
+            )
             if prompt is None:
                 self._error(400, "no usable message content found in 'messages'")
                 return
@@ -2191,7 +2403,12 @@ def make_handler(token_cache):
             logging.info(
                 "chat completion request from %s: %d message(s), rendered_prompt_length=%d chars, "
                 "stream=%s, model=%r, tools=%d",
-                self.address_string(), len(messages), len(prompt), stream, model, len(tools or []),
+                self.address_string(),
+                len(messages),
+                len(prompt),
+                stream,
+                model,
+                len(tools or []),
             )
 
             if stream:
@@ -2212,8 +2429,13 @@ def make_handler(token_cache):
 
             def emit(delta_obj, finish_reason=None):
                 chunk = {
-                    "id": completion_id, "object": "chat.completion.chunk", "created": created,
-                    "model": model, "choices": [{"index": 0, "delta": delta_obj, "finish_reason": finish_reason}],
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {"index": 0, "delta": delta_obj, "finish_reason": finish_reason}
+                    ],
                 }
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
                 self.wfile.flush()
@@ -2232,11 +2454,23 @@ def make_handler(token_cache):
                         # Leftover text is deliberately dropped here, not
                         # surfaced as delta content -- see _handle_full's
                         # comment on the same point for why.
-                        emit({"role": "assistant", "tool_calls": [
-                            {"index": i, "id": tc["id"], "type": "function",
-                             "function": {"name": tc["name"], "arguments": tc["arguments_json"]}}
-                            for i, tc in enumerate(tool_calls)
-                        ]})
+                        emit(
+                            {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "index": i,
+                                        "id": tc["id"],
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc["name"],
+                                            "arguments": tc["arguments_json"],
+                                        },
+                                    }
+                                    for i, tc in enumerate(tool_calls)
+                                ],
+                            }
+                        )
                         finish_reason = "tool_calls"
                     else:
                         emit({"role": "assistant", "content": text})
@@ -2244,20 +2478,30 @@ def make_handler(token_cache):
                 else:
                     first = True
                     for delta in run_chat_turn(token_cache, prompt):
-                        emit({"role": "assistant", "content": delta} if first else {"content": delta})
+                        emit(
+                            {"role": "assistant", "content": delta}
+                            if first
+                            else {"content": delta}
+                        )
                         first = False
                     finish_reason = "stop"
 
                 final = {
-                    "id": completion_id, "object": "chat.completion.chunk", "created": created,
-                    "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                    ],
                 }
                 self.wfile.write(f"data: {json.dumps(final)}\n\n".encode("utf-8"))
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 logging.info(
                     "chat completion (streaming) %s finished successfully (finish_reason=%s)",
-                    completion_id, finish_reason,
+                    completion_id,
+                    finish_reason,
                 )
             except Exception as e:
                 # Deliberately broad: this is the last line of defense before a
@@ -2266,7 +2510,9 @@ def make_handler(token_cache):
                 # Catching everything here -- not just our own proxy exception
                 # types -- means any crash, expected or not, leaves a full
                 # traceback in the log file rather than a silent/opaque failure.
-                logging.exception("chat completion (streaming) %s failed", completion_id)
+                logging.exception(
+                    "chat completion (streaming) %s failed", completion_id
+                )
                 err = {"error": {"message": str(e), "type": "proxy_error"}}
                 try:
                     self.wfile.write(f"data: {json.dumps(err)}\n\n".encode("utf-8"))
@@ -2297,32 +2543,58 @@ def make_handler(token_cache):
                 # final answer) rather than a genuine user-facing preamble,
                 # and there is no reliable way to tell the two apart -- see
                 # REVERSE_ENGINEERING.md's "Tool-calling emulation" section.
-                message = {"role": "assistant", "content": None, "tool_calls": [
-                    {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments_json"]}}
-                    for tc in tool_calls
-                ]}
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": tc["arguments_json"],
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                }
                 finish_reason = "tool_calls"
                 logging.info(
                     "chat completion %s finished successfully as a tool call (reply_length=%d chars, calls=%s)",
-                    completion_id, len(text), ", ".join(tc["name"] for tc in tool_calls),
+                    completion_id,
+                    len(text),
+                    ", ".join(tc["name"] for tc in tool_calls),
                 )
             else:
                 message = {"role": "assistant", "content": text}
                 finish_reason = "stop"
-                logging.info("chat completion %s finished successfully (reply_length=%d chars)", completion_id, len(text))
+                logging.info(
+                    "chat completion %s finished successfully (reply_length=%d chars)",
+                    completion_id,
+                    len(text),
+                )
 
-            self._write_json(200, {
-                "id": completion_id,
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": finish_reason,
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            })
+            self._write_json(
+                200,
+                {
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": message,
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                },
+            )
 
     return ProxyHandler
 
@@ -2399,11 +2671,19 @@ def _log_startup_banner(args):
     logging.info("m365_openai_proxy %s starting up", PROXY_VERSION)
     logging.info(
         "pid=%d python=%s (%s) platform=%s",
-        os.getpid(), platform.python_version(), platform.python_implementation(), platform.platform(),
+        os.getpid(),
+        platform.python_version(),
+        platform.python_implementation(),
+        platform.platform(),
     )
     logging.info(
         "args: host=%s port=%d credentials_prefix=%s log_file=%s log_level=%s init_credentials=%s",
-        args.host, args.port, args.credentials_prefix, args.log_file, args.log_level, args.init_credentials,
+        args.host,
+        args.port,
+        args.credentials_prefix,
+        args.log_file,
+        args.log_level,
+        args.init_credentials,
     )
     logging.info("cwd=%s script=%s", os.getcwd(), os.path.abspath(__file__))
     logging.info("=" * 78)
@@ -2422,7 +2702,10 @@ def _log_uncaught_exception(exc_type, exc_value, exc_tb):
     if issubclass(exc_type, KeyboardInterrupt):
         logging.info("interrupted (KeyboardInterrupt) at top level")
         return
-    logging.critical("unhandled exception reached the top of the main thread", exc_info=(exc_type, exc_value, exc_tb))
+    logging.critical(
+        "unhandled exception reached the top of the main thread",
+        exc_info=(exc_type, exc_value, exc_tb),
+    )
     _print_fatal_console_message("stopped because of an unexpected internal error.")
 
 
@@ -2436,17 +2719,44 @@ class _LoggingHTTPServer(http.server.ThreadingHTTPServer):
     setup is meant to prevent."""
 
     def handle_error(self, request, client_address):
-        logging.exception("unhandled exception while handling a request from %s", client_address)
+        logging.exception(
+            "unhandled exception while handling a request from %s", client_address
+        )
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1 -- there is no per-request auth, keep this local unless you have your own reason not to)")
-    parser.add_argument("--port", type=int, default=8000, help="bind port (default: 8000)")
-    parser.add_argument("--credentials-prefix", default="m365_openai_proxy", help="path prefix for the four plain-text credential files: <prefix>.refresh_token.conf, <prefix>.encrypted_refresh_token.conf, <prefix>.cache_encryption_key.conf, <prefix>.local_storage_key.conf (default: ./m365_openai_proxy -- see module docstring for their format)")
-    parser.add_argument("--init-credentials", action="store_true", help="write starter templates for all four <prefix>.*.conf credential files (each just a comment header explaining what to paste and where to get it) and exit, without starting the server")
-    parser.add_argument("--log-file", default="m365_openai_proxy.log", help="path to the log file (default: ./m365_openai_proxy.log) -- the ONLY place this program logs to (nothing goes to the console). Never contains secrets/tokens/passwords -- see module docstring's LOGGING section")
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="log verbosity for --log-file (default: INFO)")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind address (default: 127.0.0.1 -- there is no per-request auth, keep this local unless you have your own reason not to)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000, help="bind port (default: 8000)"
+    )
+    parser.add_argument(
+        "--credentials-prefix",
+        default="m365_openai_proxy",
+        help="path prefix for the four plain-text credential files: <prefix>.refresh_token.conf, <prefix>.encrypted_refresh_token.conf, <prefix>.cache_encryption_key.conf, <prefix>.local_storage_key.conf (default: ./m365_openai_proxy -- see module docstring for their format)",
+    )
+    parser.add_argument(
+        "--init-credentials",
+        action="store_true",
+        help="write starter templates for all four <prefix>.*.conf credential files (each just a comment header explaining what to paste and where to get it) and exit, without starting the server",
+    )
+    parser.add_argument(
+        "--log-file",
+        default="m365_openai_proxy.log",
+        help="path to the log file (default: ./m365_openai_proxy.log) -- the ONLY place this program logs to (nothing goes to the console). Never contains secrets/tokens/passwords -- see module docstring's LOGGING section",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="log verbosity for --log-file (default: INFO)",
+    )
     args = parser.parse_args()
 
     _configure_logging(args.log_file, getattr(logging, args.log_level))
@@ -2458,12 +2768,15 @@ def main():
             write_credentials_template(args.credentials_prefix)
         except CredentialError as e:
             logging.error("%s", e)
-            _print_fatal_console_message("could not write the credentials template files.")
+            _print_fatal_console_message(
+                "could not write the credentials template files."
+            )
             sys.exit(1)
         logging.info(
             "wrote starter credential file templates (%s.{%s}) -- fill in one of the "
             "two documented options and rerun without --init-credentials",
-            args.credentials_prefix, ",".join(FIELD_NAMES),
+            args.credentials_prefix,
+            ",".join(FIELD_NAMES),
         )
         return
 
@@ -2472,14 +2785,20 @@ def main():
         token_cache = TokenCache(store)
         logging.info("validating configured credential against Entra ID...")
         auth = token_cache.get()
-        logging.info("credential OK -- authenticated as oid=%s tid=%s", auth.oid, auth.tid)
+        logging.info(
+            "credential OK -- authenticated as oid=%s tid=%s", auth.oid, auth.tid
+        )
     except CredentialError as e:
         logging.error("%s", e)
-        _print_fatal_console_message("could not start because of a problem with its credential files.")
+        _print_fatal_console_message(
+            "could not start because of a problem with its credential files."
+        )
         sys.exit(1)
     except AuthError as e:
         logging.error("configured credential was rejected by Entra ID: %s", e)
-        _print_fatal_console_message("could not start because the sign-in information it was given was rejected.")
+        _print_fatal_console_message(
+            "could not start because the sign-in information it was given was rejected."
+        )
         sys.exit(1)
     except Exception:
         # Broad on purpose: an unexpected bug during startup should still
@@ -2487,12 +2806,18 @@ def main():
         # process exit the operator can't explain to whoever they send the
         # log to.
         logging.exception("unexpected error during startup")
-        _print_fatal_console_message("could not start because of an unexpected internal error.")
+        _print_fatal_console_message(
+            "could not start because of an unexpected internal error."
+        )
         sys.exit(1)
 
     handler_cls = make_handler(token_cache)
     server = _LoggingHTTPServer((args.host, args.port), handler_cls)
-    logging.info("listening on http://%s:%d (Ctrl+C to stop) -- no auth required on the API itself", args.host, args.port)
+    logging.info(
+        "listening on http://%s:%d (Ctrl+C to stop) -- no auth required on the API itself",
+        args.host,
+        args.port,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2504,7 +2829,9 @@ def main():
         # the same exception to sys.excepthook, logging and printing it a
         # second time).
         logging.exception("server crashed unexpectedly and has stopped")
-        _print_fatal_console_message("has stopped running because of an unexpected error.")
+        _print_fatal_console_message(
+            "has stopped running because of an unexpected error."
+        )
         sys.exit(1)
     finally:
         server.server_close()

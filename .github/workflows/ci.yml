@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     name: Lint (ruff)
@@ -27,13 +31,50 @@ jobs:
       - name: ruff check
         run: ruff check .
 
-  compatibility:
-    name: Smoke test (Python ${{ matrix.python-version }})
+      - name: ruff format --check
+        run: ruff format --check .
+
+  security:
+    name: Security scan (bandit)
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bandit
+        run: python -m pip install --upgrade bandit
+
+      # Config (skips + rationale for the repo-wide false positives) lives in
+      # pyproject.toml's [tool.bandit] table. The few remaining true
+      # positives bandit's heuristics would otherwise flag are suppressed
+      # inline with `# nosec BXXX` comments explaining why, right at each
+      # site -- see m365_openai_proxy.py.
+      - name: bandit
+        run: bandit -c pyproject.toml m365_openai_proxy.py
+
+  compatibility:
+    name: Smoke test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        include:
+          # Full Python support range on Linux, the cheapest/fastest runner.
+          - { os: ubuntu-latest, python-version: "3.9" }
+          - { os: ubuntu-latest, python-version: "3.10" }
+          - { os: ubuntu-latest, python-version: "3.11" }
+          - { os: ubuntu-latest, python-version: "3.12" }
+          - { os: ubuntu-latest, python-version: "3.13" }
+          # The README's whole pitch is "drop this one file onto any machine
+          # with a Python 3 interpreter" -- sanity-check the oldest and
+          # newest supported interpreters on macOS and Windows too.
+          - { os: macos-latest, python-version: "3.9" }
+          - { os: macos-latest, python-version: "3.13" }
+          - { os: windows-latest, python-version: "3.9" }
+          - { os: windows-latest, python-version: "3.13" }
     steps:
       - uses: actions/checkout@v4
 
@@ -47,6 +88,6 @@ jobs:
         run: python -m py_compile m365_openai_proxy.py
 
       # Imports the module (exercising the pure-Python AES-256-GCM
-      # self-check assertion at line ~380) and validates argument parsing.
+      # self-check assertion) and validates argument parsing.
       - name: Run --help
         run: python m365_openai_proxy.py --help
