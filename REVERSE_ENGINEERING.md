@@ -40,6 +40,17 @@ sections below are where that lives.
   Sydney want resent history, or look it up server-side by ConversationId?
   — every capture so far is a brand-new single-turn conversation); whether
   `msal.cache.encryption` is `HttpOnly`.
+- **Tool-calling bridge (Local MCP)**: Sydney/Chathub has a real, concrete
+  mechanism for invoking Model Context Protocol tools from the client side —
+  `mcp_discover`/`mcp_describe`/`invoke_local_plugin` SignalR invocation
+  targets on the SAME Chathub connection this project already uses, extracted
+  directly from the officeweb client's own source (not guessed). See the
+  "Local MCP tool-calling bridge" section near the end. **Not implemented**:
+  wiring this up to look like OpenAI tool-calling for a client like OpenCode
+  requires solving a real architecture mismatch (Sydney's invocation is
+  synchronous and mid-turn with a server-side timeout; OpenAI tool-calling is
+  asynchronous across separate HTTP requests) — see that section for the
+  full writeup and why this is a real next-phase project, not a quick patch.
 - **Not actually in this repo**: none of the `.har` capture files or
   `Chathub.log.jsonl` referenced throughout this document were ever committed
   (they carry live session cookies/tokens and are `.gitignore`d) — this
@@ -838,3 +849,193 @@ it within seconds to low-minutes of any snapshot being taken (this looked consis
 with the raciness observed independently via the Network-tab live-capture method
 throughout this whole investigation — see the several "stale token" sections above).
 This turned out to be the wrong explanation — see the update above.
+
+---
+
+## Update: Local MCP tool-calling bridge — found and documented, NOT implemented
+
+Investigated whether Sydney's proprietary plugin system could be bridged to
+something resembling OpenAI-style tool/function calling, so that a client like
+OpenCode could do real agentic work (not just chat) against this proxy. Short
+answer: **there is a real, concrete mechanism** — Sydney can invoke Model
+Context Protocol (MCP) tools through the client, over the exact same Chathub
+SignalR connection this project already implements — and its wire shape has
+been extracted directly from the officeweb client's own downloaded JS
+(`m365.cloud.microsoft`'s webpack bundles, captured in the big HAR from the
+initial login session), not guessed. **But turning this into OpenAI-shaped
+tool-calling for a client like OpenCode hits a real architecture mismatch that
+is not a quick fix** — see the "The actual blocker" section below before
+starting on this.
+
+### How it works (extracted from officeweb's own source)
+
+Search terms that led here: `LocalMCPDiscovery` (a message-annotation type
+seen in the `chat` invocation payload builder), which led to a whole
+client-side MCP bridge implementation in one bundle
+(`sydney-utils.vendors.a05ecef2.chunk.js`, module `690063`), and its wiring
+into the Chathub `HubConnection` in another (`6810.d1f1688a.chunk.js`).
+
+**The registration (this is the concrete proof it's on the SAME Chathub
+connection, not some separate transport):**
+```js
+this.connection.on('update', this.update.bind(this)),
+this.connection.on('completion', this.completion.bind(this)),
+this.connection.on('invoke_local_plugin', this.invokeLocalPlugin),
+this.connection.on('mcp_discover', this.localMCPPluginRouter.discoverMCPServers.bind(this.localMCPPluginRouter)),
+this.connection.on('mcp_describe', this.localMCPPluginRouter.describeMCPServers.bind(this.localMCPPluginRouter)),
+this.connection.on('unfurl_result', this.handleUnfurlResult),
+```
+`this.connection` is the exact same object `'update'`/`'completion'` are
+registered on — i.e. the same Chathub SignalR hub connection this proxy
+already opens and speaks. `mcp_discover`/`mcp_describe`/`invoke_local_plugin`
+are three more SignalR invocation *targets* the server can call on the
+client, alongside the `update`/`Metrics` targets already fully understood
+(see "Chathub.log.jsonl" section above).
+
+**`mcp_discover`** (client method `discoverMCPServers`): server asks the
+client to enumerate matching local MCP servers.
+```jsonc
+// server -> client, SignalR type:1 Invocation, target:"mcp_discover"
+// arguments[0] shape:
+{
+  "invocation": { "payload": "{\"queries\":[...]}" },
+  "correlation_id": "<opaque id, echoed back>"
+}
+// client's return value (see "client results" note below for how this gets back to the server):
+{
+  "schema_version": "https://copilot.microsoft.com/schemas/plugins/local/transport/1.0",
+  "correlation_id": "<echoed>",
+  "response": {
+    "status": "Success",  // or "Fail"
+    "message": "Local MCP servers discovered successfully.",
+    "payload": "{\"server_ids\":[\"...\"]}"
+  }
+}
+```
+
+**`mcp_describe`** (client method `describeMCPServers`): same envelope shape,
+request payload is `{"server_ids":[...],"capabilities":["tools", ...]}`
+(capabilities defaults to `["tools"]` if omitted), response payload is
+`{"servers":[{server_id, tools:[{name, description, inputSchema, _meta?}],
+prompts, resources, resourceTemplates, transport}, ...]}`. `inputSchema` here
+is a plain JSON Schema object — structurally identical to what OpenAI calls
+`parameters` in its own tool-calling `tools` array, so translating one to the
+other is a lossless, mechanical mapping.
+
+**`invoke_local_plugin`** (client method `invokeLocalPlugin` /
+`invokeMCPServer` once it self-selects on the payload shape): the actual tool
+call.
+```jsonc
+// server -> client, target:"invoke_local_plugin"
+{
+  "invocation": {
+    "payload": "{\"method\":\"mcp_<toolName>\",\"params\":{...}}",
+    "local_endpoint": "mcp://<server_id>"
+  },
+  "correlation_id": "<opaque id>"
+}
+```
+The client parses `method` as `mcp_<toolName>` (literal `"mcp"` prefix before
+the first `_`), looks up `<server_id>` from `local_endpoint` (stripping the
+`mcp://` scheme), finds that server's `tools[]` entry matching `<toolName>`,
+and — this is the important part — calls a REAL MCP client's `callTool({name,
+arguments})` method against it (the code literally calls `.connect()`,
+`.callTool()`, `.readResource()` — the same method names as the official MCP
+TypeScript SDK's `Client` class). The result is wrapped and sent back as:
+```jsonc
+{
+  "schema_version": "https://copilot.microsoft.com/schemas/plugins/local/transport/1.0",
+  "correlation_id": "<echoed>",
+  "response": {
+    "status": "Success",
+    "message": "Method <toolName> invoked successfully.",
+    "payload": "{\"result\":[{\"id\":\"<correlation_id>\",\"data\":\"<JSON-encoded MCP tool result>\",\"type\":\"text/plain\",\"description_for_model\":\"Tool invocation result for method <toolName> on server <server_id>\"}],\"jsonrpc\":\"2.0\",\"id\":\"<correlation_id>\"}"
+  }
+}
+```
+
+**How the client's return value gets back to the server**: `discoverMCPServers`/
+`describeMCPServers`/`invokeMCPServer` are all plain `async` functions
+registered via `connection.on(target, handler)`, and simply *return* their
+response object rather than calling any explicit "send reply" API. This
+matches ASP.NET Core SignalR's **"client results"** feature (introduced
+.NET 7 / a matching `@microsoft/signalr` version): when the server invokes a
+client method WITH an `invocationId` (rather than a fire-and-forget `Send`),
+the JS SignalR client automatically awaits the registered handler's returned
+Promise and transmits a `type:3` Completion frame back to the server, keyed
+by that same `invocationId`, carrying the resolved value as `result` —
+entirely transparent to the application code shown above. **This detail is
+inferred from how the feature is documented to work, not directly observed
+on the wire** (see "What's NOT yet confirmed" below) — but it's consistent
+with everything else here, since we independently confirmed via
+`Chathub.log.jsonl` that ordinary fire-and-forget server invocations (the
+`Metrics` target) carry no `invocationId` at all, which is exactly the
+contrast this theory predicts.
+
+### The actual blocker: synchronous mid-turn RPC vs. OpenAI's async tool-calling contract
+
+Even with the wire shape fully known, there's a genuine architecture mismatch
+between how Sydney's Local MCP works and how OpenAI tool-calling works, and
+it's not a minor detail:
+
+- **Sydney's model**: `invoke_local_plugin` happens *mid-turn*, synchronously,
+  over the *same live connection* that's still streaming the rest of the
+  reply. The server is waiting, with some (unknown, but presumably
+  seconds-scale, not minutes-scale) timeout, for the SignalR `type:3`
+  completion to come back on that same `invocationId` before it can continue
+  generating. The real browser client can satisfy this because it has a
+  *live, synchronous* MCP connection sitting right there in the same process.
+- **OpenAI's model**: the model's response *stops* with `finish_reason:
+  "tool_calls"`, the HTTP response for that request is already complete, and
+  the client (OpenCode) decides in its own time what to do, then sends a
+  **brand-new HTTP request** with the tool result appended to `messages`.
+  There is no expectation of a fast turnaround — a human could be in the loop.
+
+For this proxy to present `invoke_local_plugin` to OpenCode as an OpenAI tool
+call, it would have to: (1) receive the mid-turn invocation, (2) translate it
+into a `tool_calls` chunk and end the *current* HTTP response early, (3) keep
+the Sydney WebSocket connection and the pending SignalR invocation alive and
+un-completed while waiting for an *entirely separate* future HTTP request from
+OpenCode (which requires the multi-turn/conversation-continuation work
+described elsewhere in this document to correlate that follow-up request back
+to the right pending Sydney turn), then (4) complete the SignalR invocation
+with whatever OpenCode eventually sends back. Step (3) is the real risk: if
+Sydney's server-side timeout on a pending client-results invocation is short
+(ASP.NET Core SignalR's various timeouts are commonly configured in the
+10-30s range, though this specific one is unconfirmed), a real tool-executing
+agent loop easily exceeds it, and the whole approach falls over. This is a
+solvable-in-principle but genuinely substantial next-phase engineering effort,
+not a small patch to `exchange_refresh_token`-style fixes seen elsewhere in
+this document.
+
+### What's NOT yet confirmed (would need a live capture to settle)
+
+- Whether `mcp_discover`/`mcp_describe`/`invoke_local_plugin` frames actually
+  carry an `invocationId` the way "client results" implies — never directly
+  observed, only inferred from the client code's structure and by elimination
+  (contrasted against the confirmed-`invocationId`-less `Metrics` target).
+- What Sydney's server-side timeout actually is for a pending client-results
+  invocation before it gives up (directly determines whether step (3) above
+  is viable at all).
+- Whether "Local MCP" is actually enabled/reachable for this specific
+  account/tenant at all — `CHATHUB_VARIANTS` in `m365_openai_proxy.py`
+  already includes `EnableMcpServerWidgets`/`feature.EnableMcpServerWidgets`
+  among the flags sent, but whether that flag is *honored* (vs. silently
+  ignored because the account/tenant/license tier doesn't have this feature)
+  is unknown — the UI toggle backing this (`enableLocalMcp` in the officeweb
+  client's own feature-flag store) was found in the client code but never
+  observed actually turned on or exercised in any capture.
+- The exact shape of a `chat` invocation that advertises the client itself as
+  MCP-capable in the first place (does the client need to send something in
+  the outgoing payload announcing "I support Local MCP" before Sydney will
+  ever bother sending `mcp_discover`? The `LocalMCPDiscovery` message
+  annotation type suggests yes, but its outgoing shape wasn't captured).
+
+The concrete next step, if this is worth pursuing further: a live capture
+where Local MCP is actually exercised end-to-end in the real
+`m365.cloud.microsoft` web client (find the "Local MCP" toggle in its
+settings/menu, point it at a real local MCP server, and have a conversation
+that actually triggers a tool call) would answer all four of the above in one
+shot and turn this from "confirmed by reading source" to "confirmed on the
+wire" — the same bar every other finding in this document was held to before
+being implemented.

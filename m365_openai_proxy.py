@@ -243,6 +243,19 @@ KNOWN LIMITATIONS
   protocol's `throttling: {maxNumUserMessagesInConversation, ...}` field --
   see REVERSE_ENGINEERING.md) is not surfaced or specially handled; if you
   hit a quota, whatever Sydney returns is passed through as-is.
+- **No tool/function calling.** This proxy does not implement OpenAI-style
+  `tools`/`tool_calls`. Sydney does have a genuine tool-invocation mechanism
+  (Local MCP, over the same Chathub connection -- `mcp_discover`/
+  `mcp_describe`/`invoke_local_plugin` SignalR targets) which was reverse-
+  engineered from the officeweb client's own source and is fully documented
+  in REVERSE_ENGINEERING.md's "Local MCP tool-calling bridge" section, but
+  it is NOT implemented here: bridging it to OpenAI's async, multi-HTTP-
+  request tool-calling contract runs into a real architecture mismatch
+  (Sydney's invocation is synchronous, mid-turn, and presumably timeout-
+  bound) that is a substantial next-phase project, not a quick patch. If
+  you're evaluating this proxy for an agentic coding client (e.g. OpenCode)
+  that relies on tool calls to edit files/run commands, assume that will not
+  work until/unless that bridge gets built.
 
 ------------------------------------------------------------------------------
 REVERSE-ENGINEERING PROVENANCE / CONFIDENCE

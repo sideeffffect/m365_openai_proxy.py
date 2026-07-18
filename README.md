@@ -77,6 +77,15 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
 - **No multi-turn conversation memory.** Only the last `"user"`-role
   message in `messages` is sent; every call starts a brand-new Sydney
   conversation. Prior turns and system prompts are silently discarded.
+- **No tool/function calling.** Sydney does have a real MCP-based tool-
+  invocation mechanism, reverse-engineered from the officeweb client and
+  documented in `REVERSE_ENGINEERING.md`'s "Local MCP tool-calling bridge"
+  section — but it is **not implemented here**. Bridging it to OpenAI's
+  tool-calling contract runs into a genuine architecture mismatch (Sydney's
+  invocation is synchronous and mid-turn; OpenAI tool-calling is async
+  across separate HTTP requests). If you're evaluating this for an agentic
+  coding client like OpenCode that needs to edit files/run commands via
+  tool calls, assume that will not work.
 - `usage` (token counts) in every response is always zero — no token
   counting is implemented.
 - One Chathub WebSocket is opened and closed per HTTP request — no
