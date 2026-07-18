@@ -153,32 +153,59 @@ will actually work:
   (Aider's config still wants *some* string in `--openai-api-key`; this
   proxy ignores it entirely — see AUTHENTICATION MODEL above.)
 
-- **[OpenCode](https://opencode.ai/)** — technically works via this proxy's
-  tool-calling emulation, but expect it to be unreliable. OpenCode is built
-  on the Vercel AI SDK's `generateText({ tools })` loop with no plain-text
-  fallback, so it depends entirely on this proxy's emulated `tool_calls`
-  (see "Known limitations" above) — which, per the live-testing writeup in
-  `REVERSE_ENGINEERING.md`, only reliably produces a call about half the
-  time per attempt even under the best conditions (3 retries raise this
-  substantially, but not to 100%). A long OpenCode session making many tool
-  calls in a row has a real chance of the model just answering in plain
-  text at some point instead of calling a tool, which OpenCode isn't
-  designed to gracefully recover from. Point OpenCode at this proxy the
-  same way as any OpenAI-compatible custom provider (`baseURL` pointed at
-  `http://127.0.0.1:8000/v1`, any placeholder API key) if you want to try
-  it, but go in with that expectation.
+- **[OpenCode](https://opencode.ai/)** — **tested against the real OpenCode
+  CLI and did not work.** OpenCode is built on the Vercel AI SDK's
+  `generateText({ tools })` loop with no plain-text fallback, so it depends
+  entirely on this proxy's emulated `tool_calls` (see "Known limitations"
+  above). Three separate full end-to-end sessions were run against a real
+  OpenCode CLI (via a custom `@ai-sdk/openai-compatible` provider pointed at
+  this proxy) on a simple "read this file and add a function to it" task;
+  all three failed to produce a single working tool call — OpenCode's real
+  system prompt plus its full tool schema list runs 30-40KB, and neither a
+  recency-bias mitigation nor raising the retry budget to 5 changed the
+  outcome (see REVERSE_ENGINEERING.md's "production-scale end-to-end
+  validation" section for the full account, including the exact config
+  used). Configuring OpenCode against this proxy is described there if you
+  want to try it yourself, but the honest current answer is: it does not
+  work yet.
 
-- **[OpenHands CLI](https://docs.openhands.dev/)** — same emulated-
-  tool-calling dependency and reliability caveat as OpenCode applies if
-  configured for native tool calling against this proxy. OpenHands/LiteLLM
-  also has its own client-side "mock function calling" mode for backends
-  without native tool support (converts tool schemas to text and parses a
+- **[OpenHands CLI](https://docs.openhands.dev/)** — **tested against the
+  real OpenHands CLI and achieved one genuine, fully verified success** out
+  of two full end-to-end sessions tried on the same task. In the successful
+  session, OpenHands (via `--override-with-envs` pointed at this proxy)
+  actually read a real file through a real tool call, actually edited it
+  through a real tool call, and gave a correct final summary — confirmed by
+  inspecting the file on disk afterward. The other session never produced a
+  working tool call and gave an incorrect final answer. This is real,
+  demonstrated, but unreliable success, consistent with this proxy's
+  "roughly a coin flip per attempt, better with retries, still not
+  guaranteed" self-assessment above — see REVERSE_ENGINEERING.md for the
+  full account and the exact invocation used. OpenHands/LiteLLM also has
+  its own client-side "mock function calling" mode for backends without
+  native tool support (converts tool schemas to text and parses a
   different, LiteLLM-specific convention back out on the *client* side) —
-  this proxy's emulation was not tested against that mode specifically, and
-  the two approaches would be redundant with each other; if you try
-  OpenHands, using its own non-native-tool-calling mode instead of this
-  proxy's `tools` emulation (i.e. never sending `tools` in the request at
-  all) is untested but may be worth trying as an alternative.
+  untested against this proxy, and would be redundant with this proxy's own
+  emulation if both were active at once; worth trying as an alternative if
+  you hit reliability problems (configure OpenHands for non-native tool
+  calling so it never sends `tools` to this proxy at all).
+
+- **[Goose CLI](https://github.com/aaif-goose/goose/)** — **tested against
+  the real Goose CLI (the `goose` Rust binary from `download_cli.sh`, not
+  the Electron Desktop app — the `goose` command can resolve to either
+  depending on install order) and did not work: 0 of 4 full sessions
+  succeeded** on the same task. Goose's default extension set offers the
+  model **18 tools** at once (more than either OpenCode's 10 or OpenHands'
+  6), rendering to a ~19.6KB prompt, and every attempt across 3 sessions
+  fell back to the flat-refusal failure mode. Restricting Goose to just its
+  `developer` extension (`--no-profile --with-builtin developer`, 5 tools,
+  ~6.7KB prompt) changed the failure *shape* to Sydney's own code-
+  interpreter self-preempting instead of refusing — consistent with the
+  tool-count/prompt-size hypothesis noted in the OpenCode section above —
+  but still did not produce a working tool call in that trial either.
+  Configure Goose against this proxy via a custom-provider JSON (see
+  REVERSE_ENGINEERING.md for the exact config and invocations used) if you
+  want to experiment further, but the honest current answer is the same as
+  OpenCode's: it does not work yet.
 
 ## Quick start
 
