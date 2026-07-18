@@ -1,0 +1,23 @@
+[tool.bandit]
+# This project is a single stdlib-only script (see README) -- there is no
+# build system here, this file exists solely to hold bandit's config.
+#
+# Skipped checks, and why each is a false positive/non-issue in this file:
+#
+# B101 (assert_used): m365_openai_proxy.py has exactly one assert, a
+#   startup-time sanity check that the from-scratch pure-Python AES S-box
+#   construction produced the textbook FIPS-197 values (see
+#   REVERSE_ENGINEERING.md). It's a correctness self-check for the crypto
+#   implementation, not a security control -- if it's ever compiled out
+#   under `-O`, nothing security-relevant is lost, the module just loses an
+#   early sanity check in favor of failing later/louder on bad ciphertext.
+#
+# B105 (hardcoded_password_string): every hit is bandit's heuristic matching
+#   a variable/string containing a "token"/"password"-adjacent word. In this
+#   file that's always either a fixed HTTPS endpoint constant (e.g.
+#   TOKEN_URL_TEMPLATE, TOKEN_REDIRECT_URI) or long human-readable
+#   documentation text in FIELD_COMMENTS explaining to the *user* how to
+#   obtain and paste their own credentials into local gitignored files. No
+#   actual secret is ever hardcoded here -- real credentials only ever live
+#   in the four *.conf files this script reads at runtime (see .gitignore).
+skips = ["B101", "B105"]
