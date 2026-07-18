@@ -4,6 +4,13 @@ A single, self-contained, stdlib-only Python 3 script that exposes an
 OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`) backed by
 `https://m365.cloud.microsoft`'s Copilot chat backend.
 
+> **Before you integrate this with anything:** each `/v1/chat/completions`
+> call is a fresh, context-free, one-shot Sydney conversation — the proxy
+> sends only the *last* message in `messages` and discards the rest. There
+> is currently **no multi-turn conversation memory**. See "Known
+> limitations" below before wiring this into a chat UI that expects normal
+> follow-up-question behavior.
+
 **Fully self-contained.** The entire project is the one file,
 `m365_openai_proxy.py`. It uses only the Python 3 standard library — no
 `pip install` of anything, for any feature, ever. That includes the
@@ -56,12 +63,33 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   each value,
 - the full HKDF+AES-GCM decrypt algorithm, implemented from scratch in pure
   Python,
-- the one caveat that applies to *every* credential-harvesting method here:
-  MSAL rotates the underlying refresh token in the background continuously,
-  so whichever values you copy must be captured close together in time and
-  used promptly,
+- the exact request shape (tenant-specific token endpoint, MSAL
+  identity/telemetry fields) `exchange_refresh_token()` sends and why —
+  matching this precisely turned out to matter: an earlier revision that
+  omitted it had otherwise-valid tokens rejected by Entra ID as if they
+  were stale, which they weren't (see REVERSE_ENGINEERING.md for the full
+  writeup),
 - the full authentication model and why bind address defaults to
   `127.0.0.1`.
+
+## Known limitations
+
+- **No multi-turn conversation memory.** Only the last `"user"`-role
+  message in `messages` is sent; every call starts a brand-new Sydney
+  conversation. Prior turns and system prompts are silently discarded.
+- `usage` (token counts) in every response is always zero — no token
+  counting is implemented.
+- One Chathub WebSocket is opened and closed per HTTP request — no
+  connection pooling or reuse.
+- Sydney's own per-conversation rate limiting isn't specially handled or
+  surfaced; if you hit a quota, whatever Sydney returns is passed through
+  as-is.
+- Credential values (especially a plaintext refresh token grabbed from the
+  Network tab) can go stale if MSAL rotates them in the background before
+  you finish pasting them in — capture the credential files close together
+  in time as good practice, though this is a secondary risk, not the
+  primary failure mode it was once thought to be (see
+  REVERSE_ENGINEERING.md).
 
 ## Quick start
 
@@ -97,3 +125,13 @@ Run `python3 m365_openai_proxy.py --help` for all flags, including
 See `REVERSE_ENGINEERING.md` for the full protocol reverse-engineering
 writeup this implementation is based on (Chathub/SignalR wire format, the
 FOCI token-family auth chain, the MSAL cache-encryption algorithm, etc).
+
+## Requirements
+
+Python 3 standard library only, no third-party packages. Developed and
+tested against Python 3.12; no version-specific stdlib features are
+knowingly used, but only 3.12 has been verified.
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE).

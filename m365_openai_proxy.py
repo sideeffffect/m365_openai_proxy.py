@@ -204,19 +204,45 @@ Only ONE of two value combinations needs to actually be filled in:
      step -- no third-party crypto package needed for any of this). Confirmed
      working end-to-end during development: decrypted a real captured cache
      entry into well-formed
-     `{"credentialType":"RefreshToken","clientId":...,"secret":...}` JSON.
-     The one caveat that remains is freshness, not correctness: MSAL rotates
-     this cache entry in the background continuously (observed directly),
-     so all three of `local_storage_key`/`encrypted_refresh_token`/
-     `cache_encryption_key` must be captured at essentially the same moment,
-     or Entra will reject the (by-then-superseded) decrypted secret with
-     `AADSTS70000`/`invalid_grant` -- exactly like a stale plaintext
-     `refresh_token` from option 1 would.
+     `{"credentialType":"RefreshToken","clientId":...,"secret":...}` JSON,
+     and that same decrypted secret was then successfully redeemed against
+     Entra ID and used to serve real chat completions (see
+     REVERSE_ENGINEERING.md's writeup on the `exchange_refresh_token()`
+     request-shape fix for why earlier attempts at this appeared to fail).
+     `local_storage_key`/`encrypted_refresh_token`/`cache_encryption_key`
+     should still be captured close together in time as good practice (a
+     `local_storage_key`/`cache_encryption_key` pair with mismatched `id`s
+     will fail to decrypt outright, which is easy to tell apart from Entra
+     rejecting a since-superseded token), but this is no longer the
+     dominant failure mode it once appeared to be.
 
 Whichever option you fill in, the proxy overwrites the `refresh_token`
 file after every token exchange with Entra's newly-rotated refresh token
 (see AUTHENTICATION MODEL above for why) -- the other three files are left
 untouched so you can see what was originally supplied.
+
+------------------------------------------------------------------------------
+KNOWN LIMITATIONS
+------------------------------------------------------------------------------
+- **No multi-turn conversation memory.** `_last_user_message()` extracts and
+  sends only the LAST message with role "user" from the `messages` array --
+  everything else (prior turns, system prompts) is silently discarded, and
+  `run_chat_turn()` mints a brand-new random Chathub `ConversationId` on
+  every single API call. This is the single most surprising thing about
+  this proxy if you're expecting normal ChatGPT-style follow-up-question
+  behavior: it has none. Each `/v1/chat/completions` call is a fresh,
+  context-free, one-shot Sydney conversation. Threading real multi-turn
+  history into Sydney (does it want the full history resent per turn, or
+  does it look it up server-side from a stable ConversationId?) is
+  unexplored -- see REVERSE_ENGINEERING.md's "still open" notes.
+- `usage` (prompt/completion/total tokens) in every response is hardcoded
+  to zero -- this proxy does no token counting at all.
+- One Chathub WebSocket is opened, used for exactly one turn, and closed
+  per HTTP request -- no connection pooling or reuse across requests.
+- Sydney's own per-conversation throttling info (seen in the Chathub
+  protocol's `throttling: {maxNumUserMessagesInConversation, ...}` field --
+  see REVERSE_ENGINEERING.md) is not surfaced or specially handled; if you
+  hit a quota, whatever Sydney returns is passed through as-is.
 
 ------------------------------------------------------------------------------
 REVERSE-ENGINEERING PROVENANCE / CONFIDENCE
@@ -235,9 +261,25 @@ correctly-shaped plaintext against a real captured cache entry (and its
 pure-Python AES-256-GCM implementation cross-validated against the FIPS-197
 AES-256 test vector and against the third-party `cryptography` package
 across many random inputs during development, then removed as a dependency
-once validated); the only open risk there is the same background-rotation
-freshness issue that affects every credential-harvesting method here, not
-the decrypt algorithm itself.
+once validated).
+
+An earlier revision of this docstring warned that the dominant remaining
+risk was "background token rotation racing the manual copy-paste
+workflow" -- repeated `AADSTS70000`/`invalid_grant` rejections during live
+testing looked exactly like that. They weren't: the actual cause was
+`exchange_refresh_token()` sending a request that, while RFC 6749-valid,
+didn't match any of the ~16 real MSAL refresh_token-grant requests
+captured across every HAR in this project (wrong token endpoint, missing
+`X-AnchorMailbox`/telemetry fields -- see that function's own docstring
+for the full comparison and REVERSE_ENGINEERING.md for the writeup). Fixed
+and confirmed live: the exact same "stale-looking" credential that had
+failed three times in a row with the old request shape was accepted
+immediately once the request was corrected, and a full chat completion
+(both plain and streaming) was exchanged successfully end-to-end. Ordinary
+MSAL background rotation may still be a real, secondary consideration if
+the source browser tab is left open for a long time between capturing a
+value and using it, but it is no longer the proven explanation for
+exchange failures that it once appeared to be.
 
 ------------------------------------------------------------------------------
 USAGE
@@ -1579,6 +1621,15 @@ def run_chat_turn(token_cache, text, **kwargs):
 # ==============================================================================
 
 def _last_user_message(messages):
+    """Extracts only the LAST "user"-role message's text and discards
+    everything else in `messages` -- prior turns, system prompts, all of
+    it. This is a deliberate scope limitation (see the module docstring's
+    KNOWN LIMITATIONS section), not an oversight: every call to
+    run_chat_turn() below mints a brand-new Sydney ConversationId, so there
+    is currently no conversation memory across `/v1/chat/completions`
+    calls at all. If you're adding multi-turn support, this is the
+    function (and run_chat_turn's fresh-ConversationId-per-call behavior)
+    that needs to change."""
     for m in reversed(messages):
         if m.get("role") != "user":
             continue

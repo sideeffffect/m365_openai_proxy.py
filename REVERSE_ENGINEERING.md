@@ -1,8 +1,53 @@
 # Reverse engineering notes: m365.cloud.microsoft chat endpoint
 
-Source artifacts in this repo:
-- `m365.cloud.microsoft_chat_Archive [26-07-18 16-13-56].har` — one captured HAR entry
-- `request-curl.sh` — the same request exported as a curl command (headers/body match the HAR)
+This document is a **chronological research log**, not a reference manual — it
+records the investigation in the order it happened, including dead ends and
+theories that later turned out to be wrong (each correction is called out
+explicitly where it happens, e.g. the "AADSTS70000" section below). If you just
+want to know what's true *right now*, read this summary and follow the links;
+if you want the full provenance/reasoning behind any of it, the dated "Update:"
+sections below are where that lives.
+
+## Current state summary (read this first)
+
+- **Auth chain**: one interactive login mints a FOCI-family (Family of Client
+  IDs) refresh token good across three sibling AAD apps. The Sydney/Chathub
+  access token is minted by silently redeeming that refresh token under
+  `client_id=c0ab8ce9-e9a0-42e7-b064-33d422df41f1`,
+  `scope=https://substrate.office.com/sydney/.default`. See "FOCI" and "Sydney"
+  sections below for the full chain.
+- **The refresh_token-grant request has a specific required shape** — tenant-
+  specific token endpoint (not `/common/`), plus `client_id`/`client-request-id`
+  in the URL and six MSAL identity/telemetry fields
+  (`X-AnchorMailbox`/`x-client-SKU`/etc.) in the body. Getting this wrong makes
+  Entra ID reject an otherwise-valid, non-stale refresh token with a
+  generic-looking `AADSTS70000 invalid_grant` — see the "AADSTS70000" update
+  near the end of this document; this was fixed in `m365_openai_proxy.py` and
+  confirmed against live traffic.
+- **Wire protocol**: `wss://substrate.office.com/m365Copilot/Chathub/{oid}@{tid}?...&access_token={JWT}` —
+  SignalR JSON Hub Protocol (`\x1e`-delimited frames). Send a `type:4`
+  (StreamInvocation) `target:"chat"` with the payload documented in the
+  "Chathub.log.jsonl" section below; the reply streams back as `type:1`
+  `target:"update"` frames (`writeAtCursor` deltas or full-text snapshots),
+  terminated by a `type:3` (Completion) frame.
+- **MSAL localStorage cache encryption** (only relevant if using the
+  encrypted-cache credential option instead of a plaintext refresh token): it's
+  HKDF-SHA256(salt=nonce, info=clientId-or-empty) deriving a per-entry AES-256
+  key, then AES-GCM with a fixed all-zero IV — **not** raw AES-GCM with the
+  base key directly, which is why early brute-force attempts at this failed.
+  See the "MSAL localStorage cache-encryption algorithm — SOLVED" section.
+- **Still open / unexplored**: multi-turn conversation payload shape (does
+  Sydney want resent history, or look it up server-side by ConversationId?
+  — every capture so far is a brand-new single-turn conversation); whether
+  `msal.cache.encryption` is `HttpOnly`.
+- **Not actually in this repo**: none of the `.har` capture files or
+  `Chathub.log.jsonl` referenced throughout this document were ever committed
+  (they carry live session cookies/tokens and are `.gitignore`d) — this
+  document is the durable record of what they showed, not a pointer to files
+  you can go re-read locally unless you made your own captures during
+  development.
+
+---
 
 ## What was actually captured
 
