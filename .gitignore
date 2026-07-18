@@ -1,0 +1,33 @@
+# Raw browser captures — these carry LIVE credentials (session cookies, bearer JWTs,
+# access_token query params) and must never be committed. Keep them local only.
+*.har
+*.log.jsonl
+request-curl.sh
+.juggler/
+
+# Python
+__pycache__/
+*.pyc
+
+# Live credentials for manual testing -- never commit these
+.refresh_token
+*.token
+.cache_encryption_key
+.refresh_token_key
+.refresh_token_value
+.encryption_key
+.encryption_value
+m365_credentials.json
+m365_openai_proxy.json
+
+# The proxy's four plain-text credential files (any --credentials-prefix,
+# not just the default "m365_openai_proxy") -- never commit these, they
+# hold either a live refresh token or the encrypted-cache equivalent
+*.refresh_token.conf
+*.encrypted_refresh_token.conf
+*.cache_encryption_key.conf
+*.local_storage_key.conf
+
+# Proxy's own runtime log -- never commit (should never contain secrets by
+# design, but treat it as sensitive operational data regardless)
+m365_openai_proxy.log
