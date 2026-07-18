@@ -868,7 +868,7 @@ class WebSocketClient:
         if status != 101:
             raise WSError(f"WebSocket handshake failed: HTTP {status}")
         expected_accept = base64.b64encode(
-            hashlib.sha1((key + self._GUID).encode()).digest()
+            hashlib.sha1((key + self._GUID).encode(), usedforsecurity=False).digest()
         ).decode()
         if resp_headers.get("sec-websocket-accept") != expected_accept:
             raise WSError(
@@ -1525,8 +1525,13 @@ def exchange_refresh_token(refresh_token, oid=None, tid=None):
             "Accept": "*/*",
         },
     )
+    # `req` above is built from `url`, which is always
+    # TOKEN_URL_TEMPLATE/TOKEN_URL_COMMON (fixed https://login.microsoftonline.com/...
+    # constants) -- the templated `tid` only fills a path segment, it can
+    # never change the scheme or host, so this isn't an arbitrary/
+    # attacker-controlled URL open.
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         # `detail` is Entra ID's own JSON error body (error code, description,
@@ -2317,9 +2322,13 @@ def make_handler(token_cache):
                     self.path,
                     self.address_string(),
                 )
+                # Best-effort fallback: the real error is already logged
+                # above; if even sending a 500 fails (e.g. client already
+                # disconnected) there's nothing more useful to do than drop
+                # it.
                 try:
                     self._error(500, "internal error")
-                except Exception:
+                except Exception:  # nosec B110
                     pass
 
         def _do_GET(self):
@@ -2354,9 +2363,10 @@ def make_handler(token_cache):
                     self.path,
                     self.address_string(),
                 )
+                # See do_GET's comment above, same reasoning.
                 try:
                     self._error(500, "internal error")
-                except Exception:
+                except Exception:  # nosec B110
                     pass
 
         def _do_POST(self):
