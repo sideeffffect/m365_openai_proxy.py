@@ -224,17 +224,25 @@ untouched so you can see what was originally supplied.
 ------------------------------------------------------------------------------
 KNOWN LIMITATIONS
 ------------------------------------------------------------------------------
-- **No multi-turn conversation memory.** `_last_user_message()` extracts and
-  sends only the LAST message with role "user" from the `messages` array --
-  everything else (prior turns, system prompts) is silently discarded, and
-  `run_chat_turn()` mints a brand-new random Chathub `ConversationId` on
-  every single API call. This is the single most surprising thing about
-  this proxy if you're expecting normal ChatGPT-style follow-up-question
-  behavior: it has none. Each `/v1/chat/completions` call is a fresh,
-  context-free, one-shot Sydney conversation. Threading real multi-turn
-  history into Sydney (does it want the full history resent per turn, or
-  does it look it up server-side from a stable ConversationId?) is
-  unexplored -- see REVERSE_ENGINEERING.md's "still open" notes.
+- **Multi-turn memory is "context-stuffing", not native Sydney state.**
+  `_render_conversation_prompt()` renders the *entire* incoming `messages`
+  array (system/developer instructions + every prior user/assistant turn)
+  into one plain-text blob, and that whole blob becomes the single Chathub
+  turn's `message.text` -- `run_chat_turn()` still mints a brand-new random
+  Chathub `ConversationId` on every single API call, same as always. In
+  other words: this proxy does NOT use Sydney's own server-side memory (it
+  is unconfirmed whether reusing a stable `ConversationId` across calls
+  would even work -- see REVERSE_ENGINEERING.md); instead it relies on the
+  *client* resending its full growing conversation every request, which is
+  exactly what stateless per-request clients like Aider already do. Two
+  practical consequences: (1) the effective prompt sent to Sydney grows with
+  the conversation, so very long-running sessions may eventually hit
+  whatever context/size limit Sydney enforces (unconfirmed, not yet
+  surfaced by this proxy); (2) a client that expects Sydney's *own*
+  memory/threading semantics (e.g. server-side conversation continuation
+  independent of what the client resends) will not get that -- it gets
+  exactly the transcript it sent, replayed back through one fresh Sydney
+  turn, every time.
 - `usage` (prompt/completion/total tokens) in every response is hardcoded
   to zero -- this proxy does no token counting at all.
 - One Chathub WebSocket is opened, used for exactly one turn, and closed
@@ -333,7 +341,7 @@ import uuid
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.3"
+PROXY_VERSION = "0.4"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -1633,26 +1641,93 @@ def run_chat_turn(token_cache, text, **kwargs):
 # OpenAI-compatible HTTP layer -- NO per-request auth (see module docstring)
 # ==============================================================================
 
-def _last_user_message(messages):
-    """Extracts only the LAST "user"-role message's text and discards
-    everything else in `messages` -- prior turns, system prompts, all of
-    it. This is a deliberate scope limitation (see the module docstring's
-    KNOWN LIMITATIONS section), not an oversight: every call to
-    run_chat_turn() below mints a brand-new Sydney ConversationId, so there
-    is currently no conversation memory across `/v1/chat/completions`
-    calls at all. If you're adding multi-turn support, this is the
-    function (and run_chat_turn's fresh-ConversationId-per-call behavior)
-    that needs to change."""
-    for m in reversed(messages):
-        if m.get("role") != "user":
+def _message_text(m):
+    """Extracts the plain-text content of one OpenAI `messages[]` entry,
+    handling both the plain-string `content` form and the "content parts"
+    list form (`[{"type": "text", "text": ...}, ...]`); non-text parts
+    (images etc.) are silently skipped since Sydney/Chathub only accepts a
+    single text string per turn."""
+    content = m.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _render_conversation_prompt(messages):
+    """Renders an OpenAI `messages[]` array into the single text blob that
+    becomes one Chathub turn's `message.text`.
+
+    Sydney/Chathub has no native `messages` concept: one Chathub turn is a
+    single freeform text string, and every call to run_chat_turn() mints a
+    brand-new Chathub ConversationId (whether Sydney would honor a *stable*
+    ConversationId as server-side memory across turns is unconfirmed and
+    untested -- see REVERSE_ENGINEERING.md -- so this proxy does not rely on
+    that and instead treats every Chathub turn as independent).
+
+    Multi-turn conversations are instead supported the same way many
+    bridges handle backends with no native `system` role or message
+    history: "context-stuffing" -- the full running conversation (system
+    instructions + prior turns) is rendered as plain text and Sydney is
+    asked to continue it, with the whole thing discarded once the turn
+    completes. This is what makes stateless-per-request clients that
+    resend their full growing conversation on every call (e.g. Aider) work
+    through this proxy: from Sydney's point of view each call is still a
+    single fresh one-shot turn, but that turn now contains everything the
+    client considers "the conversation so far."
+
+    For the simple common case of a single user-only message with no
+    system prompt and no prior turns (e.g. a quick curl test, or any
+    minimal single-shot client), this returns that message's text exactly
+    as given, unadorned -- identical to this proxy's original behavior.
+    Returns None if there is no usable text at all.
+    """
+    system_parts = []
+    turns = []  # [(role_label, text), ...], in order
+
+    for m in messages:
+        text = _message_text(m)
+        if not text:
             continue
-        content = m.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):  # OpenAI "content parts" format
-            parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
-            return "\n".join(p for p in parts if p)
-    return None
+        role = m.get("role")
+        if role in ("system", "developer"):
+            system_parts.append(text)
+        elif role == "user":
+            turns.append(("User", text))
+        elif role == "assistant":
+            turns.append(("Assistant", text))
+        else:
+            # Anything else (e.g. a stray "tool" message) is included rather
+            # than silently dropped, labeled with its own role name.
+            turns.append((role or "unknown", text))
+
+    if not turns:
+        return None
+
+    # Simple case: exactly one user message and nothing else -- send it
+    # verbatim, unchanged from this proxy's original single-shot behavior.
+    if not system_parts and len(turns) == 1 and turns[0][0] == "User":
+        return turns[0][1]
+
+    lines = []
+    if system_parts:
+        lines.append("### Instructions (follow these exactly)")
+        lines.extend(system_parts)
+        lines.append("")
+    if len(turns) > 1:
+        lines.append(
+            "### Conversation so far (context only -- do not reply to any of "
+            "this, only to the final message below)"
+        )
+        for label, text in turns[:-1]:
+            lines.append(f"{label}: {text}")
+        lines.append("")
+    last_label, last_text = turns[-1]
+    lines.append("### Respond to this message")
+    lines.append(f"{last_label}: {last_text}")
+    return "\n".join(lines)
 
 
 def make_handler(token_cache):
@@ -1737,17 +1812,18 @@ def make_handler(token_cache):
                 self._error(400, "invalid JSON body")
                 return
 
-            prompt = _last_user_message(body.get("messages") or [])
+            messages = body.get("messages") or []
+            prompt = _render_conversation_prompt(messages)
             if prompt is None:
-                self._error(400, "no message with role \"user\" found in 'messages'")
+                self._error(400, "no usable message content found in 'messages'")
                 return
 
             model = body.get("model") or "m365-copilot"
             stream = bool(body.get("stream", False))
             logging.info(
-                "chat completion request from %s: %d message(s), prompt_length=%d chars, "
+                "chat completion request from %s: %d message(s), rendered_prompt_length=%d chars, "
                 "stream=%s, model=%r",
-                self.address_string(), len(body.get("messages") or []), len(prompt), stream, model,
+                self.address_string(), len(messages), len(prompt), stream, model,
             )
 
             if stream:

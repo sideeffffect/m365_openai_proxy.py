@@ -36,10 +36,13 @@ sections below are where that lives.
   key, then AES-GCM with a fixed all-zero IV — **not** raw AES-GCM with the
   base key directly, which is why early brute-force attempts at this failed.
   See the "MSAL localStorage cache-encryption algorithm — SOLVED" section.
-- **Still open / unexplored**: multi-turn conversation payload shape (does
-  Sydney want resent history, or look it up server-side by ConversationId?
-  — every capture so far is a brand-new single-turn conversation); whether
-  `msal.cache.encryption` is `HttpOnly`.
+- **Multi-turn conversation**: implemented via context-stuffing (the full
+  `messages` array is rendered into one text blob per Chathub turn) rather
+  than server-side `ConversationId` reuse — see the "goal re-scoped to
+  'drive a coding agent'" update near the end of this document. Whether
+  Sydney would honor a *resumed* `ConversationId` at all remains genuinely
+  unexplored (every capture so far is a brand-new single-turn conversation);
+  whether `msal.cache.encryption` is `HttpOnly` is also still unconfirmed.
 - **Tool-calling bridge (Local MCP)**: Sydney/Chathub has a real, concrete
   mechanism for invoking Model Context Protocol tools from the client side —
   `mcp_discover`/`mcp_describe`/`invoke_local_plugin` SignalR invocation
@@ -1039,3 +1042,68 @@ that actually triggers a tool call) would answer all four of the above in one
 shot and turn this from "confirmed by reading source" to "confirmed on the
 wire" — the same bar every other finding in this document was held to before
 being implemented.
+
+## Update: goal re-scoped to "drive a coding agent via m365 Copilot", multi-turn implemented via context-stuffing
+
+The actual end goal was clarified: not "faithfully replicate every Sydney
+protocol detail," but "run an existing terminal coding-agent CLI whose model
+backend is `m365.cloud.microsoft`'s Copilot." That reframes the tool-calling
+question above from "how do we bridge Sydney's real MCP mechanism" to "which
+agent CLIs even need that in the first place."
+
+**Researched OpenCode vs. Aider's actual API requirements (docs + a live
+GitHub issue, not just inference):**
+
+- **OpenCode** is built on the Vercel AI SDK's `generateText({ tools })` loop.
+  Every action — read a file, edit it, run a shell command, grep — is modeled
+  as a tool call the *model* must emit in the API response; OpenCode's own
+  docs note "there are only a few [models] that are good at both generating
+  code and tool calling," and a real OpenCode GitHub issue
+  (anomalyco/opencode#4661) shows tool calling breaking outright the moment a
+  backend doesn't emit `tool_calls` in the expected shape. There is no
+  plain-text fallback. This confirms the architecture-mismatch analysis in
+  the "Local MCP tool-calling bridge" section above is the *only* way to get
+  OpenCode working, with all the same open unknowns (`invocationId` support,
+  Sydney's real timeout, whether Local MCP is enabled for this
+  tenant/account) — still not attempted.
+- **Aider**, by contrast, does not use API-level tool-calling at all. It
+  performs every file/git/shell operation itself, locally, and only requires
+  the model to reply with a diff or whole-file rewrite in plain text (its
+  `diff`/`whole`/`udiff` edit formats), which Aider parses and applies. This
+  needs nothing from Sydney beyond a normal chat-completion round trip — no
+  protocol bridging at all.
+
+Given that, multi-turn conversation memory (the other prerequisite Aider
+needs, since it resends its full growing conversation — system prompt +
+every prior turn — on every request) was implemented, deliberately choosing
+**context-stuffing over server-side ConversationId reuse**:
+
+- `_render_conversation_prompt()` (replacing the old `_last_user_message()`)
+  renders the *entire* incoming `messages` array — every `system`/`developer`
+  message concatenated as "Instructions", every prior turn labeled
+  `User:`/`Assistant:` in order, the final message called out separately —
+  into one plain-text blob, which becomes the single Chathub turn's
+  `message.text`. `run_chat_turn()` still mints a brand-new random
+  `ConversationId` every call, exactly as before.
+- This was chosen over trying to reuse a stable Sydney `ConversationId`
+  across calls (which remains genuinely unconfirmed — see "Still open" at
+  the top of this document — every capture so far is a brand-new
+  single-turn conversation, so it's unknown whether Sydney would even honor
+  a resumed `ConversationId`, let alone with what history semantics). Context-
+  stuffing needs zero unconfirmed server-side behavior: it works as long as
+  Sydney can answer a single, larger text prompt, which is not in doubt.
+- Trade-off accepted knowingly: the effective prompt sent to Sydney grows
+  with the conversation (no summarization/truncation implemented), so a
+  long-running Aider session will eventually hit whatever context/size limit
+  Sydney enforces server-side — this proxy does not detect or surface that
+  limit, it would just surface as Sydney erroring or truncating.
+- The single-user-message-only case (no system prompt, no prior turns —
+  e.g. a bare curl test) is preserved as a special case returning the
+  message text completely unadorned, so this change is behavior-preserving
+  for the simplest use.
+
+**Net effect**: this proxy is now usable as Aider's model backend today (see
+the README's "Using this with a coding agent" section for the exact
+`--openai-api-base` invocation). OpenCode is not yet usable through this
+proxy and won't be until the Local MCP tool-calling bridge above is actually
+built and its open unknowns resolved with a live capture.

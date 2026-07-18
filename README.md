@@ -5,11 +5,15 @@ OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`) backed by
 `https://m365.cloud.microsoft`'s Copilot chat backend.
 
 > **Before you integrate this with anything:** each `/v1/chat/completions`
-> call is a fresh, context-free, one-shot Sydney conversation — the proxy
-> sends only the *last* message in `messages` and discards the rest. There
-> is currently **no multi-turn conversation memory**. See "Known
-> limitations" below before wiring this into a chat UI that expects normal
-> follow-up-question behavior.
+> call still opens a fresh, brand-new Sydney conversation under the hood —
+> Sydney's own server-side conversation memory is never used. Multi-turn
+> history works by "context-stuffing": the proxy renders the *entire*
+> `messages` array (system prompt + every prior turn) into one text blob
+> and sends that as a single Chathub turn, which is exactly what stateless
+> per-request clients (e.g. Aider) already expect. There is still **no
+> tool/function calling** (see "Known limitations"), so agent harnesses
+> that rely on the model emitting `tool_calls` to edit files/run
+> commands (e.g. OpenCode) will not work yet.
 
 **Fully self-contained.** The entire project is the one file,
 `m365_openai_proxy.py`. It uses only the Python 3 standard library — no
@@ -74,9 +78,16 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
 
 ## Known limitations
 
-- **No multi-turn conversation memory.** Only the last `"user"`-role
-  message in `messages` is sent; every call starts a brand-new Sydney
-  conversation. Prior turns and system prompts are silently discarded.
+- **Multi-turn memory is context-stuffing, not native Sydney state.** Every
+  call still mints a brand-new Sydney `ConversationId` — this proxy renders
+  the whole incoming `messages` array (system/developer instructions + all
+  prior turns) into one text blob and sends that as a single Chathub turn.
+  This works well for clients that resend their full conversation on every
+  request (Aider does this), but the effective prompt grows with the
+  conversation, so very long sessions may eventually hit whatever
+  context/size limit Sydney enforces (unconfirmed, not surfaced by this
+  proxy). A client expecting genuine server-side thread continuation
+  independent of what it resends will not get that.
 - **No tool/function calling.** Sydney does have a real MCP-based tool-
   invocation mechanism, reverse-engineered from the officeweb client and
   documented in `REVERSE_ENGINEERING.md`'s "Local MCP tool-calling bridge"
@@ -84,8 +95,12 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   tool-calling contract runs into a genuine architecture mismatch (Sydney's
   invocation is synchronous and mid-turn; OpenAI tool-calling is async
   across separate HTTP requests). If you're evaluating this for an agentic
-  coding client like OpenCode that needs to edit files/run commands via
-  tool calls, assume that will not work.
+  coding client whose harness is built around the model emitting
+  `tool_calls` (e.g. **OpenCode**, which relies on tool calls for every
+  file/shell action and has no plain-text fallback), assume that will not
+  work yet. Clients that don't need API-level tool calling at all — e.g.
+  **Aider**, which parses diffs/whole-file rewrites out of plain text and
+  performs every file/git operation itself — work today; see below.
 - `usage` (token counts) in every response is always zero — no token
   counting is implemented.
 - One Chathub WebSocket is opened and closed per HTTP request — no
@@ -99,6 +114,37 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   in time as good practice, though this is a secondary risk, not the
   primary failure mode it was once thought to be (see
   REVERSE_ENGINEERING.md).
+
+## Using this with a coding agent
+
+The goal of this project is to let an existing coding-agent CLI drive its
+edits/chat using `m365.cloud.microsoft`'s Copilot as the model backend,
+without that agent knowing it isn't talking to a normal OpenAI-compatible
+API. Whether a given agent works comes down to one question: **does it
+require the model to emit native OpenAI `tool_calls`, or does it drive
+file/shell operations itself from plain-text model output?**
+
+- **[Aider](https://aider.chat/)** — works today. Aider never asks the
+  model to emit `tool_calls`; it asks for a diff/whole-file rewrite in
+  plain text and applies it itself, and it resends the full running
+  conversation on every request (which this proxy now renders faithfully
+  via context-stuffing — see "Known limitations" above). Point it at this
+  proxy with an OpenAI-compatible model config, e.g.:
+
+  ```bash
+  aider --openai-api-base http://127.0.0.1:8000/v1 --openai-api-key sk-unused \
+    --model openai/m365-copilot
+  ```
+
+  (Aider's config still wants *some* string in `--openai-api-key`; this
+  proxy ignores it entirely — see AUTHENTICATION MODEL above.)
+
+- **[OpenCode](https://opencode.ai/)** — does not work yet. OpenCode is
+  built on the Vercel AI SDK's `generateText({ tools })` loop: reading a
+  file, editing it, running a shell command are all modeled as tool calls
+  the model must invoke, with no plain-text fallback. This proxy doesn't
+  implement OpenAI-style `tool_calls` (see "Known limitations"), so
+  OpenCode will not be able to take any actions through it today.
 
 ## Quick start
 
