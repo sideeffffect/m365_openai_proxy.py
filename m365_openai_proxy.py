@@ -251,19 +251,53 @@ KNOWN LIMITATIONS
   protocol's `throttling: {maxNumUserMessagesInConversation, ...}` field --
   see REVERSE_ENGINEERING.md) is not surfaced or specially handled; if you
   hit a quota, whatever Sydney returns is passed through as-is.
-- **No tool/function calling.** This proxy does not implement OpenAI-style
-  `tools`/`tool_calls`. Sydney does have a genuine tool-invocation mechanism
-  (Local MCP, over the same Chathub connection -- `mcp_discover`/
-  `mcp_describe`/`invoke_local_plugin` SignalR targets) which was reverse-
-  engineered from the officeweb client's own source and is fully documented
-  in REVERSE_ENGINEERING.md's "Local MCP tool-calling bridge" section, but
-  it is NOT implemented here: bridging it to OpenAI's async, multi-HTTP-
-  request tool-calling contract runs into a real architecture mismatch
-  (Sydney's invocation is synchronous, mid-turn, and presumably timeout-
-  bound) that is a substantial next-phase project, not a quick patch. If
-  you're evaluating this proxy for an agentic coding client (e.g. OpenCode)
-  that relies on tool calls to edit files/run commands, assume that will not
-  work until/unless that bridge gets built.
+- **Tool/function calling is EMULATED and probabilistic, not a guarantee.**
+  Sydney has no native OpenAI-style `tools`/`tool_calls` mechanism this proxy
+  can use (its real one, Local MCP, is a separate, unimplemented, much
+  harder project -- see below). What this proxy does instead: when a
+  request includes `tools`, it injects a plain-text instructions block
+  (`_render_tools_block()`) teaching the model a fixed textual convention
+  (`<action_request>{"name": ..., "arguments": {...}}</action_request>`)
+  and parses that back out of the reply (`_extract_tool_calls()`) into a
+  real OpenAI `tool_calls` response. This is entirely prompt-level steering
+  with NO formal contract -- live testing during development found:
+    - Sydney's own built-in capabilities (its code interpreter, mainly) very
+      often preempt this convention entirely -- it just tries to satisfy the
+      request itself first, even for things it structurally cannot do (e.g.
+      reading a file from the *user's* machine, which its sandboxed
+      interpreter has no access to).
+    - The literal word "tool"/"tools" ANYWHERE in the rendered prompt --
+      including in the CLIENT's own system prompt, which this proxy cannot
+      control -- measurably makes this worse. This proxy actively launders
+      that word out of the entire prompt when `tools` is present
+      (`_neutralize_tool_word()`), which helps but does not fix it outright.
+    - Even under the best (simplest, single-capability, word-laundered)
+      conditions measured, the model followed the convention roughly HALF
+      the time on a single attempt. This proxy retries automatically up to
+      3 times per turn (`_run_tool_call_turn()`) when the first attempt
+      doesn't produce a call, which raises the effective success rate
+      substantially -- but retrying costs latency (each attempt is a full
+      Chathub round trip) and still isn't 100%.
+    - Continuing a conversation *after* a tool result required its own fix:
+      naively rendering "the assistant already called X" as a fabricated
+      prior turn reliably triggered a flat refusal on the next reply (a
+      classic prompt-injection SHAPE, even with entirely mundane content).
+      Folding the tool result into the next turn as ordinary user-supplied
+      context instead of a fabricated assistant/tool history entry fixed
+      this specific failure mode.
+  See REVERSE_ENGINEERING.md's "Tool-calling emulation" section for the
+  full trial-by-trial account. Net assessment: usable for occasional/low-
+  stakes tool use, but NOT reliable enough to assume a long agentic loop
+  (the kind OpenCode or OpenHands actually run -- many tool calls in a row)
+  will complete without derailing into a plain-text non-call at some point.
+  Sydney's own REAL tool-invocation mechanism (Local MCP, over the same
+  Chathub connection -- `mcp_discover`/`mcp_describe`/`invoke_local_plugin`
+  SignalR targets, reverse-engineered from the officeweb client's own
+  source) is documented in REVERSE_ENGINEERING.md's "Local MCP tool-calling
+  bridge" section but remains unimplemented -- bridging it properly runs
+  into a genuine architecture mismatch (Sydney's invocation is synchronous,
+  mid-turn, and presumably timeout-bound) that is a substantial separate
+  project, not a quick patch, and would sidestep everything above.
 
 ------------------------------------------------------------------------------
 REVERSE-ENGINEERING PROVENANCE / CONFIDENCE
@@ -327,6 +361,7 @@ import json
 import logging
 import os
 import platform
+import re
 import socket
 import ssl
 import struct
@@ -341,7 +376,7 @@ import uuid
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.4"
+PROXY_VERSION = "0.5"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -686,6 +721,20 @@ ALLOWED_MESSAGE_TYPES = [
 ]
 
 SIGNALR_RS = "\x1e"  # SignalR JSON Hub Protocol record separator
+
+# Sydney's own built-in plugins/capabilities (BingWebSearch via the `plugins`
+# field; the code interpreter and image-gen capabilities via `cwc_code_
+# interpreter*`/`flux*`/`gptv*` OPTIONS_SETS entries) reliably preempt this
+# proxy's injected tool-calling emulation -- confirmed live during
+# development: a weather question got a flat refusal, and a basic-arithmetic
+# "use the calculator tool" request got silently answered via Sydney's own
+# code interpreter instead of our requested `<tool_call>` convention (see
+# REVERSE_ENGINEERING.md's "Tool-calling emulation" section). When a request
+# includes `tools`, this proxy asks Sydney with these capabilities stripped,
+# so the model has nothing to reach for except our injected convention.
+TOOL_MODE_OPTIONS_SETS = [
+    o for o in OPTIONS_SETS if not any(kw in o for kw in ("code_interpreter", "flux", "gptv"))
+]
 
 
 # ==============================================================================
@@ -1512,12 +1561,17 @@ def open_chathub(auth):
     return ws, session_id
 
 
-def send_chat_message(ws, session_id, text, locale="en-US", timezone="UTC", timezone_offset=0):
+def send_chat_message(ws, session_id, text, locale="en-US", timezone="UTC", timezone_offset=0, tools_requested=False):
     trace_id = str(uuid.uuid4())
     logging.info(
-        "sending chat message: session_id=%s trace_id=%s text_length=%d chars locale=%s",
-        session_id, trace_id, len(text), locale,
+        "sending chat message: session_id=%s trace_id=%s text_length=%d chars locale=%s tools_requested=%s",
+        session_id, trace_id, len(text), locale, tools_requested,
     )
+    # When the client wants OpenAI-style tool-calling, suppress Sydney's own
+    # built-in plugins/capabilities (BingWebSearch, code interpreter, image
+    # gen) -- see TOOL_MODE_OPTIONS_SETS's comment for why.
+    options_sets = TOOL_MODE_OPTIONS_SETS if tools_requested else OPTIONS_SETS
+    plugins = [] if tools_requested else [{"Id": "BingWebSearch", "Source": "BuiltIn"}]
     payload = {
         "type": 4,
         "target": "chat",
@@ -1526,7 +1580,7 @@ def send_chat_message(ws, session_id, text, locale="en-US", timezone="UTC", time
             "source": "officeweb",
             "clientCorrelationId": trace_id,
             "sessionId": session_id,
-            "optionsSets": OPTIONS_SETS,
+            "optionsSets": options_sets,
             "streamingMode": "ConciseWithPadding",
             "options": {},
             "extraExtensionParameters": {},
@@ -1561,7 +1615,7 @@ def send_chat_message(ws, session_id, text, locale="en-US", timezone="UTC", time
                 "clientPreferences": {},
                 "connectedFederatedConnections": ["dummyId"],
             },
-            "plugins": [{"Id": "BingWebSearch", "Source": "BuiltIn"}],
+            "plugins": plugins,
             "isSbsSupported": True,
             "tone": "Magic",
             "renderReferencesBehindEOS": True,
@@ -1656,9 +1710,210 @@ def _message_text(m):
     return ""
 
 
-def _render_conversation_prompt(messages):
-    """Renders an OpenAI `messages[]` array into the single text blob that
-    becomes one Chathub turn's `message.text`.
+# ------------------------------------------------------------------------------
+# Tool-calling emulation -- see REVERSE_ENGINEERING.md's "Tool-calling
+# emulation" section for the full design rationale and live-testing notes.
+#
+# Sydney/Chathub has NO native tool/function-calling mechanism this proxy can
+# use (see the still-undone "Local MCP tool-calling bridge" research). This
+# is a from-scratch, model-agnostic emulation built entirely in this proxy,
+# the same well-known trick backends without native tool support use: the
+# available tool schemas are injected into the prompt as plain-text
+# instructions, the model is told a single fixed textual convention to use
+# when it wants to call one, and this proxy parses that convention back out
+# of the reply into OpenAI's real `tool_calls` response shape. Every turn
+# that includes `tools` re-injects the instructions from scratch, since
+# Sydney (like the rest of this proxy's context handling) has no memory of a
+# previous turn's tool definitions either.
+# ------------------------------------------------------------------------------
+
+_TOOL_CALL_OPEN = "<action_request>"
+_TOOL_CALL_CLOSE = "</action_request>"
+_TOOL_CALL_RE = re.compile(r"<action_request>\s*(.*?)\s*</action_request>", re.DOTALL)
+
+
+def _render_tools_block(tools, tool_choice):
+    """Renders an OpenAI `tools` array (+ `tool_choice`) into the plain-text
+    instructions block that teaches the model this proxy's tool-calling
+    convention: a single-line JSON object `{"name": ..., "arguments": {...}}`
+    wrapped in `<action_request>...</action_request>` tags.
+
+    The specific wording here is NOT arbitrary -- it was arrived at by live
+    trial-and-error against the real Sydney backend (see
+    REVERSE_ENGINEERING.md's "Tool-calling emulation" section for the full
+    account) after two more "obvious" phrasings both failed outright:
+      - Calling these "tools/functions" and asking the model to "call" one
+        got either a flat content-policy-style refusal, or got silently
+        preempted by Sydney's OWN real built-in plugins (BingWebSearch, the
+        code interpreter) instead of following our convention at all --
+        Sydney has strong standing behavior to prefer reaching for its own
+        real capabilities over an instructed textual convention, even when
+        its own capabilities can't actually satisfy the request (e.g. it
+        tried "coding and executing" to read a file that only exists on the
+        *user's* machine, failed, and told the user to upload it -- never
+        touching our convention).
+      - What DOES reliably work: avoid the words "tool"/"function" entirely
+        (call them "capabilities" instead), and explicitly tell the model
+        up front that its own real capabilities are unavailable this turn
+        (no internet access, no code interpreter) so there is nothing left
+        for it to preempt this request with.
+    This is still prompt-level steering, not a guarantee -- there is no
+    formal contract that the underlying model obeys this convention, and
+    REVERSE_ENGINEERING.md documents this as probabilistic, not certain."""
+    lines = [
+        "",
+        "IMPORTANT: for this reply, you have no internet access, no code "
+        "interpreter, and no ability to execute code or search the web -- "
+        "any apparent ability to do so is disabled for this conversation. "
+        "The ONLY way to get information or perform actions you don't "
+        "already have is to request it from the user with the exact format "
+        "below, and nothing else in your reply (no markdown code fences, no "
+        "explanation before or after it) -- arguments must be one line of "
+        "valid JSON matching the schema given for that capability:",
+        "",
+        _TOOL_CALL_OPEN,
+        '{"name": "<capability name>", "arguments": {<arguments as JSON>}}',
+        _TOOL_CALL_CLOSE,
+        "",
+        "If you don't need to request anything, just reply normally in "
+        "plain text -- do not use the tags above unless you are actually "
+        "making a request. You may make more than one request by using "
+        f"multiple {_TOOL_CALL_OPEN}...{_TOOL_CALL_CLOSE} blocks in the same "
+        "reply.",
+        "",
+        "Capabilities you can request this way:",
+    ]
+    for t in tools:
+        fn = t.get("function") or {}
+        name = fn.get("name", "?")  # left untouched -- must round-trip verbatim, see _neutralize_tool_word's docstring
+        desc = _neutralize_tool_word(fn.get("description", ""))
+        params = fn.get("parameters", {})
+        lines.append(f"- {name}: {desc}")
+        lines.append(f"  parameters schema: {json.dumps(params)}")
+
+    if isinstance(tool_choice, dict):
+        forced_name = (tool_choice.get("function") or {}).get("name")
+        if forced_name:
+            lines.append("")
+            lines.append(f'You MUST request "{forced_name}" now, using the format above.')
+    elif tool_choice == "required":
+        lines.append("")
+        lines.append("You MUST make one of the requests above now, using the format above.")
+
+    return "\n".join(lines)
+
+
+_TOOL_WORD_RE = re.compile(r"\btools?\b", re.IGNORECASE)
+
+
+def _neutralize_tool_word(text):
+    """Replaces the word "tool"/"tools" (case-insensitively, whole-word only)
+    with a neutral synonym ("capability"/"capabilities", case-matched)
+    throughout `text`.
+
+    This is a live-tested-necessary workaround, not a style choice: the
+    literal word "tool" ANYWHERE in a turn sent to Sydney -- even inside the
+    CLIENT's own system prompt or user message content, completely outside
+    this proxy's own injected instructions -- reliably makes Sydney fall
+    back to preempting the request with its own real built-in capabilities
+    (the code interpreter, mainly) instead of ever considering this proxy's
+    `<action_request>` convention, confirmed by live A/B testing during
+    development (see REVERSE_ENGINEERING.md's "Tool-calling emulation"
+    section). Coding-agent system prompts (OpenCode's, OpenHands', etc.)
+    are saturated with exactly this word ("you have access to the following
+    tools", tool names/descriptions, etc.), so this proxy cannot simply ask
+    callers to avoid it -- it has to actively launder it out of the entire
+    rendered prompt whenever `tools` is present. Applied only to free-form
+    text (system/user/assistant/tool-result content and tool descriptions),
+    never to the structural JSON (a tool's `name` field, argument/schema
+    keys) that this proxy needs to parse back out of the reply verbatim."""
+    def _repl(m):
+        word = m.group(0)
+        replacement = "capabilities" if word.lower() == "tools" else "capability"
+        return replacement.capitalize() if word[0].isupper() else replacement
+    return _TOOL_WORD_RE.sub(_repl, text)
+
+
+def _extract_tool_calls(reply_text):
+    """Parses `reply_text` for this proxy's `<tool_call>{...}</tool_call>`
+    convention (see `_render_tools_block`). Returns `(remaining_text,
+    tool_calls)`: `tool_calls` is a list of `{"id", "name", "arguments_json"}`
+    dicts (already carrying a synthesized OpenAI-style call id and a
+    compact-JSON-encoded arguments string, ready to drop into an OpenAI
+    `tool_calls` response entry), and `remaining_text` is whatever plain text
+    was outside the tags (may be empty). A tag pair with unparseable/
+    incomplete JSON inside is logged and dropped rather than raised -- the
+    model attempted a tool call but produced broken output, which should
+    surface to the client as "the model didn't call a tool" rather than
+    crash this proxy's response entirely."""
+    tool_calls = []
+
+    def _handle(match):
+        raw = match.group(1)
+        try:
+            obj = json.loads(raw)
+            name = obj["name"]
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logging.warning("model emitted a %s block with unparseable content, skipping it: %r", _TOOL_CALL_OPEN, e)
+            return ""
+        arguments = obj.get("arguments", {})
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "name": name,
+            "arguments_json": json.dumps(arguments),
+        })
+        return ""
+
+    remaining = _TOOL_CALL_RE.sub(_handle, reply_text).strip()
+    return remaining, tool_calls
+
+
+_TOOL_CALL_MAX_ATTEMPTS = 3
+
+
+def _run_tool_call_turn(token_cache, prompt, max_attempts=_TOOL_CALL_MAX_ATTEMPTS):
+    """Runs one Chathub turn with `tools_requested=True`, retrying as brand-
+    new, independent Chathub turns (Sydney has no memory to preserve across
+    a retry anyway -- see `_render_conversation_prompt`'s docstring) up to
+    `max_attempts` times if the reply doesn't contain a parseable
+    `<action_request>` tag.
+
+    This retry exists because whether the underlying model actually follows
+    this proxy's tool-calling convention on any given turn is genuinely
+    probabilistic, not deterministic: live A/B testing during development
+    measured roughly a 50% success rate on even the simplest possible
+    single-capability request, with Sydney's own built-in code interpreter
+    silently preempting the rest of the time -- see REVERSE_ENGINEERING.md's
+    "Tool-calling emulation" section for the exact trial data and why a
+    single attempt alone was not an acceptable design. Retrying
+    substantially raises the *effective* success rate (if failures were
+    independent, 3 attempts at 50% each would be ~87.5%; REVERSE_ENGINEERING.md
+    documents the actual measured rate, which was somewhat lower --
+    consecutive failures are not perfectly independent in practice).
+
+    Returns `(text, tool_calls)` from whichever attempt produced tool_calls,
+    or from the LAST attempt if none did across all attempts -- so the
+    caller still has a plain-text reply to fall back to (finish_reason
+    "stop") rather than nothing at all."""
+    text, tool_calls = "", []
+    for attempt in range(1, max_attempts + 1):
+        text = "".join(run_chat_turn(token_cache, prompt, tools_requested=True))
+        _, tool_calls = _extract_tool_calls(text)
+        if tool_calls:
+            if attempt > 1:
+                logging.info("tool-call emulation succeeded on retry attempt %d/%d", attempt, max_attempts)
+            return text, tool_calls
+        logging.info(
+            "tool-call emulation attempt %d/%d produced no action_request block%s",
+            attempt, max_attempts, "" if attempt < max_attempts else " -- giving up, falling back to plain content",
+        )
+    return text, tool_calls
+
+
+def _render_conversation_prompt(messages, tools=None, tool_choice=None):
+    """Renders an OpenAI `messages[]` array (optionally plus a `tools`
+    schema list and `tool_choice`) into the single text blob that becomes
+    one Chathub turn's `message.text`.
 
     Sydney/Chathub has no native `messages` concept: one Chathub turn is a
     single freeform text string, and every call to run_chat_turn() mints a
@@ -1673,48 +1928,121 @@ def _render_conversation_prompt(messages):
     instructions + prior turns) is rendered as plain text and Sydney is
     asked to continue it, with the whole thing discarded once the turn
     completes. This is what makes stateless-per-request clients that
-    resend their full growing conversation on every call (e.g. Aider) work
+    resend their full growing conversation on every call (e.g. a tool-
+    calling coding agent's follow-up request after a tool result) work
     through this proxy: from Sydney's point of view each call is still a
     single fresh one-shot turn, but that turn now contains everything the
     client considers "the conversation so far."
 
+    An assistant message carrying `tool_calls` (content may be null) is NOT
+    rendered as its own conversation turn -- only real assistant dialogue
+    text (if any) is. A `"tool"`-role message's result text is instead held
+    and folded as a parenthetical preamble onto the START of the next real
+    turn (the next user message, or a synthesized final turn if the tool
+    result is the last message). This was a deliberate, live-tested fix, not
+    a simplification for its own sake: rendering something like `Assistant:
+    [called read_file(...)]` as its own fabricated history turn -- i.e.
+    inventing a prior assistant turn describing an action it "already took"
+    -- reliably produced a flat content-policy-style refusal on the next
+    reply during development (a classic prompt-injection/jailbreak SHAPE:
+    a fake prior-assistant-turn claiming an action was taken, even though
+    every word here is mundane). Folding the same information into the
+    *user's* turn instead, worded as ordinary supplied context rather than
+    fabricated assistant history, reliably avoided the refusal in the same
+    A/B comparison -- see REVERSE_ENGINEERING.md's "Tool-calling emulation"
+    section for the exact trial transcripts. If `tools` is given,
+    `_render_tools_block()`'s instructions are appended to the system/
+    instructions section -- see the "Tool-calling emulation" comment block
+    above this function.
+
     For the simple common case of a single user-only message with no
-    system prompt and no prior turns (e.g. a quick curl test, or any
-    minimal single-shot client), this returns that message's text exactly
-    as given, unadorned -- identical to this proxy's original behavior.
-    Returns None if there is no usable text at all.
+    system prompt, no prior turns, and no `tools` (e.g. a quick curl test,
+    or any minimal single-shot client), this returns that message's text
+    exactly as given, unadorned -- identical to this proxy's original
+    behavior. Returns None if there is no usable text/turn at all.
     """
     system_parts = []
     turns = []  # [(role_label, text), ...], in order
+    tool_call_names = {}  # tool_call_id -> tool name, filled in as we scan assistant messages
+    pending_results = []  # [(tool_name, result_text), ...] waiting to be folded onto the next turn
+    # See _neutralize_tool_word's docstring: the client's OWN system prompt/
+    # messages need this too, not just this proxy's own injected text --
+    # applied to every piece of free-form text below whenever `tools` is
+    # present at all (never when it isn't, to leave plain chat untouched).
+    clean = _neutralize_tool_word if tools else (lambda s: s)
+
+    def _fold_pending(text):
+        """Prepends any buffered tool-result text onto `text` as ordinary
+        parenthetical context and clears the buffer -- see this function's
+        caller-level docstring for why this replaces rendering a fabricated
+        assistant history turn."""
+        nonlocal pending_results
+        if not pending_results:
+            return text
+        preamble = "\n".join(f"(Result of your earlier {n} request: {t})" for n, t in pending_results)
+        pending_results = []
+        return f"{preamble}\n\n{text}" if text else preamble
 
     for m in messages:
-        text = _message_text(m)
-        if not text:
-            continue
         role = m.get("role")
+        text = clean(_message_text(m))
+
         if role in ("system", "developer"):
-            system_parts.append(text)
-        elif role == "user":
-            turns.append(("User", text))
-        elif role == "assistant":
-            turns.append(("Assistant", text))
-        else:
-            # Anything else (e.g. a stray "tool" message) is included rather
-            # than silently dropped, labeled with its own role name.
-            turns.append((role or "unknown", text))
+            if text:
+                system_parts.append(text)
+            continue
+
+        if role == "assistant":
+            tool_calls = m.get("tool_calls")
+            if tool_calls:
+                for tc in tool_calls:
+                    tool_call_names[tc.get("id")] = (tc.get("function") or {}).get("name", "?")
+                # Deliberately not rendered as a turn at all -- see the
+                # docstring above. Genuine assistant text alongside the
+                # tool_calls (rare, but possible) is still kept.
+            if text:
+                turns.append(("Assistant", text))
+            continue
+
+        if role == "tool":
+            tool_name = tool_call_names.get(m.get("tool_call_id"), "unknown_request")
+            pending_results.append((tool_name, text or "(empty result)"))
+            continue
+
+        if role == "user":
+            text = _fold_pending(text)
+            if text:
+                turns.append(("User", text))
+            continue
+
+        if text:
+            # Anything else is included rather than silently dropped,
+            # labeled with its own role name.
+            turns.append((role or "unknown", _fold_pending(text)))
+
+    if pending_results:
+        # The conversation ended on a tool result with no further user turn
+        # (the normal shape for an OpenAI-style client's follow-up request
+        # right after executing a call) -- synthesize a final turn asking
+        # Sydney to continue, carrying that result as its only content.
+        turns.append(("User", _fold_pending("Please continue.")))
 
     if not turns:
         return None
 
-    # Simple case: exactly one user message and nothing else -- send it
-    # verbatim, unchanged from this proxy's original single-shot behavior.
-    if not system_parts and len(turns) == 1 and turns[0][0] == "User":
+    tools_block = _render_tools_block(tools, tool_choice) if tools else None
+
+    # Simple case: exactly one user message, no system prompt, no tools --
+    # send it verbatim, unchanged from this proxy's original behavior.
+    if not system_parts and not tools_block and len(turns) == 1 and turns[0][0] == "User":
         return turns[0][1]
 
     lines = []
-    if system_parts:
+    if system_parts or tools_block:
         lines.append("### Instructions (follow these exactly)")
         lines.extend(system_parts)
+        if tools_block:
+            lines.append(tools_block)
         lines.append("")
     if len(turns) > 1:
         lines.append(
@@ -1813,7 +2141,9 @@ def make_handler(token_cache):
                 return
 
             messages = body.get("messages") or []
-            prompt = _render_conversation_prompt(messages)
+            tools = body.get("tools") or None
+            tool_choice = body.get("tool_choice")
+            prompt = _render_conversation_prompt(messages, tools=tools, tool_choice=tool_choice)
             if prompt is None:
                 self._error(400, "no usable message content found in 'messages'")
                 return
@@ -1822,16 +2152,16 @@ def make_handler(token_cache):
             stream = bool(body.get("stream", False))
             logging.info(
                 "chat completion request from %s: %d message(s), rendered_prompt_length=%d chars, "
-                "stream=%s, model=%r",
-                self.address_string(), len(messages), len(prompt), stream, model,
+                "stream=%s, model=%r, tools=%d",
+                self.address_string(), len(messages), len(prompt), stream, model, len(tools or []),
             )
 
             if stream:
-                self._handle_streaming(prompt, model)
+                self._handle_streaming(prompt, model, tools_requested=bool(tools))
             else:
-                self._handle_full(prompt, model)
+                self._handle_full(prompt, model, tools_requested=bool(tools))
 
-        def _handle_streaming(self, prompt, model):
+        def _handle_streaming(self, prompt, model, tools_requested=False):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -1842,27 +2172,55 @@ def make_handler(token_cache):
             completion_id = f"chatcmpl-{uuid.uuid4().hex}"
             created = int(time.time())
 
-            def emit(delta_obj):
+            def emit(delta_obj, finish_reason=None):
                 chunk = {
                     "id": completion_id, "object": "chat.completion.chunk", "created": created,
-                    "model": model, "choices": [{"index": 0, "delta": delta_obj, "finish_reason": None}],
+                    "model": model, "choices": [{"index": 0, "delta": delta_obj, "finish_reason": finish_reason}],
                 }
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
                 self.wfile.flush()
 
             try:
-                first = True
-                for delta in run_chat_turn(token_cache, prompt):
-                    emit({"role": "assistant", "content": delta} if first else {"content": delta})
-                    first = False
+                if tools_requested:
+                    # Buffered mode: whether this reply is plain content or a
+                    # tool call can only be known once the FULL text has been
+                    # seen (see _extract_tool_calls), so there is no true
+                    # incremental streaming when `tools` is present -- the
+                    # whole reply is collected first, then emitted as one
+                    # chunk. Documented as a known limitation. See
+                    # _run_tool_call_turn for why this retries internally.
+                    text, tool_calls = _run_tool_call_turn(token_cache, prompt)
+                    if tool_calls:
+                        # Leftover text is deliberately dropped here, not
+                        # surfaced as delta content -- see _handle_full's
+                        # comment on the same point for why.
+                        emit({"role": "assistant", "tool_calls": [
+                            {"index": i, "id": tc["id"], "type": "function",
+                             "function": {"name": tc["name"], "arguments": tc["arguments_json"]}}
+                            for i, tc in enumerate(tool_calls)
+                        ]})
+                        finish_reason = "tool_calls"
+                    else:
+                        emit({"role": "assistant", "content": text})
+                        finish_reason = "stop"
+                else:
+                    first = True
+                    for delta in run_chat_turn(token_cache, prompt):
+                        emit({"role": "assistant", "content": delta} if first else {"content": delta})
+                        first = False
+                    finish_reason = "stop"
+
                 final = {
                     "id": completion_id, "object": "chat.completion.chunk", "created": created,
-                    "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 }
                 self.wfile.write(f"data: {json.dumps(final)}\n\n".encode("utf-8"))
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
-                logging.info("chat completion (streaming) %s finished successfully", completion_id)
+                logging.info(
+                    "chat completion (streaming) %s finished successfully (finish_reason=%s)",
+                    completion_id, finish_reason,
+                )
             except Exception as e:
                 # Deliberately broad: this is the last line of defense before a
                 # request-handling bug would otherwise vanish into the default
@@ -1878,10 +2236,13 @@ def make_handler(token_cache):
                 except OSError:
                     pass
 
-        def _handle_full(self, prompt, model):
+        def _handle_full(self, prompt, model, tools_requested=False):
             completion_id = f"chatcmpl-{uuid.uuid4().hex}"
             try:
-                text = "".join(run_chat_turn(token_cache, prompt))
+                if tools_requested:
+                    text, tool_calls = _run_tool_call_turn(token_cache, prompt)
+                else:
+                    text, tool_calls = "".join(run_chat_turn(token_cache, prompt)), []
             except Exception as e:
                 # See the comment in _handle_streaming's except clause: broad
                 # on purpose, so any bug still produces a diagnosable log entry.
@@ -1889,7 +2250,29 @@ def make_handler(token_cache):
                 self._error(502, str(e))
                 return
 
-            logging.info("chat completion %s finished successfully (reply_length=%d chars)", completion_id, len(text))
+            if tool_calls:
+                # Leftover text (`content`) is deliberately dropped, not
+                # attached to the message: in practice it's been Sydney's own
+                # internal progress boilerplate ("Coding and executing", from
+                # the code-interpreter step it still runs internally even
+                # when it ultimately follows this proxy's convention for its
+                # final answer) rather than a genuine user-facing preamble,
+                # and there is no reliable way to tell the two apart -- see
+                # REVERSE_ENGINEERING.md's "Tool-calling emulation" section.
+                message = {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments_json"]}}
+                    for tc in tool_calls
+                ]}
+                finish_reason = "tool_calls"
+                logging.info(
+                    "chat completion %s finished successfully as a tool call (reply_length=%d chars, calls=%s)",
+                    completion_id, len(text), ", ".join(tc["name"] for tc in tool_calls),
+                )
+            else:
+                message = {"role": "assistant", "content": text}
+                finish_reason = "stop"
+                logging.info("chat completion %s finished successfully (reply_length=%d chars)", completion_id, len(text))
+
             self._write_json(200, {
                 "id": completion_id,
                 "object": "chat.completion",
@@ -1897,8 +2280,8 @@ def make_handler(token_cache):
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish_reason,
                 }],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             })

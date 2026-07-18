@@ -54,6 +54,21 @@ sections below are where that lives.
   synchronous and mid-turn with a server-side timeout; OpenAI tool-calling is
   asynchronous across separate HTTP requests) — see that section for the
   full writeup and why this is a real next-phase project, not a quick patch.
+- **Tool-calling emulation (implemented, IS shipped, but probabilistic)**:
+  instead of the Local MCP bridge above, `m365_openai_proxy.py` emulates
+  OpenAI `tools`/`tool_calls` entirely by prompting — inject a plain-text
+  convention (`<action_request>{"name":...,"arguments":{...}}
+  </action_request>`), parse it back out of the reply. Live A/B testing
+  found Sydney's own built-in code interpreter frequently preempts this
+  convention instead of following it, and that the literal word "tool"
+  ANYWHERE in the prompt (including in a client's own system prompt, which
+  can't be controlled) measurably makes this worse — this proxy launders
+  that word out and retries up to 3x per turn, which helps substantially
+  but still tops out around a coin-flip on a single attempt even under the
+  best measured conditions. See the "tool-calling emulation implemented and
+  live-tested" update for the full trial-by-trial account, including a
+  separate refusal-triggering failure mode (found and fixed) around how a
+  tool *result* gets rendered back into the conversation on the next turn.
 - **Not actually in this repo**: none of the `.har` capture files or
   `Chathub.log.jsonl` referenced throughout this document were ever committed
   (they carry live session cookies/tokens and are `.gitignore`d) — this
@@ -1107,3 +1122,186 @@ the README's "Using this with a coding agent" section for the exact
 `--openai-api-base` invocation). OpenCode is not yet usable through this
 proxy and won't be until the Local MCP tool-calling bridge above is actually
 built and its open unknowns resolved with a live capture.
+
+## Update: tool-calling emulation implemented and live-tested against Sydney
+
+Following the previous update, the user's actual, restated goal was: "I just
+want to be able to run a coding agent, like OpenCode, but have only access
+to `https://m365.cloud.microsoft/`", and specifically to pursue emulating
+tool-calling by prompting rather than building the real Local MCP bridge.
+This section documents that implementation and, in detail, the live A/B
+testing against the real Sydney backend that shaped its final design -- the
+first two "obvious" designs both failed for non-obvious reasons, and the
+actual failure modes matter for anyone extending this further.
+
+### The mechanism, as shipped
+
+- `_render_tools_block(tools, tool_choice)` renders the OpenAI `tools` array
+  into a plain-text instructions block, injected into the "Instructions"
+  section of the rendered prompt whenever a request includes `tools`.
+- The convention taught to the model: a single-line JSON object
+  `{"name": ..., "arguments": {...}}` wrapped in
+  `<action_request>...</action_request>` tags, with nothing else in the
+  reply when making a request.
+- `_extract_tool_calls(reply_text)` parses that convention back out of
+  Sydney's reply with a regex + `json.loads`, synthesizing OpenAI-shaped
+  `tool_calls` entries (`id`, `type: "function"`, `function.name`,
+  `function.arguments` as a JSON string).
+- `_run_tool_call_turn()` retries up to 3 times (as independent, stateless
+  Chathub turns) if an attempt doesn't produce a parseable call.
+- `_neutralize_tool_word()` rewrites the word "tool"/"tools" to "capability"/
+  "capabilities" throughout the ENTIRE rendered prompt (not just this
+  proxy's own injected text) whenever `tools` is present.
+- Tool results from a `"tool"`-role message are folded into the START of the
+  next real turn as parenthetical context, rather than rendered as their own
+  fabricated "assistant already took this action" history turn.
+- `send_chat_message()`/`open_chathub()` (via a new `tools_requested` flag
+  threaded through `run_chat_turn()`) suppress Sydney's own built-in
+  `BingWebSearch` plugin (empty `plugins: []` instead of the usual
+  `[{"Id": "BingWebSearch", ...}]`) and the code-interpreter/image-gen
+  `OPTIONS_SETS` entries (`TOOL_MODE_OPTIONS_SETS`) when `tools` is present.
+
+### Why it's shaped this way: the live trial-and-error
+
+**Attempt 1 (failed): calling it a "tool" and asking the model to "call" it.**
+First design: instructions phrased naturally ("You also have access to the
+following tools/functions. To call one, reply with...", wrapped in
+`<tool_call>...</tool_call>` tags -- chosen because that tag resembles the
+Hermes/Qwen-style function-calling format some open models were actually
+trained on). Tested against three scenarios:
+- A weather question ("What is the current weather in Paris?") with a
+  `get_weather` tool: got a flat, canned refusal --
+  `"Sorry, it looks like I can't chat about this. Let's try a different
+  topic."` -- even though the IDENTICAL question with no `tools` at all got
+  answered correctly and fully via Sydney's own real `BingWebSearch` plugin.
+- An arithmetic question ("add 12 and 30") with a `calculator_add` tool: NOT
+  a refusal, but also never touched our `<tool_call>` convention -- Sydney
+  silently used its own real code-interpreter plugin instead (`"Coding and
+  executing\n\`\`\`python\nprint(12+30)\n\`\`\`{"status":"Success",
+  "stdout":"42\n",...}Coding and executing42"`), producing a plausible-
+  looking plain-text answer with no tool call at all.
+- A file-read question ("read src/main.py in my project") with a
+  `read_file` tool -- a task Sydney genuinely CANNOT satisfy with its own
+  real capabilities (its code interpreter is a separate sandboxed
+  environment with no access to the user's actual machine): it still tried
+  its own code interpreter first, discovered the file wasn't there, and told
+  the user to upload the file -- never once considering the injected
+  `<tool_call>` convention, even though that was the only way it could
+  actually have completed the task.
+
+Suppressing Sydney's own `BingWebSearch` plugin and code-interpreter-related
+`OPTIONS_SETS` flags (the `tools_requested` mechanism, described above) was
+tried next, on the theory that Sydney was simply always preferring its own
+real capabilities when they were available. It did NOT fix the weather
+refusal or the file-read case -- the code interpreter still ran regardless
+(those specific `OPTIONS_SETS` entries evidently gate UI features like
+citation formatting and interactive charts, not the core capability), and
+the refusal persisted even with plugins/options stripped down. So Sydney's
+preference for its own real capabilities over an instructed textual
+convention is not simply a matter of disabling the competing plugin.
+
+**Attempt 2 (worked, mostly): avoid the word "tool" entirely, disclaim
+Sydney's own capabilities up front.** A very different phrasing, tested as a
+single raw user message with no `tools` field and no system prompt at all
+(to isolate the wording from every other variable): *"IMPORTANT: You have no
+internet access, no code interpreter, and no ability to execute code of any
+kind in this conversation... The ONLY way you can get information you don't
+already know is by requesting it from me using the exact format below...
+`<request_info>{"need": "read_file", "args": {"path": "src/main.py"}}
+</request_info>"*. This worked -- Sydney reproduced the tag and JSON exactly
+(with a leaked `"Coding and executing"` prefix before it, an internal
+progress-message artifact that turned out to reliably precede tool-call
+replies even when the final answer correctly follows the convention).
+
+Isolating the variable further: re-adding the word "tool" ANYWHERE in the
+prompt -- even just the user saying *"Please use your tools to read the
+file..."*, with everything else unchanged -- reliably reproduced the
+original file-read failure (Sydney fell back to "I can't access your local
+project files... please upload it"). Manually pre-replacing "tools" with
+"capabilities" in that same sentence reliably recovered success. This is
+the basis for `_neutralize_tool_word()`: since a real coding-agent's own
+system prompt (OpenCode's, OpenHands', etc.) is unavoidably saturated with
+the word "tool" and this proxy cannot edit what the client sends, the fix
+has to launder that word out of the ENTIRE rendered prompt, not just this
+proxy's own injected instructions.
+
+**However: even after fixing the wording, the effective reliability is
+still roughly a coin flip.** Six repeated trials of the exact same simplest-
+possible request (one tool, one plain user message, word laundered) split
+3 successes / 3 failures. This is inherent model-sampling variance, not a
+bug or a remaining keyword to find -- there is no deterministic "fix" left
+at the prompt level. This directly motivated `_run_tool_call_turn()`'s
+retry loop (each retry is a fresh, independent, stateless Chathub turn, so
+retrying costs nothing but latency): across the retry-enabled sample
+measured during development (8 requests: 5 simplest-case + 3 with a longer,
+more realistic multi-tool/multi-instruction system prompt resembling a real
+coding agent's), 7/8 succeeded within 3 attempts -- consistent with, though
+not a large enough sample to precisely confirm, the ~87.5% a naive
+independent-trials model would predict from a ~50% per-attempt rate. The
+one measured failure was on the more complex, realistic prompt, consistent
+with reliability degrading somewhat as the prompt grows longer/more
+tool-saturated even after laundering.
+
+**A second, distinct failure mode: continuing after a tool result.** Once a
+tool call was obtained, the natural next test -- render the client's
+follow-up request (the original user turn + an assistant `tool_calls`
+message + a `"tool"`-role result message, exactly as a real client sends it
+back) -- initially reproduced the SAME flat refusal from Attempt 1, every
+single time (3/3 trials, each internally retried 3x = 9 total attempts, all
+refused). The rendering at the time synthesized a fabricated `"Assistant:
+[requested \"read_file\" (call_id=...) with arguments {...}]"` turn in the
+"conversation so far" transcript -- i.e., inventing a prior assistant turn
+describing an action it "already took." Removing that fabricated turn
+entirely and instead folding the tool's result text into the START of the
+next turn as ordinary parenthetical context (worded as information the user
+is now supplying, not as history the model supposedly generated) fixed this
+completely: 3/3 retest trials produced a coherent, correct final answer
+using the tool result. The working hypothesis: a fabricated "the assistant
+already took this action" turn has the SHAPE of a classic prompt-injection/
+jailbreak technique (asserting the model already agreed to or did something,
+to manipulate its next response), and Sydney's safety layer appears to react
+to that shape specifically, independent of how mundane the actual content
+is. This is inferred from the A/B result, not confirmed via any official
+source -- treat it as a strong empirical pattern, not a proven mechanism.
+
+### Honest net assessment
+
+- A single tool-calling attempt succeeds roughly half the time even under
+  the best (simplest, word-laundered) conditions measured. Retrying (3x,
+  already implemented) raises this to a rate high enough for occasional/
+  low-stakes tool use, but not to anything like 100%.
+- Once obtained, continuing the conversation after a tool result is
+  reliable (all measured trials succeeded) PROVIDED the tool result is
+  folded into the next turn as context rather than rendered as a fabricated
+  assistant-history turn -- this proxy does this by default.
+- **This is not a solid foundation for a long autonomous agentic loop.** A
+  real OpenCode/OpenHands session might need dozens of consecutive
+  successful tool calls; even at a generously-estimated 90%-per-call
+  effective success rate (with retries), the probability of completing 20
+  calls without the model ever "just answering in plain text instead" is
+  under 15%. Whether that's acceptable depends entirely on what you're
+  using it for -- an occasional one-off tool call in an otherwise-
+  conversational session is a very different use case from driving an
+  unattended coding agent.
+- The real fix for reliability would be Sydney's actual Local MCP mechanism
+  (see the section above), not more prompt engineering here -- but that
+  remains a substantial, unimplemented, separate project with its own
+  unresolved unknowns (see "What's NOT yet confirmed" above).
+
+### Ideas not yet tried (would need further live testing to evaluate)
+
+- Whether OpenHands/LiteLLM's own client-side "mock function calling" mode
+  (convert tool schemas to text and parse a DIFFERENT, LiteLLM-specific
+  convention back out on the *client* side, entirely independent of this
+  proxy's `tools` emulation) performs any better when pointed at this proxy
+  with NO `tools` field sent at all -- i.e., let OpenHands do its own
+  prompt-based emulation against plain chat completions, rather than layering
+  its emulation on top of this proxy's. Untested.
+- Whether lowering `_TOOL_CALL_MAX_ATTEMPTS` costs meaningfully less latency
+  at an acceptable further reliability cost, or whether raising it (5+
+  attempts) meaningfully improves the effective rate further -- only 3 was
+  tested.
+- Whether the specific tag name (`<action_request>`) or wording matters at
+  the margin beyond avoiding "tool" -- only one alternative phrasing/tag
+  pair was tried once it started working; no systematic sweep across
+  taggings was done.

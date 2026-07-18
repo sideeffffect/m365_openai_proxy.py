@@ -10,10 +10,11 @@ OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`) backed by
 > history works by "context-stuffing": the proxy renders the *entire*
 > `messages` array (system prompt + every prior turn) into one text blob
 > and sends that as a single Chathub turn, which is exactly what stateless
-> per-request clients (e.g. Aider) already expect. There is still **no
-> tool/function calling** (see "Known limitations"), so agent harnesses
-> that rely on the model emitting `tool_calls` to edit files/run
-> commands (e.g. OpenCode) will not work yet.
+> per-request clients already expect. Tool/function calling (`tools` /
+> `tool_calls`) is now implemented, but it is **emulated by prompting, on
+> a backend with no native concept of it, and it is probabilistic — not a
+> guarantee**. See "Known limitations" before depending on it for a real
+> agent loop (OpenCode, OpenHands, etc.).
 
 **Fully self-contained.** The entire project is the one file,
 `m365_openai_proxy.py`. It uses only the Python 3 standard library — no
@@ -88,19 +89,31 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   context/size limit Sydney enforces (unconfirmed, not surfaced by this
   proxy). A client expecting genuine server-side thread continuation
   independent of what it resends will not get that.
-- **No tool/function calling.** Sydney does have a real MCP-based tool-
-  invocation mechanism, reverse-engineered from the officeweb client and
-  documented in `REVERSE_ENGINEERING.md`'s "Local MCP tool-calling bridge"
-  section — but it is **not implemented here**. Bridging it to OpenAI's
-  tool-calling contract runs into a genuine architecture mismatch (Sydney's
-  invocation is synchronous and mid-turn; OpenAI tool-calling is async
-  across separate HTTP requests). If you're evaluating this for an agentic
-  coding client whose harness is built around the model emitting
-  `tool_calls` (e.g. **OpenCode**, which relies on tool calls for every
-  file/shell action and has no plain-text fallback), assume that will not
-  work yet. Clients that don't need API-level tool calling at all — e.g.
-  **Aider**, which parses diffs/whole-file rewrites out of plain text and
-  performs every file/git operation itself — work today; see below.
+- **Tool/function calling is emulated by prompting, and is probabilistic.**
+  Sydney has no native `tools`/`tool_calls` mechanism at all. When a request
+  includes `tools`, this proxy injects plain-text instructions teaching the
+  model a fixed convention (`<action_request>{"name":...,"arguments":{...}}
+  </action_request>`) and parses that back out of the reply into a real
+  OpenAI `tool_calls` response — see `m365_openai_proxy.py`'s module
+  docstring and `REVERSE_ENGINEERING.md`'s "Tool-calling emulation" section
+  for the full live-testing account. In short: Sydney's own built-in code
+  interpreter frequently preempts this convention instead of following it
+  (even for things it structurally can't do, like reading a file from
+  *your* machine), and even under the best measured conditions a single
+  attempt only followed the convention about half the time. This proxy
+  retries automatically (up to 3 attempts per turn) to raise the effective
+  success rate, and folds tool results back in as a way that avoids a
+  refusal-triggering failure mode found during testing — but this remains
+  fundamentally probabilistic, not a guaranteed contract. Expect an
+  occasional tool call to just not happen (the model replies with plain
+  text instead) even after retries, especially on longer/more complex
+  system prompts. Sydney's own REAL tool-invocation mechanism (Local MCP)
+  is reverse-engineered and documented in `REVERSE_ENGINEERING.md`'s "Local
+  MCP tool-calling bridge" section but remains **unimplemented** — it would
+  sidestep all of the above, at the cost of a genuine architecture mismatch
+  (Sydney's invocation is synchronous/mid-turn; OpenAI tool-calling is
+  async across separate HTTP requests) that's a substantial separate
+  project, not a quick patch.
 - `usage` (token counts) in every response is always zero — no token
   counting is implemented.
 - One Chathub WebSocket is opened and closed per HTTP request — no
@@ -120,16 +133,17 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
 The goal of this project is to let an existing coding-agent CLI drive its
 edits/chat using `m365.cloud.microsoft`'s Copilot as the model backend,
 without that agent knowing it isn't talking to a normal OpenAI-compatible
-API. Whether a given agent works comes down to one question: **does it
-require the model to emit native OpenAI `tool_calls`, or does it drive
-file/shell operations itself from plain-text model output?**
+API. Whether a given agent needs `tools`/`tool_calls` at the API level (and
+therefore depends on this proxy's probabilistic emulation of them) or drives
+file/shell operations itself from plain-text output determines how well it
+will actually work:
 
-- **[Aider](https://aider.chat/)** — works today. Aider never asks the
-  model to emit `tool_calls`; it asks for a diff/whole-file rewrite in
-  plain text and applies it itself, and it resends the full running
-  conversation on every request (which this proxy now renders faithfully
-  via context-stuffing — see "Known limitations" above). Point it at this
-  proxy with an OpenAI-compatible model config, e.g.:
+- **[Aider](https://aider.chat/)** — works well, with no dependency on tool-
+  calling emulation at all. Aider never asks the model to emit `tool_calls`;
+  it asks for a diff/whole-file rewrite in plain text and applies it itself,
+  and it resends the full running conversation on every request (rendered
+  via this proxy's context-stuffing). Point it at this proxy with an
+  OpenAI-compatible model config, e.g.:
 
   ```bash
   aider --openai-api-base http://127.0.0.1:8000/v1 --openai-api-key sk-unused \
@@ -139,12 +153,32 @@ file/shell operations itself from plain-text model output?**
   (Aider's config still wants *some* string in `--openai-api-key`; this
   proxy ignores it entirely — see AUTHENTICATION MODEL above.)
 
-- **[OpenCode](https://opencode.ai/)** — does not work yet. OpenCode is
-  built on the Vercel AI SDK's `generateText({ tools })` loop: reading a
-  file, editing it, running a shell command are all modeled as tool calls
-  the model must invoke, with no plain-text fallback. This proxy doesn't
-  implement OpenAI-style `tool_calls` (see "Known limitations"), so
-  OpenCode will not be able to take any actions through it today.
+- **[OpenCode](https://opencode.ai/)** — technically works via this proxy's
+  tool-calling emulation, but expect it to be unreliable. OpenCode is built
+  on the Vercel AI SDK's `generateText({ tools })` loop with no plain-text
+  fallback, so it depends entirely on this proxy's emulated `tool_calls`
+  (see "Known limitations" above) — which, per the live-testing writeup in
+  `REVERSE_ENGINEERING.md`, only reliably produces a call about half the
+  time per attempt even under the best conditions (3 retries raise this
+  substantially, but not to 100%). A long OpenCode session making many tool
+  calls in a row has a real chance of the model just answering in plain
+  text at some point instead of calling a tool, which OpenCode isn't
+  designed to gracefully recover from. Point OpenCode at this proxy the
+  same way as any OpenAI-compatible custom provider (`baseURL` pointed at
+  `http://127.0.0.1:8000/v1`, any placeholder API key) if you want to try
+  it, but go in with that expectation.
+
+- **[OpenHands CLI](https://docs.openhands.dev/)** — same emulated-
+  tool-calling dependency and reliability caveat as OpenCode applies if
+  configured for native tool calling against this proxy. OpenHands/LiteLLM
+  also has its own client-side "mock function calling" mode for backends
+  without native tool support (converts tool schemas to text and parses a
+  different, LiteLLM-specific convention back out on the *client* side) —
+  this proxy's emulation was not tested against that mode specifically, and
+  the two approaches would be redundant with each other; if you try
+  OpenHands, using its own non-native-tool-calling mode instead of this
+  proxy's `tools` emulation (i.e. never sending `tools` in the request at
+  all) is untested but may be worth trying as an alternative.
 
 ## Quick start
 
