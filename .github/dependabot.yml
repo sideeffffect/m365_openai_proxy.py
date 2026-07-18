@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Keep the pinned action versions in the workflow files patched
+  # automatically (e.g. actions/checkout@v4 -> v5 when it ships).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
