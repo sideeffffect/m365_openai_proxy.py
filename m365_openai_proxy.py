@@ -2397,20 +2397,13 @@ def _render_tools_block(tools, tool_choice):
         "Capabilities you can request this way:",
     ]
     lines.extend(_render_capability_list(tools))
-
-    if isinstance(tool_choice, dict):
-        forced_name = (tool_choice.get("function") or {}).get("name")
-        if forced_name:
-            lines.append("")
-            lines.append(
-                f'You MUST request "{forced_name}" now, using the format above.'
-            )
-    elif tool_choice == "required":
-        lines.append("")
-        lines.append(
-            "You MUST make one of the requests above now, using the format above."
+    lines.extend(
+        _render_tool_choice_directive(
+            tool_choice,
+            forced='You MUST request "{name}" now, using the format above.',
+            required="You MUST make one of the requests above now, using the format above.",
         )
-
+    )
     return "\n".join(lines)
 
 
@@ -2465,22 +2458,31 @@ def _render_tools_block_code_mode(tools, tool_choice):
         "Capabilities available this way:",
     ]
     lines.extend(_render_capability_list(tools))
+    lines.extend(
+        _render_tool_choice_directive(
+            tool_choice,
+            forced=f"You MUST call {_CODE_MODE_INVOKE_NAME}('{{name}}', ...) now.",
+            required=f"You MUST call {_CODE_MODE_INVOKE_NAME}(...) now, for one of "
+            "the capabilities above.",
+        )
+    )
+    return "\n".join(lines)
 
+
+def _render_tool_choice_directive(tool_choice, forced, required):
+    """Shared by both `_render_tools_block()` and
+    `_render_tools_block_code_mode()`: renders OpenAI's `tool_choice` field
+    into trailing directive lines (empty when `tool_choice` doesn't force
+    anything). `forced` is a format string with a `{name}` placeholder for
+    the specific forced capability; `required` is the "must use one of
+    them" wording -- each convention supplies its own phrasing."""
     if isinstance(tool_choice, dict):
         forced_name = (tool_choice.get("function") or {}).get("name")
         if forced_name:
-            lines.append("")
-            lines.append(
-                f"You MUST call {_CODE_MODE_INVOKE_NAME}('{forced_name}', ...) now."
-            )
+            return ["", forced.format(name=forced_name)]
     elif tool_choice == "required":
-        lines.append("")
-        lines.append(
-            f"You MUST call {_CODE_MODE_INVOKE_NAME}(...) now, for one of the "
-            "capabilities above."
-        )
-
-    return "\n".join(lines)
+        return ["", required]
+    return []
 
 
 def _render_capability_list(tools):
@@ -2703,12 +2705,41 @@ def _looks_like_throttled_empty_reply(text):
     return not text.strip()
 
 
+#: The one user-facing message for the empty-reply throttle shape above --
+#: shared by every surface point (non-streaming 429 body, streaming SSE
+#: error event) so clients see the same text no matter which path hit it.
+_THROTTLED_EMPTY_MSG = (
+    "Sydney returned a completely empty reply. This usually means Microsoft "
+    "is temporarily throttling this account after a burst of requests -- "
+    "wait a bit (a minute or more) and try again."
+)
+
+
 def _extract_calls_for_mode(mode, text):
     """Dispatches to the extractor matching `mode` (see _TOOL_CALL_MODES) --
     keeps _run_tool_call_turn's retry loop mode-agnostic."""
     if mode == "code":
         return _extract_code_mode_calls(text)
     return _extract_tool_calls(text)
+
+
+def _openai_tool_call_entries(tool_calls, with_index=False):
+    """Renders extracted tool calls (`{"id", "name", "arguments_json"}`
+    dicts, see the extractors above) as OpenAI response `tool_calls`
+    entries. `with_index=True` adds the `index` key that streaming chunk
+    deltas carry but full responses don't -- the only difference between
+    the two response shapes."""
+    entries = []
+    for i, tc in enumerate(tool_calls):
+        entry = {
+            "id": tc["id"],
+            "type": "function",
+            "function": {"name": tc["name"], "arguments": tc["arguments_json"]},
+        }
+        if with_index:
+            entry = {"index": i, **entry}
+        entries.append(entry)
+    return entries
 
 
 def _run_tool_call_turn(
@@ -3237,6 +3268,20 @@ def make_handler(token_cache, conversation_sessions):
             else:
                 self._handle_full(plan, model)
 
+        def _remember_turn(self, plan, text):
+            """Shared tail of `_run_plain_turn`/`_stream_plain_turn`: if
+            `plan` is tracked, remembers the completed turn's conversation
+            state under a fingerprint of `messages + [this reply]` so the
+            client's next call can be recognized as a continuation."""
+            if not plan.should_track:
+                return
+            new_fingerprint = _conversation_fingerprint(
+                plan.messages + [{"role": "assistant", "content": text}]
+            )
+            conversation_sessions.remember(
+                new_fingerprint, plan.conversation_id, plan.oid, plan.turn_count
+            )
+
         def _run_plain_turn(self, plan):
             """Runs one plain-text (no `tools`) Chathub turn per `plan`,
             with ConversationSessionStore bookkeeping: on success, remembers
@@ -3291,13 +3336,7 @@ def make_handler(token_cache, conversation_sessions):
                     )
                 )
 
-            if plan.should_track:
-                new_fingerprint = _conversation_fingerprint(
-                    plan.messages + [{"role": "assistant", "content": text}]
-                )
-                conversation_sessions.remember(
-                    new_fingerprint, plan.conversation_id, plan.oid, plan.turn_count
-                )
+            self._remember_turn(plan, text)
             return text
 
         def _stream_plain_turn(self, plan):
@@ -3328,14 +3367,7 @@ def make_handler(token_cache, conversation_sessions):
                     conversation_sessions.forget(plan.lookup_fingerprint)
                 raise
 
-            if plan.should_track:
-                text = "".join(parts)
-                new_fingerprint = _conversation_fingerprint(
-                    plan.messages + [{"role": "assistant", "content": text}]
-                )
-                conversation_sessions.remember(
-                    new_fingerprint, plan.conversation_id, plan.oid, plan.turn_count
-                )
+            self._remember_turn(plan, "".join(parts))
 
         def _handle_streaming(self, plan, model):
             self.send_response(200)
@@ -3382,18 +3414,9 @@ def make_handler(token_cache, conversation_sessions):
                         emit(
                             {
                                 "role": "assistant",
-                                "tool_calls": [
-                                    {
-                                        "index": i,
-                                        "id": tc["id"],
-                                        "type": "function",
-                                        "function": {
-                                            "name": tc["name"],
-                                            "arguments": tc["arguments_json"],
-                                        },
-                                    }
-                                    for i, tc in enumerate(tool_calls)
-                                ],
+                                "tool_calls": _openai_tool_call_entries(
+                                    tool_calls, with_index=True
+                                ),
                             }
                         )
                         finish_reason = "tool_calls"
@@ -3405,12 +3428,7 @@ def make_handler(token_cache, conversation_sessions):
                         # it as a proper SSE error event (type
                         # `upstream_throttled`) instead of a silent
                         # "the assistant said nothing" success.
-                        raise ThrottledError(
-                            "Sydney returned a completely empty reply -- this "
-                            "usually means Microsoft is temporarily throttling "
-                            "this account after a burst of requests; wait a "
-                            "bit (a minute or more) and try again"
-                        )
+                        raise ThrottledError(_THROTTLED_EMPTY_MSG)
                     else:
                         emit({"role": "assistant", "content": text})
                         finish_reason = "stop"
@@ -3428,12 +3446,7 @@ def make_handler(token_cache, conversation_sessions):
                         # _looks_like_throttled_empty_reply's docstring for
                         # why this is treated as an error, not a valid
                         # (if terse) empty answer.
-                        raise ThrottledError(
-                            "Sydney returned a completely empty reply -- this "
-                            "usually means Microsoft is temporarily throttling "
-                            "this account after a burst of requests; wait a "
-                            "bit (a minute or more) and try again"
-                        )
+                        raise ThrottledError(_THROTTLED_EMPTY_MSG)
                     finish_reason = "stop"
 
                 final = {
@@ -3512,14 +3525,7 @@ def make_handler(token_cache, conversation_sessions):
                     "burst of requests, surfacing as an error",
                     completion_id,
                 )
-                self._error(
-                    429,
-                    "Sydney returned a completely empty reply. This usually "
-                    "means Microsoft is temporarily throttling this account "
-                    "after a burst of requests -- wait a bit (a minute or "
-                    "more) and try again.",
-                    err_type="upstream_throttled",
-                )
+                self._error(429, _THROTTLED_EMPTY_MSG, err_type="upstream_throttled")
                 return
 
             if tool_calls:
@@ -3534,17 +3540,7 @@ def make_handler(token_cache, conversation_sessions):
                 message = {
                     "role": "assistant",
                     "content": None,
-                    "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments_json"],
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
+                    "tool_calls": _openai_tool_call_entries(tool_calls),
                 }
                 finish_reason = "tool_calls"
                 logging.info(
