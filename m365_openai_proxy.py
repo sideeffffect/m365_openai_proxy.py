@@ -226,7 +226,7 @@ KNOWN LIMITATIONS
 ------------------------------------------------------------------------------
 - **Multi-turn memory now prefers Sydney's own native conversation state,
   with context-stuffing kept as an automatic fallback for whatever doesn't
-  fit that.** A live experiment (`experiments/probe_conversation_reuse.py`,
+  fit that.** A live experiment (`scripts/probe_conversation_reuse.py`,
   see REVERSE_ENGINEERING.md's "Sydney-native conversation continuity"
   section) confirmed that Sydney DOES honor a `ConversationId` reused
   across a brand-new, independent Chathub WebSocket connection as real
@@ -264,7 +264,7 @@ KNOWN LIMITATIONS
   fast path, the second gets a clean cache miss and falls back to a
   brand-new conversation instead of corrupting either branch with the
   other's content (a real bug caught live by
-  `experiments/test_continuity_offline.py`'s "branch" case during
+  `tests/test_continuity.py`'s "branch" case during
   development, not just a theoretical concern). A turn that tries to
   continue a tracked session and fails is caught, the session is forgotten,
   and (for non-streaming requests only -- see `_run_plain_turn`'s docstring
@@ -501,7 +501,7 @@ import uuid
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.8"
+PROXY_VERSION = "0.8.0"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -2215,7 +2215,7 @@ class ConversationSessionStore:
 
     Each entry is SINGLE-USE: `lookup()` POPS the matching entry rather than
     just peeking at it. This matters for correctness, not just bookkeeping
-    hygiene -- confirmed by `experiments/test_continuity_offline.py`'s
+    hygiene -- confirmed by `tests/test_continuity.py`'s
     "branch" case catching this as a real bug during development. Sydney's
     own conversation state is a single, linear, mutable timeline: once one
     request has extended it with a given next message, that `ConversationId`

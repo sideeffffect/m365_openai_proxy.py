@@ -124,7 +124,7 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   is reverse-engineered and documented in `REVERSE_ENGINEERING.md`'s "Local
   MCP tool-calling bridge" section but remains **unimplemented in this
   proxy** — deliberately. It was live-probed against the real backend
-  (`experiments/probe_local_mcp.py`), which **confirmed on the wire** that
+   (`scripts/probe_local_mcp.py`), which **confirmed on the wire** that
   Local MCP is reachable for the tested tenant (our warmup advertisement
   makes Sydney call `mcp_describe` back), that the invocation carries an
   `invocationId` (SignalR "client results" is real), and that the wire
@@ -401,28 +401,44 @@ Run `python3 m365_openai_proxy.py --help` for all flags, including
 See `REVERSE_ENGINEERING.md` for the full protocol reverse-engineering
 writeup this implementation is based on (Chathub/SignalR wire format, the
 FOCI token-family auth chain, the MSAL cache-encryption algorithm, etc).
-`experiments/` holds small, ad-hoc scripts used while developing/investigating
-features — `probe_conversation_reuse.py` (live-tests against the real backend
-that a reused `ConversationId` carries real server-side memory),
-`dump_frames.py` (raw SignalR frame dump, used to find the rate-limit handling
-gap), `test_continuity_offline.py` / `test_throttle_429_offline.py` /
-`test_token_refresh_race_offline.py` (network-free tests of the HTTP-layer
-wiring, with `run_chat_turn` stubbed out), and `probe_local_mcp.py` (the live
+`tests/` holds the network-free test suite (`pytest`), which drives the
+proxy's real HTTP handler with `run_chat_turn` stubbed out so it needs no
+live credentials or quota — `test_continuity.py`, `test_throttle_429.py`,
+and `test_token_refresh_race.py` cover the conversation-continuity,
+throttle-harmonization, and token-refresh-race wiring respectively.
+`scripts/` holds live, credential-requiring dev probes (**not** automated
+tests): `probe_conversation_reuse.py` (confirms a reused `ConversationId`
+carries real server-side memory), `dump_frames.py` (raw SignalR frame dump,
+used to find the rate-limit handling gap), and `probe_local_mcp.py` (the live
 probe that confirmed Sydney's Local MCP handshake on the wire and pinned down
 the tool-surfacing blocker — see the "Local MCP tool-calling bridge" section
 of REVERSE_ENGINEERING.md). See REVERSE_ENGINEERING.md for what each one found.
 None of them are part of the shipped proxy or required to run it — and, per
 `AGENTS.md`, unlike the proxy itself they may use any Python tooling/libraries.
 
+## Development
+
+The repo's dev tooling (test suite, linter/formatter, security scanner) is
+managed with [uv](https://docs.astral.sh/uv/) — none of it is needed to *run*
+the proxy, which stays stdlib-only:
+
+```bash
+uv sync                                   # install the dev tooling
+uv run pytest                             # run the offline test suite
+uv run ruff format . && uv run ruff check .
+uv run bandit -c pyproject.toml m365_openai_proxy.py
+```
+
 ## Requirements
 
-Python 3 standard library only, no third-party packages. CI smoke-tests
-this script (byte-compile, plus a `--help` run that imports the module and
-so exercises the pure-Python AES-256-GCM self-check) on Python 3.9 through
-3.13 on Linux, and on the oldest and newest of those (3.9 and 3.13) on
-macOS and Windows as well. Functional end-to-end use — which needs live
-Microsoft credentials and so can't run in CI — was developed and verified
-against Python 3.12.
+**Running the proxy** needs only a Python 3 interpreter — standard library
+only, no third-party packages, nothing to install. CI smoke-tests the script
+(byte-compile, plus a `--help` run that imports the module and so exercises
+the pure-Python AES-256-GCM self-check) on Python 3.11 through 3.13 on Linux,
+and on the oldest and newest of those (3.11 and 3.13) on macOS and Windows as
+well, and runs the `pytest` suite on 3.11–3.13. Functional end-to-end use —
+which needs live Microsoft credentials and so can't run in CI — was developed
+and verified against Python 3.12.
 
 ## License
 

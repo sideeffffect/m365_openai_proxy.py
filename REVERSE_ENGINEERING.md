@@ -1176,7 +1176,7 @@ being implemented.
 ## Update: Local MCP bridge — live-probed on the wire (findings; deliberately NOT implemented in the proxy)
 
 Rather than wait for a browser-side capture, the four open unknowns above were
-attacked directly: a standalone probe (`experiments/probe_local_mcp.py`)
+attacked directly: a standalone probe (`scripts/probe_local_mcp.py`)
 stands up a **fake in-process MCP server** (`probe_server`, one tool
 `get_probe_secret` returning a sentinel only the tool could know), advertises
 it to Sydney over this project's existing Chathub connection exactly as the
@@ -1265,12 +1265,12 @@ round-trip on every turn) is worse than not shipping it:
   mock-function-calling).
 
 So the value of the work — the protocol knowledge — is preserved **here** (this
-section) plus the reproducible live probe `experiments/probe_local_mcp.py`,
+section) plus the reproducible live probe `scripts/probe_local_mcp.py`,
 rather than as dormant, unusable code in the shipped single-file proxy. The
 proxy itself is unchanged.
 
 **Concrete next step to actually enable this**, whenever it's worth revisiting:
-re-run `experiments/probe_local_mcp.py` while a Local-MCP-enabled declarative
+re-run `scripts/probe_local_mcp.py` while a Local-MCP-enabled declarative
 agent is selected (a real `GptId` in `threadLevelGptId`/`selectedGptId`), which
 is where the bundle evidence says surfacing lives. If that makes Sydney emit
 `invoke_local_plugin`, the prototype bridge (recoverable from this branch's
@@ -2359,7 +2359,7 @@ mode on top of it.
 
 ### The probe
 
-`experiments/probe_conversation_reuse.py` (not part of the shipped proxy --
+`scripts/probe_conversation_reuse.py` (not part of the shipped proxy --
 an ad-hoc script kept for anyone who wants to re-run or extend this test)
 does the following against the real backend, using this repo's own
 already-configured credentials:
@@ -2449,8 +2449,8 @@ Key design choices, and why:
 - **Tracked sessions are single-use -- a real bug this caught during
   development, not just defensive programming.** The first implementation
   had `ConversationSessionStore.lookup()` merely READ the matching entry,
-  leaving it in place for future lookups too. `experiments/
-  test_continuity_offline.py`'s "branch" case (send turn 1, then two
+  leaving it in place for future lookups too. `tests/
+    test_continuity.py`'s "branch" case (send turn 1, then two
   DIFFERENT possible turn 2's from the same point) caught this immediately:
   both turn-2 variants matched the same cached entry and both reused the
   same `ConversationId` -- but Sydney's own conversation state is one
@@ -2487,7 +2487,7 @@ While running the probe and the modified proxy's real HTTP server back to
 back (several Chathub turns in a short window), Sydney's own rate limiting
 kicked in -- and exposed a pre-existing gap that had nothing to do with
 conversation continuity. Dumping raw frames for a throttled turn
-(`experiments/dump_frames.py`) showed:
+(`scripts/dump_frames.py`) showed:
 
 ```json
 {"type": 2, "invocationId": "0", "item": {"messages": [
@@ -2534,7 +2534,7 @@ spending live quota chasing a second confirmation of the HTTP-layer wiring
 WebSocket connections -- was already conclusively confirmed by the probe
 in the section above), the rest of the `ConversationSessionStore`/
 `_plan_chat_turn`/`_run_plain_turn`/`_stream_plain_turn` wiring was instead
-validated with `experiments/test_continuity_offline.py`: a real HTTP
+validated with `tests/test_continuity.py`: a real HTTP
 server (`_LoggingHTTPServer` + `make_handler`), with `run_chat_turn`
 monkeypatched to a fake, network-free stand-in, driven by real
 `urllib.request` POSTs. This spends zero Sydney quota and, per the "single-

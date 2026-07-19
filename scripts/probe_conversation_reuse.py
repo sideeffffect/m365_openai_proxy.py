@@ -15,7 +15,7 @@ Run directly against the sibling checkout's already-configured credential
 files (read-only except for the refresh_token rotation the proxy always does
 as part of normal operation):
 
-    python3 experiments/probe_conversation_reuse.py
+    python3 scripts/probe_conversation_reuse.py
 
 Prints each turn's reply text (synthetic test content only, nothing
 sensitive) and a final verdict line.

@@ -21,18 +21,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
-
-      - name: Install ruff
-        run: python -m pip install --upgrade ruff
+          enable-cache: true
 
       - name: ruff check
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: ruff format --check
-        run: ruff format --check .
+        run: uv run ruff format --check .
 
   security:
     name: Security scan (bandit)
@@ -40,12 +38,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
-
-      - name: Install bandit
-        run: python -m pip install --upgrade bandit
+          enable-cache: true
 
       # Config (skips + rationale for the repo-wide false positives) lives in
       # pyproject.toml's [tool.bandit] table. The few remaining true
@@ -53,7 +49,27 @@ jobs:
       # inline with `# nosec BXXX` comments explaining why, right at each
       # site -- see m365_openai_proxy.py.
       - name: bandit
-        run: bandit -c pyproject.toml m365_openai_proxy.py
+        run: uv run bandit -c pyproject.toml m365_openai_proxy.py
+
+  test:
+    name: Tests (pytest, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # The offline suite in tests/ drives the proxy's real HTTP handler with
+      # every network call stubbed -- no live Microsoft credentials, no quota.
+      - name: pytest
+        run: uv run --python ${{ matrix.python-version }} pytest -q
 
   compatibility:
     name: Smoke test (${{ matrix.os }}, Python ${{ matrix.python-version }})
@@ -62,18 +78,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Full Python support range on Linux, the cheapest/fastest runner.
-          - { os: ubuntu-latest, python-version: "3.9" }
-          - { os: ubuntu-latest, python-version: "3.10" }
+          # Supported Python range on Linux, the cheapest/fastest runner.
           - { os: ubuntu-latest, python-version: "3.11" }
           - { os: ubuntu-latest, python-version: "3.12" }
           - { os: ubuntu-latest, python-version: "3.13" }
           # The README's whole pitch is "drop this one file onto any machine
           # with a Python 3 interpreter" -- sanity-check the oldest and
-          # newest supported interpreters on macOS and Windows too.
-          - { os: macos-latest, python-version: "3.9" }
+          # newest supported interpreters on macOS and Windows too. This job
+          # deliberately uses a bare interpreter (no uv, no pip install) to
+          # prove the proxy runs with nothing installed.
+          - { os: macos-latest, python-version: "3.11" }
           - { os: macos-latest, python-version: "3.13" }
-          - { os: windows-latest, python-version: "3.9" }
+          - { os: windows-latest, python-version: "3.11" }
           - { os: windows-latest, python-version: "3.13" }
     steps:
       - uses: actions/checkout@v7
