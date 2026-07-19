@@ -105,6 +105,29 @@ except a single non-technical fatal message when it truly can't continue.
 **Never log secrets/tokens/passwords** — only lengths, ids, and non-secret
 metadata. Preserve this when editing.
 
+## Versioning & releases
+
+The version lives in **one canonical place — `PROXY_VERSION` in
+`m365_openai_proxy.py`** (it's what the proxy reports in its startup banner and
+its HTTP `Server:` header). Two other places must always agree with it:
+
+- **`pyproject.toml`'s `version`** — the same number, without the `v` prefix.
+- **the git tag + GitHub Release** — tag `vX.Y` for `PROXY_VERSION` `X.Y`.
+
+The scheme is `X.Y` (e.g. `0.8`), tag `vX.Y`. There is no automated/derived
+versioning (setuptools-scm/hatch-vcs and friends need a build backend, and this
+project deliberately has none — `[tool.uv] package = false`, nothing to build),
+so the sync is a manual step. **To cut a release:**
+
+1. Bump `PROXY_VERSION` in `m365_openai_proxy.py`.
+2. Set `version` in `pyproject.toml` to the same number.
+3. Run the local CI gate (see above) so the release is green.
+4. Commit, then tag: `git tag vX.Y && git push origin vX.Y`.
+5. Create the GitHub Release for `vX.Y` (`gh release create vX.Y …`).
+
+If you ever bump one of these, bump all of them in the same change — a mismatch
+between the banner, `pyproject.toml`, and the tag/Release is a bug.
+
 ## Where things live
 
 - `m365_openai_proxy.py` — the entire shipped proxy (stdlib-only). Its module
@@ -119,7 +142,9 @@ metadata. Preserve this when editing.
 - `scripts/` — developer-only live probes needing real credentials/network
   (may use any deps); **not** run in CI.
 - `README.md` — user-facing usage and the compatibility/limitations picture.
-- `pyproject.toml` — project metadata, the uv-managed `[dependency-groups] dev`
-  tooling, and the `pytest` + `bandit` config. There is no build system; the
-  product is a single script, so `[tool.uv] package = false`.
+- `pyproject.toml` — project metadata (its `version` mirrors the proxy's
+  `PROXY_VERSION` and the git tag/Release — see "Versioning & releases"), the
+  uv-managed `[dependency-groups] dev` tooling, and the `pytest` + `bandit`
+  config. There is no build system; the product is a single script, so
+  `[tool.uv] package = false`.
 - `uv.lock` — the pinned dev-tooling lockfile (committed).
