@@ -31,9 +31,3 @@ m365_openai_proxy.json
 # Proxy's own runtime log -- never commit (should never contain secrets by
 # design, but treat it as sensitive operational data regardless)
 m365_openai_proxy.log
-
-# Operator's local MCP server config (--local-mcp-config, written by
-# --init-local-mcp-config) -- holds local command lines / filesystem paths,
-# keep it local
-m365_openai_proxy.local_mcp.json
-*.local_mcp.json

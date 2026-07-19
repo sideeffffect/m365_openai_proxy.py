@@ -1173,7 +1173,7 @@ shot and turn this from "confirmed by reading source" to "confirmed on the
 wire" — the same bar every other finding in this document was held to before
 being implemented.
 
-## Update: Local MCP bridge — live-probed on the wire, and implemented (opt-in, additive)
+## Update: Local MCP bridge — live-probed on the wire (findings; deliberately NOT implemented in the proxy)
 
 Rather than wait for a browser-side capture, the four open unknowns above were
 attacked directly: a standalone probe (`experiments/probe_local_mcp.py`)
@@ -1240,40 +1240,42 @@ off `e.clientData.pluginInfo.GptId` — i.e. an invoked local tool is bound to a
 GPT/agent. The describe handshake pre-caches descriptors regardless, but
 without an agent context the tools are never injected into the model's prompt.
 
-### What was implemented, and why it's opt-in and additive
+### Decision: findings documented, NOT implemented in the proxy
 
-Given the above, `m365_openai_proxy.py` now ships the **transport layer of the
-bridge** — the part that is confirmed on the wire — as an **opt-in, additive**
-feature (`--enable-local-mcp` + `--local-mcp-config`), pure-stdlib as the whole
-project must be:
+A working transport-layer bridge was actually prototyped (a pure-stdlib stdio
+MCP host — `StdioMCPClient` + `LocalMCPHost` — that answers Sydney's
+`mcp_discover`/`mcp_describe`/`invoke_local_plugin` invocations, threaded
+through the Chathub turn and gated behind `--enable-local-mcp`). It passed an
+offline test against a real mock MCP subprocess and its handshake was verified
+live end-to-end (warmup sent → Sydney called `mcp_describe` back → the host
+serviced it). **But it was deliberately NOT merged into `m365_openai_proxy.py`,
+and that prototype code was reverted**, for one decisive reason: in the only
+scenario this proxy can connect as (`OfficeWebIncludedCopilot`), the surfacing
+blocker above means Sydney never actually sends `invoke_local_plugin`, so the
+bridge — however correct — can never fire end-to-end. Shipping a feature that
+cannot be used (and that carries per-turn cost: an extra warmup + describe
+round-trip on every turn) is worse than not shipping it:
 
-- `StdioMCPClient` — a minimal MCP client speaking JSON-RPC 2.0 over a child
-  process's stdin/stdout using MCP's newline-delimited stdio framing
-  (`initialize` + `notifications/initialized`, `tools/list`, `tools/call`).
-- `LocalMCPHost` — owns the operator-configured servers, sends the warmup
-  advertisement, and services Sydney's `mcp_discover`/`mcp_describe`/
-  `invoke_local_plugin` invocations by making real MCP calls and returning the
-  confirmed-shape client-result envelopes as SignalR type:3 completions.
-- Wired into the Chathub turn (`open_chathub`/`run_chat_turn`/
-  `stream_chat_reply`) so a turn becomes a Local MCP host when enabled, and is
-  byte-for-byte unchanged when not (the default).
+- It would add a user-facing `--enable-local-mcp` flag that does nothing useful,
+  which is a support/maintenance liability and a credibility cost against this
+  project's "confirmed on the wire before shipping" bar.
+- The earlier plan to *replace* the probabilistic prompt-emulation with this
+  bridge is off the table entirely: a bridge that never triggers would be a
+  straight regression for the clients that work today (Aider, OpenHands
+  mock-function-calling).
 
-It is **not** a replacement for the prompt-emulation tool-calling. The earlier
-plan was to replace emulation, but the live finding above makes that unsafe: a
-bridge that never triggers `invoke_local_plugin` in the reachable scenario
-would be a straight regression for the clients that work today (Aider, OpenHands
-mock-function-calling). So the bridge is off by default; when off, nothing
-changes. The bridge's own logic is covered offline by
-`experiments/test_local_mcp_offline.py` (a real mock stdio MCP server
-subprocess + the exact server→client frames Sydney sends, asserting every wire
-shape), so the transport is regression-tested even though the end-to-end
-trigger is blocked upstream.
+So the value of the work — the protocol knowledge — is preserved **here** (this
+section) plus the reproducible live probe `experiments/probe_local_mcp.py`,
+rather than as dormant, unusable code in the shipped single-file proxy. The
+proxy itself is unchanged.
 
-**Concrete unlock, if pursued further:** drive the same probe while a
-Local-MCP-enabled declarative agent is selected (a real `GptId` in
-`threadLevelGptId`/`selectedGptId`), which is where the bundle evidence says
-surfacing lives. That would turn the one remaining blocker into either "works
-end-to-end" or a next, more specific finding.
+**Concrete next step to actually enable this**, whenever it's worth revisiting:
+re-run `experiments/probe_local_mcp.py` while a Local-MCP-enabled declarative
+agent is selected (a real `GptId` in `threadLevelGptId`/`selectedGptId`), which
+is where the bundle evidence says surfacing lives. If that makes Sydney emit
+`invoke_local_plugin`, the prototype bridge (recoverable from this branch's
+history) becomes worth landing; until then, the emulation path in
+`m365_openai_proxy.py` remains the only tool-calling mechanism that works.
 
 ## Update: goal re-scoped to "drive a coding agent via m365 Copilot", multi-turn implemented via context-stuffing
 

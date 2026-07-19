@@ -399,24 +399,11 @@ KNOWN LIMITATIONS
   Sydney's own REAL tool-invocation mechanism (Local MCP, over the same
   Chathub connection -- `mcp_discover`/`mcp_describe`/`invoke_local_plugin`
   SignalR targets, reverse-engineered from the officeweb client's own
-  source) now has an OPT-IN, ADDITIVE bridge implemented here (see the
-  "Local MCP tool-calling bridge" code section and `--enable-local-mcp`):
-  this proxy can host real local MCP servers (stdio subprocess + JSON-RPC,
-  pure stdlib) and advertise them to Sydney. Live probing
-  (experiments/probe_local_mcp.py) CONFIRMED ON THE WIRE, for the tested
-  tenant, three of the four things REVERSE_ENGINEERING.md had flagged as
-  only inferred: Local MCP is reachable (our warmup made Sydney send
-  `mcp_describe` back), the invocation carries an `invocationId` (SignalR
-  "client results" is real), and the advertisement/describe shapes are
-  accepted. BUT: in this proxy's default (non-agent) scenario Sydney does
-  the describe HANDSHAKE yet never SURFACES the tool to the model, so it
-  never calls `invoke_local_plugin` -- surfacing appears gated to a
-  declarative-agent/GptId context this scenario can't reach (see
-  REVERSE_ENGINEERING.md for the full evidence). So the bridge is correct
-  and its handshake is live-exercisable, but does not yet make Sydney
-  actually call a tool -- which is exactly why it is opt-in and additive
-  (the prompt-emulation above stays the default and is untouched), not a
-  replacement.
+  source) is documented in REVERSE_ENGINEERING.md's "Local MCP tool-calling
+  bridge" section but remains unimplemented -- bridging it properly runs
+  into a genuine architecture mismatch (Sydney's invocation is synchronous,
+  mid-turn, and presumably timeout-bound) that is a substantial separate
+  project, not a quick patch, and would sidestep everything above.
 
 - **A completely empty reply from Sydney is treated as an error, not a
   silent success -- this usually means Microsoft-side request throttling,
@@ -500,11 +487,9 @@ import logging
 import os
 import platform
 import re
-import select
 import socket
 import ssl
 import struct
-import subprocess  # nosec B404: only used to run operator-configured local MCP servers (see StdioMCPClient); no shell, args from a local config file, never network input
 import sys
 import textwrap
 import threading
@@ -1806,566 +1791,6 @@ class TokenCache:
 
 
 # ==============================================================================
-# Local MCP tool-calling bridge (opt-in, additive) -- see REVERSE_ENGINEERING.md
-# ==============================================================================
-#
-# Sydney has a REAL tool-invocation mechanism ("Local MCP") that runs over the
-# very same Chathub SignalR connection this proxy already speaks: the client
-# advertises which local MCP servers it has (a fire-and-forget `send`
-# invocation carrying a `LocalMcpDiscovery` annotation -- the browser's
-# warmupLocalMCPPlugins()), and Sydney then invokes `mcp_discover` /
-# `mcp_describe` / `invoke_local_plugin` back ON the client, each as a SignalR
-# Invocation the client answers via the "client results" feature (a type:3
-# Completion keyed by the invocation's invocationId). This proxy can play the
-# same host role: run real local MCP servers (stdio subprocess + JSON-RPC 2.0,
-# pure stdlib) and expose them to Sydney.
-#
-# WHAT'S CONFIRMED ON THE WIRE (via experiments/probe_local_mcp.py, run live
-# against the real backend during development):
-#   * Local MCP is reachable for the tested tenant -- our LocalMcpDiscovery
-#     warmup made Sydney send `mcp_describe` back with our advertised
-#     server_ids.
-#   * The MCP invocation DOES carry an `invocationId` (SignalR "client
-#     results" is genuinely in play -- theory upgraded to confirmed).
-#   * The outgoing advertisement + the describe client-result shapes below are
-#     accepted (Sydney describes successfully; no error frame).
-#
-# WHAT'S STILL BLOCKED (also established live, exhaustively): in the default
-# `OfficeWebIncludedCopilot` scenario this proxy connects as, Sydney does the
-# describe HANDSHAKE but never SURFACES the described tool to the model, so it
-# never sends `invoke_local_plugin`. Every reachable lever was tried (extra
-# variants, feature.EnableMcpServerDynamicTools in the chat payload, a
-# plugins[] entry, feature.DisableDynamicToolValidation, transport shapes,
-# enumerate- and invoke-intent prompts) and the model always reports the tool
-# absent. The strongest inference is that dynamic-tool surfacing is gated to a
-# declarative-agent / GptId context the default web-chat scenario can't reach
-# (the invoke path binds tools to pluginInfo.GptId, and
-# feature.EnableMcpServerDynamicTools appears only as an agent-scoped setting
-# in the officeweb bundle). See REVERSE_ENGINEERING.md's "Local MCP
-# tool-calling bridge" section for the full evidence.
-#
-# CONSEQUENCE for this code: the bridge is CORRECT and its handshake is
-# live-exercisable (Sydney really does call our describe handler), but until
-# an MCP-enabled agent context is available it will not actually make Sydney
-# call a tool. It is therefore OPT-IN (`--enable-local-mcp`) and ADDITIVE:
-# when disabled -- the default -- every code path below is inert and the proxy
-# behaves exactly as it did before this existed, including the (working)
-# prompt-emulation tool-calling. Nothing is replaced or regressed.
-
-# The transport schema string the officeweb client stamps on every Local MCP
-# client-result envelope (extracted verbatim from its bundled source).
-LOCAL_MCP_SCHEMA_VERSION = (
-    "https://copilot.microsoft.com/schemas/plugins/local/transport/1.0"
-)
-# `invoke_local_plugin` carries `local_endpoint: "mcp://<server_id>"`; the
-# client strips this scheme to recover the server id (see invoke handling).
-LOCAL_MCP_ENDPOINT_SCHEME = "mcp://"
-# The SignalR invocation targets Sydney can call on the client for Local MCP.
-LOCAL_MCP_TARGETS = ("mcp_discover", "mcp_describe", "invoke_local_plugin", "local_mcp")
-# The message-annotation type the warmup advertisement carries.
-LOCAL_MCP_DISCOVERY_ANNOTATION = "LocalMcpDiscovery"
-
-
-class LocalMCPError(Exception):
-    """A local MCP server (subprocess) misbehaved -- failed to start, spoke
-    malformed JSON-RPC, or a tool call errored/timed out. Never fatal to the
-    proxy: it is turned into a `status: "Fail"` client-result so Sydney learns
-    the invocation failed rather than the whole Chathub turn dying."""
-
-
-class StdioMCPClient:
-    """A minimal, pure-stdlib Model Context Protocol client speaking JSON-RPC
-    2.0 over a child process's stdin/stdout, using MCP's stdio transport
-    framing (one JSON message per line, UTF-8, newline-delimited -- no
-    Content-Length headers). Implements just what the bridge needs:
-    `initialize` + `notifications/initialized`, `tools/list`, `tools/call`.
-
-    One child process per configured server, kept alive for the proxy's
-    lifetime. All request/response traffic on a single client is serialized by
-    `self._lock`, so concurrent Chathub turns invoking the same server can't
-    interleave their JSON-RPC ids on the shared pipe."""
-
-    def __init__(self, command, args=None, env=None, cwd=None, timeout=30.0):
-        self.command = command
-        self.args = list(args or [])
-        self.env = env
-        self.cwd = cwd
-        self.timeout = timeout
-        self._proc = None
-        self._lock = threading.Lock()
-        self._next_id = 0
-
-    def start(self):
-        """Spawn the child and perform the MCP initialize handshake. Raises
-        LocalMCPError on any failure (the caller decides whether that's fatal
-        -- at proxy startup it is; per-turn it is not)."""
-        full_env = None
-        if self.env:
-            full_env = dict(os.environ)
-            full_env.update(self.env)
-        try:
-            # nosec B603: command/args come from the operator's own local
-            # config file (see load_local_mcp_config), not from any network
-            # input; this is the documented way to run local MCP servers.
-            self._proc = subprocess.Popen(  # nosec B603
-                [self.command, *self.args],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                env=full_env,
-                cwd=self.cwd,
-                bufsize=0,
-            )
-        except (OSError, ValueError) as e:
-            raise LocalMCPError(
-                f"could not start local MCP server {self.command!r}: {e}"
-            ) from e
-
-        self._request(
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "m365-openai-proxy",
-                    "version": PROXY_VERSION,
-                },
-            },
-        )
-        self._notify("notifications/initialized", {})
-
-    def list_tools(self):
-        """Return the server's tools as a list of {name, description,
-        inputSchema} dicts (the MCP shape, which is also exactly what
-        mcp_describe wants back)."""
-        result = self._request("tools/list", {})
-        return result.get("tools", []) or []
-
-    def call_tool(self, name, arguments):
-        """Invoke one tool. Returns the raw MCP tool-result object
-        ({content:[...], isError?}). Raises LocalMCPError on transport
-        failure; a tool that ran but returned isError=True is a normal return
-        value here (the bridge forwards it to Sydney as-is)."""
-        return self._request("tools/call", {"name": name, "arguments": arguments or {}})
-
-    def stop(self):
-        proc = self._proc
-        self._proc = None
-        if proc is None:
-            return
-        try:
-            if proc.stdin:
-                proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                proc.kill()
-            except OSError:
-                pass
-
-    # -- internals -------------------------------------------------------
-
-    def _notify(self, method, params):
-        with self._lock:
-            self._write({"jsonrpc": "2.0", "method": method, "params": params})
-
-    def _request(self, method, params):
-        with self._lock:
-            self._next_id += 1
-            req_id = self._next_id
-            self._write(
-                {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "method": method,
-                    "params": params,
-                }
-            )
-            return self._read_response(req_id)
-
-    def _write(self, obj):
-        if self._proc is None or self._proc.stdin is None:
-            raise LocalMCPError("local MCP server is not running")
-        line = (json.dumps(obj) + "\n").encode("utf-8")
-        try:
-            self._proc.stdin.write(line)
-            self._proc.stdin.flush()
-        except (OSError, BrokenPipeError) as e:
-            raise LocalMCPError(f"local MCP server pipe write failed: {e}") from e
-
-    def _read_response(self, req_id):
-        """Read newline-delimited JSON-RPC messages until the response whose
-        id matches `req_id` arrives, skipping any notifications/other messages
-        the server emits in the meantime. Enforces `self.timeout` across the
-        whole wait."""
-        deadline = time.monotonic() + self.timeout
-        stdout = self._proc.stdout if self._proc else None
-        if stdout is None:
-            raise LocalMCPError("local MCP server has no stdout")
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise LocalMCPError(
-                    f"local MCP server timed out after {self.timeout:.0f}s"
-                )
-            ready, _, _ = select.select([stdout], [], [], remaining)
-            if not ready:
-                continue
-            raw = stdout.readline()
-            if not raw:
-                raise LocalMCPError("local MCP server closed its output stream")
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                # Some servers print non-JSON banners to stdout before
-                # settling; ignore anything that isn't a JSON-RPC message.
-                continue
-            if msg.get("id") != req_id:
-                continue  # a notification or an unrelated response
-            if "error" in msg:
-                err = msg["error"] or {}
-                raise LocalMCPError(
-                    f"local MCP server returned an error for {req_id}: "
-                    f"{err.get('message', err)}"
-                )
-            return msg.get("result", {}) or {}
-
-
-class LocalMCPHost:
-    """Owns the set of local MCP servers the operator configured and turns
-    Sydney's server->client Local MCP invocations into real MCP calls against
-    them. Instantiated once (at proxy startup) and shared across all Chathub
-    turns; `send_warmup()`/`handle_frame()` are called from within a turn.
-
-    A None `LocalMCPHost` (the default) means the feature is off -- every
-    Chathub code path checks for that and stays exactly as it was."""
-
-    def __init__(self, servers):
-        #: server_id -> {"client": StdioMCPClient, "tools": [descriptor,...]}
-        self._servers = servers
-        self._descriptors = {}
-
-    @property
-    def server_ids(self):
-        return list(self._servers.keys())
-
-    def start(self):
-        """Start every configured server and cache its tool descriptors. Any
-        server that fails to start is logged and skipped (the rest still
-        work); if NONE start, raises LocalMCPError so the operator finds out
-        at startup rather than silently having an inert feature."""
-        started = 0
-        for server_id, client in self._servers.items():
-            try:
-                client.start()
-                tools = client.list_tools()
-            except LocalMCPError:
-                logging.exception(
-                    "local MCP server %r failed to start/list tools -- skipping it",
-                    server_id,
-                )
-                continue
-            self._descriptors[server_id] = tools
-            started += 1
-            logging.info(
-                "local MCP server %r started with %d tool(s): %s",
-                server_id,
-                len(tools),
-                ", ".join(t.get("name", "?") for t in tools) or "(none)",
-            )
-        if started == 0:
-            raise LocalMCPError(
-                "no local MCP servers could be started (see log for details)"
-            )
-
-    def stop(self):
-        for client in self._servers.values():
-            client.stop()
-
-    # -- warmup advertisement -------------------------------------------
-
-    def send_warmup(self, ws):
-        """Advertise our configured servers to Sydney exactly as the browser's
-        warmupLocalMCPPlugins() does: a fire-and-forget SignalR `send`
-        invocation carrying a LocalMcpDiscovery annotation naming the
-        server_ids we host."""
-        server_ids = list(self._descriptors.keys())
-        if not server_ids:
-            return
-        frame = {
-            "type": 1,
-            "target": "send",
-            "arguments": [
-                {
-                    "type": LOCAL_MCP_DISCOVERY_ANNOTATION,
-                    "serverIds": server_ids,
-                    "disableDescriptorCache": True,
-                }
-            ],
-        }
-        ws.send_text(json.dumps(frame) + SIGNALR_RS)
-        logging.info("sent Local MCP warmup advertisement (server_ids=%s)", server_ids)
-
-    # -- frame handling --------------------------------------------------
-
-    def handle_frame(self, ws, frame):
-        """If `frame` is a Local MCP invocation from Sydney, service it and
-        send the SignalR type:3 completion back on `ws`, returning True.
-        Otherwise return False (the caller keeps its normal handling). Never
-        raises: any failure becomes a Fail client-result."""
-        if frame.get("type") != 1 or frame.get("target") not in LOCAL_MCP_TARGETS:
-            return False
-        target = frame["target"]
-        invocation_id = frame.get("invocationId")
-        args = frame.get("arguments") or [None]
-        arg = args[0] if args else None
-        correlation_id = (arg or {}).get("correlation_id", "")
-        logging.info(
-            "Local MCP invocation from Sydney: target=%s invocationId=%s",
-            target,
-            invocation_id,
-        )
-        try:
-            result = self._dispatch(target, arg, correlation_id)
-        except Exception:
-            logging.exception("Local MCP handler for %s failed", target)
-            result = self._fail(correlation_id, "Local MCP handler raised.")
-
-        if invocation_id is None:
-            # No invocationId => not a client-results invocation; there is no
-            # way to return a value. Confirmed on the wire that these DO carry
-            # an invocationId, so this is just defensive.
-            logging.warning(
-                "Local MCP invocation %s had no invocationId; cannot return a "
-                "result to Sydney",
-                target,
-            )
-            return True
-        ws.send_text(
-            json.dumps({"type": 3, "invocationId": invocation_id, "result": result})
-            + SIGNALR_RS
-        )
-        return True
-
-    def _dispatch(self, target, arg, correlation_id):
-        if target == "mcp_discover":
-            return self._ok(
-                correlation_id,
-                "Local MCP servers discovered successfully.",
-                {"server_ids": list(self._descriptors.keys())},
-            )
-        if target == "mcp_describe":
-            return self._handle_describe(arg, correlation_id)
-        # invoke_local_plugin / local_mcp
-        return self._handle_invoke(arg, correlation_id)
-
-    def _handle_describe(self, arg, correlation_id):
-        payload = _parse_invocation_payload(arg)
-        requested = payload.get("server_ids") or list(self._descriptors.keys())
-        capabilities = payload.get("capabilities") or ["tools"]
-        servers = []
-        for server_id in requested:
-            tools = self._descriptors.get(server_id)
-            if tools is None:
-                continue
-            servers.append(
-                {
-                    "server_id": server_id,
-                    "tools": tools if "tools" in capabilities else [],
-                    "prompts": [],
-                    "resources": [],
-                    "resourceTemplates": [],
-                    "transport": {"type": "stdio"},
-                }
-            )
-        return self._ok(
-            correlation_id,
-            "Local MCP servers described successfully",
-            {"servers": servers},
-        )
-
-    def _handle_invoke(self, arg, correlation_id):
-        invocation = (arg or {}).get("invocation") or {}
-        raw_payload = invocation.get("payload")
-        endpoint = invocation.get("local_endpoint") or ""
-        try:
-            call = json.loads(raw_payload) if raw_payload else {}
-        except (json.JSONDecodeError, TypeError):
-            return self._fail(correlation_id, "Invalid invocation payload.")
-        method = call.get("method") or ""
-        params = call.get("params") or {}
-        # method is "mcp_<toolName>": literal "mcp" prefix before the FIRST
-        # underscore, everything after is the tool name (which may itself
-        # contain underscores). This matches the officeweb client's parser.
-        sep = method.find("_")
-        prefix = method[:sep].lower() if sep != -1 else ""
-        tool_name = method[sep + 1 :] if sep != -1 else ""
-        server_id = endpoint
-        if server_id.startswith(LOCAL_MCP_ENDPOINT_SCHEME):
-            server_id = server_id[len(LOCAL_MCP_ENDPOINT_SCHEME) :]
-        if prefix != "mcp" or not tool_name or not server_id:
-            return self._fail(correlation_id, "Malformed Local MCP method/endpoint.")
-
-        entry = self._servers.get(server_id)
-        if entry is None or server_id not in self._descriptors:
-            return self._fail(correlation_id, f"Server {server_id} not found.")
-        if not any(t.get("name") == tool_name for t in self._descriptors[server_id]):
-            return self._fail(
-                correlation_id, f"Tool {tool_name} not found on {server_id}."
-            )
-
-        try:
-            tool_result = entry.call_tool(tool_name, params)
-        except LocalMCPError as e:
-            return self._fail(correlation_id, f"Tool invocation failed: {e}")
-
-        return self._ok(
-            correlation_id,
-            f"Method {tool_name} invoked successfully.",
-            {
-                "result": [
-                    {
-                        "id": correlation_id,
-                        "data": json.dumps(tool_result),
-                        "type": "text/plain",
-                        "description_for_model": (
-                            f"Tool invocation result for method {tool_name} "
-                            f"on server {server_id}"
-                        ),
-                    }
-                ],
-                "jsonrpc": "2.0",
-                "id": correlation_id,
-            },
-        )
-
-    # -- client-result envelope builders --------------------------------
-
-    def _ok(self, correlation_id, message, payload_obj):
-        return _local_mcp_envelope(correlation_id, "Success", message, payload_obj)
-
-    def _fail(self, correlation_id, message):
-        return _local_mcp_envelope(correlation_id, "Fail", message, {})
-
-
-def _parse_invocation_payload(arg):
-    """Extract and JSON-decode the `.invocation.payload` string from a Local
-    MCP invocation argument, returning {} on anything malformed."""
-    invocation = (arg or {}).get("invocation") or {}
-    raw = invocation.get("payload")
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _local_mcp_envelope(correlation_id, status, message, payload_obj):
-    """Build the Local MCP client-result envelope Sydney expects back (the
-    value returned becomes the SignalR type:3 completion's `result`). `payload`
-    is itself a JSON-encoded string, exactly as the officeweb client sends."""
-    return {
-        "schema_version": LOCAL_MCP_SCHEMA_VERSION,
-        "correlation_id": correlation_id,
-        "response": {
-            "status": status,
-            "message": message,
-            "payload": json.dumps(payload_obj),
-        },
-    }
-
-
-def load_local_mcp_config(path):
-    """Load the operator's local MCP server config (JSON) into a LocalMCPHost
-    (not yet started). Format:
-
-        {
-          "servers": [
-            {"server_id": "files",
-             "command": "npx",
-             "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"],
-             "env": {"FOO": "bar"},          // optional
-             "cwd": "/some/dir",             // optional
-             "timeout": 30}                  // optional, seconds
-          ]
-        }
-
-    Raises CredentialError-style ValueError on a malformed file so main() can
-    report it clearly and refuse to start."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError as e:
-        raise LocalMCPError(f"local MCP config file not found: {path}") from e
-    except (OSError, json.JSONDecodeError) as e:
-        raise LocalMCPError(f"could not read local MCP config {path}: {e}") from e
-
-    servers_cfg = (data or {}).get("servers")
-    if not isinstance(servers_cfg, list) or not servers_cfg:
-        raise LocalMCPError(
-            f"local MCP config {path} has no 'servers' list (see --init-local-mcp-config)"
-        )
-    servers = {}
-    for i, entry in enumerate(servers_cfg):
-        if not isinstance(entry, dict):
-            raise LocalMCPError(f"local MCP config server #{i} is not an object")
-        server_id = entry.get("server_id")
-        command = entry.get("command")
-        if not server_id or not command:
-            raise LocalMCPError(
-                f"local MCP config server #{i} needs both 'server_id' and 'command'"
-            )
-        if server_id in servers:
-            raise LocalMCPError(f"duplicate local MCP server_id {server_id!r}")
-        servers[server_id] = StdioMCPClient(
-            command=command,
-            args=entry.get("args"),
-            env=entry.get("env"),
-            cwd=entry.get("cwd"),
-            timeout=float(entry.get("timeout", 30.0)),
-        )
-    return LocalMCPHost(servers)
-
-
-def write_local_mcp_config_template(path):
-    """Write a commented starter local MCP config the operator can edit."""
-    template = {
-        "_comment": (
-            "Local MCP servers this proxy will host and advertise to Sydney. "
-            "Each runs as a subprocess speaking MCP over stdio. See "
-            "REVERSE_ENGINEERING.md's 'Local MCP tool-calling bridge' section "
-            "-- NOTE the feature is opt-in (--enable-local-mcp) and, on the "
-            "tested tenant, the handshake works but Sydney does not yet surface "
-            "the tools to the model in the default scenario."
-        ),
-        "servers": [
-            {
-                "server_id": "example-filesystem",
-                "command": "npx",
-                "args": [
-                    "-y",
-                    "@modelcontextprotocol/server-filesystem",
-                    "/path/to/allowed/dir",
-                ],
-                "env": {},
-            }
-        ],
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(template, f, indent=2)
-        f.write("\n")
-
-
-# ==============================================================================
 # Chathub: open the WebSocket, send one `chat` invocation, stream the reply
 # ==============================================================================
 
@@ -2525,17 +1950,11 @@ def send_chat_message(
     ws.send_text(json.dumps(payload) + SIGNALR_RS)
 
 
-def stream_chat_reply(ws, timeout_s=120, local_mcp=None):
+def stream_chat_reply(ws, timeout_s=120):
     """Yield text deltas as the bot's reply streams in. Reassembles deltas by
     diffing successive full-text snapshots (`messages[].text`) rather than
     trying to interpret the `writeAtCursor` partial-append fields directly --
-    simpler, and self-correcting if a snapshot ever doesn't extend cleanly.
-
-    `local_mcp`, if given (a LocalMCPHost), services any Local MCP invocation
-    Sydney sends mid-turn (mcp_discover/mcp_describe/invoke_local_plugin) by
-    answering it on this same `ws` with a SignalR client-result -- see the
-    Local MCP bridge section. When None (the default) those frames are ignored
-    exactly as before."""
+    simpler, and self-correcting if a snapshot ever doesn't extend cleanly."""
     deadline = time.time() + timeout_s
     last_text = ""
     buf = SignalRBuffer()
@@ -2551,11 +1970,6 @@ def stream_chat_reply(ws, timeout_s=120, local_mcp=None):
 
         for frame in buf.feed(raw):
             ftype = frame.get("type")
-
-            if local_mcp is not None and local_mcp.handle_frame(ws, frame):
-                # Serviced a Local MCP invocation (answered on this ws); this
-                # frame is not part of the text reply stream.
-                continue
 
             if ftype == 1 and frame.get("target") == "update":
                 for arg in frame.get("arguments") or []:
@@ -2622,25 +2036,17 @@ def stream_chat_reply(ws, timeout_s=120, local_mcp=None):
     raise ProtocolError("timed out waiting for a Chathub reply")
 
 
-def run_chat_turn(token_cache, text, conversation_id=None, local_mcp=None, **kwargs):
+def run_chat_turn(token_cache, text, conversation_id=None, **kwargs):
     """End-to-end: cached/refreshed Sydney auth -> one Chathub turn -> yields
     text deltas. Generator; the WebSocket is closed once exhausted.
     `conversation_id`, if given, is passed straight through to
     `open_chathub()` -- see its docstring for why reusing one across calls
-    matters.
-
-    `local_mcp`, if given (a LocalMCPHost), makes this turn a Local MCP host:
-    the warmup advertisement is sent right after the SignalR handshake (as the
-    browser does), and any Local MCP invocation Sydney sends back is serviced
-    on this connection. None (the default) leaves the turn exactly as it was
-    before this feature existed."""
+    matters."""
     auth = token_cache.get()
     ws, session_id = open_chathub(auth, conversation_id=conversation_id)
     try:
-        if local_mcp is not None:
-            local_mcp.send_warmup(ws)
         send_chat_message(ws, session_id, text, **kwargs)
-        yield from stream_chat_reply(ws, local_mcp=local_mcp)
+        yield from stream_chat_reply(ws)
     finally:
         ws.close()
         logging.info("Chathub WebSocket closed (session_id=%s)", session_id)
@@ -3337,12 +2743,7 @@ def _openai_tool_call_entries(tool_calls, with_index=False):
 
 
 def _run_tool_call_turn(
-    token_cache,
-    messages,
-    tools,
-    tool_choice,
-    max_attempts=_TOOL_CALL_MAX_ATTEMPTS,
-    local_mcp=None,
+    token_cache, messages, tools, tool_choice, max_attempts=_TOOL_CALL_MAX_ATTEMPTS
 ):
     """Runs one Chathub turn per attempt (up to `max_attempts`), each as a
     brand-new, independent Chathub turn (Sydney has no memory to preserve
@@ -3385,9 +2786,7 @@ def _run_tool_call_turn(
             mode,
             len(prompt),
         )
-        text = "".join(
-            run_chat_turn(token_cache, prompt, tool_mode=mode, local_mcp=local_mcp)
-        )
+        text = "".join(run_chat_turn(token_cache, prompt, tool_mode=mode))
         _, tool_calls = _extract_calls_for_mode(mode, text)
         if tool_calls:
             if attempt > 1:
@@ -3736,17 +3135,11 @@ def _plan_chat_turn(token_cache, messages, tools, tool_choice, conversation_sess
     )
 
 
-def make_handler(token_cache, conversation_sessions, local_mcp=None):
+def make_handler(token_cache, conversation_sessions):
     """Builds a request handler class bound to one TokenCache (in turn bound
     to one CredentialStore) -- the single configured Microsoft identity this
     proxy instance speaks as -- and one ConversationSessionStore (or None if
-    --disable-conversation-continuity was given).
-
-    `local_mcp`, if given (a started LocalMCPHost), makes every Chathub turn a
-    Local MCP host: the warmup advertisement is sent and Sydney's Local MCP
-    invocations are serviced on the turn's own connection. None (the default,
-    i.e. --enable-local-mcp not given) leaves every turn behaving exactly as
-    it did before this feature existed."""
+    --disable-conversation-continuity was given)."""
 
     class ProxyHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -3903,10 +3296,7 @@ def make_handler(token_cache, conversation_sessions, local_mcp=None):
             try:
                 text = "".join(
                     run_chat_turn(
-                        token_cache,
-                        plan.prompt,
-                        conversation_id=plan.conversation_id,
-                        local_mcp=local_mcp,
+                        token_cache, plan.prompt, conversation_id=plan.conversation_id
                     )
                 )
             except ThrottledError:
@@ -3942,10 +3332,7 @@ def make_handler(token_cache, conversation_sessions, local_mcp=None):
                 plan.turn_count = 1
                 text = "".join(
                     run_chat_turn(
-                        token_cache,
-                        plan.prompt,
-                        conversation_id=plan.conversation_id,
-                        local_mcp=local_mcp,
+                        token_cache, plan.prompt, conversation_id=plan.conversation_id
                     )
                 )
 
@@ -3965,10 +3352,7 @@ def make_handler(token_cache, conversation_sessions, local_mcp=None):
             parts = []
             try:
                 for delta in run_chat_turn(
-                    token_cache,
-                    plan.prompt,
-                    conversation_id=plan.conversation_id,
-                    local_mcp=local_mcp,
+                    token_cache, plan.prompt, conversation_id=plan.conversation_id
                 ):
                     parts.append(delta)
                     yield delta
@@ -4021,11 +3405,7 @@ def make_handler(token_cache, conversation_sessions, local_mcp=None):
                     # See _run_tool_call_turn for why this retries internally
                     # (and across more than one tool-calling convention).
                     text, tool_calls = _run_tool_call_turn(
-                        token_cache,
-                        plan.messages,
-                        plan.tools,
-                        plan.tool_choice,
-                        local_mcp=local_mcp,
+                        token_cache, plan.messages, plan.tools, plan.tool_choice
                     )
                     if tool_calls:
                         # Leftover text is deliberately dropped here, not
@@ -4114,11 +3494,7 @@ def make_handler(token_cache, conversation_sessions, local_mcp=None):
             try:
                 if tools_requested:
                     text, tool_calls = _run_tool_call_turn(
-                        token_cache,
-                        plan.messages,
-                        plan.tools,
-                        plan.tool_choice,
-                        local_mcp=local_mcp,
+                        token_cache, plan.messages, plan.tools, plan.tool_choice
                     )
                 else:
                     text, tool_calls = self._run_plain_turn(plan), []
@@ -4376,30 +3752,6 @@ def main():
         "enabled by default (see module docstring's 'Sydney-native conversation "
         "continuity' section); this is an escape hatch if it ever causes trouble",
     )
-    parser.add_argument(
-        "--enable-local-mcp",
-        action="store_true",
-        help="EXPERIMENTAL, off by default. Host the local MCP servers listed in "
-        "--local-mcp-config and advertise them to Sydney over the Chathub "
-        "connection (Sydney's own REAL tool-invocation mechanism). The wire "
-        "handshake is confirmed live, but on the tested tenant Sydney does not "
-        "yet surface the tools to the model in this proxy's default scenario -- "
-        "see REVERSE_ENGINEERING.md's 'Local MCP tool-calling bridge' section. "
-        "Additive: leaves the existing prompt-emulation tool-calling untouched",
-    )
-    parser.add_argument(
-        "--local-mcp-config",
-        default="m365_openai_proxy.local_mcp.json",
-        help="path to the JSON file listing local MCP servers to host when "
-        "--enable-local-mcp is given (default: ./m365_openai_proxy.local_mcp.json) "
-        "-- run --init-local-mcp-config to write a starter template",
-    )
-    parser.add_argument(
-        "--init-local-mcp-config",
-        action="store_true",
-        help="write a starter --local-mcp-config template and exit, without "
-        "starting the server",
-    )
     args = parser.parse_args()
 
     _configure_logging(args.log_file, getattr(logging, args.log_level))
@@ -4420,22 +3772,6 @@ def main():
             "two documented options and rerun without --init-credentials",
             args.credentials_prefix,
             ",".join(FIELD_NAMES),
-        )
-        return
-
-    if args.init_local_mcp_config:
-        try:
-            write_local_mcp_config_template(args.local_mcp_config)
-        except OSError as e:
-            logging.error("could not write local MCP config template: %s", e)
-            _print_fatal_console_message(
-                "could not write the local MCP config template file."
-            )
-            sys.exit(1)
-        logging.info(
-            "wrote starter local MCP config template (%s) -- edit it and rerun "
-            "with --enable-local-mcp",
-            args.local_mcp_config,
         )
         return
 
@@ -4473,36 +3809,16 @@ def main():
     conversation_sessions = (
         None if args.disable_conversation_continuity else ConversationSessionStore()
     )
-
-    local_mcp = None
-    if args.enable_local_mcp:
-        try:
-            local_mcp = load_local_mcp_config(args.local_mcp_config)
-            local_mcp.start()
-        except LocalMCPError as e:
-            logging.error("could not enable Local MCP: %s", e)
-            _print_fatal_console_message(
-                "could not start because the local MCP servers could not be started."
-            )
-            sys.exit(1)
-        logging.info(
-            "Local MCP bridge enabled, hosting server(s): %s -- NOTE: on the "
-            "tested tenant the handshake works but Sydney may not surface these "
-            "tools to the model (see REVERSE_ENGINEERING.md)",
-            ", ".join(local_mcp.server_ids),
-        )
-
-    handler_cls = make_handler(token_cache, conversation_sessions, local_mcp)
+    handler_cls = make_handler(token_cache, conversation_sessions)
     server = _LoggingHTTPServer((args.host, args.port), handler_cls)
     logging.info(
         "listening on http://%s:%d (Ctrl+C to stop) -- no auth required on the API "
-        "itself; Sydney-native conversation continuity is %s; Local MCP bridge is %s",
+        "itself; Sydney-native conversation continuity is %s",
         args.host,
         args.port,
         "disabled (--disable-conversation-continuity)"
         if conversation_sessions is None
         else "enabled",
-        "enabled (--enable-local-mcp)" if local_mcp is not None else "disabled",
     )
     try:
         server.serve_forever()
@@ -4521,8 +3837,6 @@ def main():
         sys.exit(1)
     finally:
         server.server_close()
-        if local_mcp is not None:
-            local_mcp.stop()
         logging.info("server closed")
 
 
