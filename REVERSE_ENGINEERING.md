@@ -36,13 +36,17 @@ sections below are where that lives.
   key, then AES-GCM with a fixed all-zero IV — **not** raw AES-GCM with the
   base key directly, which is why early brute-force attempts at this failed.
   See the "MSAL localStorage cache-encryption algorithm — SOLVED" section.
-- **Multi-turn conversation**: implemented via context-stuffing (the full
-  `messages` array is rendered into one text blob per Chathub turn) rather
-  than server-side `ConversationId` reuse — see the "goal re-scoped to
-  'drive a coding agent'" update near the end of this document. Whether
-  Sydney would honor a *resumed* `ConversationId` at all remains genuinely
-  unexplored (every capture so far is a brand-new single-turn conversation);
-  whether `msal.cache.encryption` is `HttpOnly` is also still unconfirmed.
+- **Multi-turn conversation**: now prefers Sydney's own server-side
+  conversation memory (a `ConversationId` reused across independent
+  Chathub WebSocket connections) over context-stuffing, confirmed to work
+  by a live experiment — see the "Sydney-native conversation continuity"
+  section near the end of this document. Context-stuffing (the full
+  `messages` array rendered into one text blob per Chathub turn — see the
+  "goal re-scoped to 'drive a coding agent'" update) is kept as the
+  automatic fallback for anything that doesn't cleanly match a tracked
+  session (the first turn, edited history, `tools` present, an
+  expired/evicted entry). Whether `msal.cache.encryption` is `HttpOnly` is
+  still unconfirmed.
 - **Tool-calling bridge (Local MCP)**: Sydney/Chathub has a real, concrete
   mechanism for invoking Model Context Protocol tools from the client side —
   `mcp_discover`/`mcp_describe`/`invoke_local_plugin` SignalR invocation
@@ -1974,5 +1978,112 @@ without the word "tool" present, exactly as seen in several `<action_request>`
 convention trials earlier in this document) -- it would need its own live
 A/B trial to confirm before being called a fix rather than a guess.
 
+## Update: Sydney-native conversation continuity — the "genuinely unexplored" `ConversationId`-reuse question, now answered live
+
+Every earlier section of this document that touched multi-turn conversation
+support (the "goal re-scoped to 'drive a coding agent'" update, and the
+"Still open" list near the top) explicitly flagged the same unresolved
+question: this proxy mints a brand-new Chathub `ConversationId` on every
+single call and relies entirely on the *client* resending its full growing
+transcript (context-stuffing) because **whether Sydney would honor a
+*resumed* `ConversationId` at all was untested** — every capture in this
+project up to this point was a single, brand-new, one-turn conversation.
+That question is the actual title of this section, and it's now answered:
+**yes, confirmed live.**
+
+### The experiment
+
+`experiments/probe_conversation_reuse.py` (checked into this repo, runnable
+against a real configured credential) does exactly the minimal thing needed
+to isolate this variable from every other one (no shared WebSocket
+connection, no client-side history resent, nothing this proxy's own
+context-stuffing could be accidentally relying on instead):
+
+1. **Turn 1** — open Chathub WebSocket #1 with a freshly-minted
+   `ConversationId`, `isStartOfSession: true`. Message: *"For this
+   conversation only, the secret code word is 'zylophant-47'. Please just
+   confirm you've noted it in one short sentence, don't ask anything
+   else."* Close the connection immediately after the reply.
+2. **Turn 2** — open a **BRAND NEW** WebSocket #2 (new `session_id`, new
+   `X-SessionId`, new `clientrequestid`, new `traceId`/`clientCorrelationId`
+   — nothing whatsoever carried over from turn 1 except the `ConversationId`
+   value itself), `isStartOfSession: false`. Message: *"Without me
+   repeating it: what was the secret code word I told you a moment ago in
+   this same conversation?"* — deliberately phrased so the ONLY way to
+   answer correctly is genuine memory of turn 1; no context is resent.
+3. **Control turn** — open yet another brand-new WebSocket #3 with a
+   **different, freshly-minted** `ConversationId`, `isStartOfSession: true`,
+   and send the IDENTICAL turn-2 question. If Sydney's replies were somehow
+   driven by something other than `ConversationId` (e.g. always answering
+   from some other session-wide state, or hallucinating a plausible-looking
+   answer regardless), the control turn should also "remember" — it must
+   NOT, for turn 2's success to mean anything.
+
+### The result (live run, 2026-07-19)
+
+```
+=== fixed ConversationId for this probe: fef00dea-c472-4052-9dd7-dde71084dd82 ===
+
+--- turn 1 (new WS #1, isStartOfSession=True): teach the secret word ---
+[session_id=399eb60e-4822-444b-bbba-558f23e7520a] bot reply:
+Noted: the code word for this conversation is **"zylophant-47."**
+
+--- turn 2 (BRAND NEW WS #2, same ConversationId, isStartOfSession=False) ---
+[session_id=c0d867f3-5f0d-4ab6-9882-bf87ecb3373c] bot reply:
+The secret code word you gave earlier in this conversation was **zylophant-47**.
+
+--- control turn (BRAND NEW WS #3, BRAND NEW ConversationId) ---
+[session_id=a85e04f5-03db-4eba-93bf-012a5cd45683] bot reply:
+I don't see any secret code word earlier in this conversation. The only message before this one is your question asking me to recall it, so no code word was provided here for me to repeat.
+
+=== verdict ===
+turn 2 (same ConversationId) mentions the secret word: True
+control turn (fresh ConversationId) mentions the secret word: False
+=> Sydney DOES honor a reused ConversationId across independent WebSocket connections as server-side conversation memory.
+```
+
+Unambiguous: turn 2 correctly recalled the secret word with zero context
+resent, purely from a reused `ConversationId` on a totally independent
+connection; the control turn, on a fresh `ConversationId`, correctly showed
+no knowledge at all with the identical question. This rules out every
+alternative explanation (shared connection state, coincidental/hallucinated
+correct guess, some other session-wide memory) — Sydney's server-side
+conversation memory is keyed on `ConversationId` itself, not on keeping one
+WebSocket connection alive.
+
+### What this changes, and what it deliberately doesn't
+
+Implemented in `m365_openai_proxy.py` as `ConversationSessionStore` (see its
+own docstring and the design-rationale section comment above
+`_conversation_fingerprint`) — full mechanism summarized in this file's
+"Current state summary" and the module docstring's "KNOWN LIMITATIONS"
+section, so it isn't duplicated a third time here. The short version: the
+OpenAI chat-completions API gives this proxy no conversation id of its own
+to key on, so recognizing "this request continues a conversation I already
+relayed to Sydney" is done by fingerprinting the client's own `messages[]`
+array — an exact-prefix match against what a previous call's `messages` plus
+this proxy's own reply would look like. On a match, only the newest message
+is sent, over the previously-used `ConversationId`, instead of context-
+stuffing the whole transcript again. Any mismatch (first turn, edited
+history, `tools` present, an evicted/expired entry) falls back to exactly
+the pre-existing context-stuffing behavior, so this can only ever make a
+turn smaller/faster, never wrong.
+
+Deliberately **not** extended to `tools` requests in this update: the
+tool-calling emulation is already probabilistic on its own (see "Tool-
+calling emulation" above), and layering a second, separately-unconfirmed
+axis of uncertainty (does Sydney's memory of an injected tool-schema
+instructions block survive as reliably as its memory of ordinary dialogue
+across a reused `ConversationId`?) on top of it was judged not worth doing
+without its own dedicated live A/B trial — flagged here as a genuine
+follow-up, not done as a guess.
+
+Also not done in this update: surfacing Sydney's own per-conversation
+`throttling` info (`maxNumUserMessagesInConversation`, seen in the Chathub
+protocol and noted as unsurfaced back in the "Still open" list near the top
+of this document) to proactively expire a tracked session before Sydney's
+own server-side limit would reject it. `ConversationSessionStore`'s local
+TTL/LRU bounds are a separate, purely local safety net for this proxy's own
+memory usage — not a substitute for that still-unsurfaced signal.
 
 

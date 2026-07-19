@@ -4,20 +4,25 @@ A single, self-contained, stdlib-only Python 3 script that exposes an
 OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`) backed by
 `https://m365.cloud.microsoft`'s Copilot chat backend.
 
-> **Before you integrate this with anything:** each `/v1/chat/completions`
-> call still opens a fresh, brand-new Sydney conversation under the hood —
-> Sydney's own server-side conversation memory is never used. Multi-turn
-> history works by "context-stuffing": the proxy renders the *entire*
-> `messages` array (system prompt + every prior turn) into one text blob
-> and sends that as a single Chathub turn, which is exactly what stateless
-> per-request clients already expect. Tool/function calling (`tools` /
-> `tool_calls`) is now implemented, but it is **emulated by prompting, on
-> a backend with no native concept of it, and it is probabilistic — not a
-> guarantee**. See "Known limitations" before depending on it for a real
-> agent loop. **If your client is OpenHands, prefer its own client-side
-> "mock function calling" mode over this proxy's `tools` emulation — it is
-> dramatically more reliable (3/3 vs. ~coin-flip in testing); see "Using
-> this with a coding agent" below.**
+> **Before you integrate this with anything:** as of this version, a
+> multi-turn conversation with no `tools` prefers Sydney's own native
+> server-side conversation memory — confirmed by a live experiment (see
+> REVERSE_ENGINEERING.md's "Sydney-native conversation continuity" section)
+> that reusing a Chathub `ConversationId` across independent connections
+> really does make Sydney recall earlier turns with nothing resent. Any
+> request this proxy can't confidently recognize as a continuation (the
+> first turn, edited history, `tools` present, an expired local cache
+> entry) automatically falls back to the original behavior: "context-
+> stuffing" the *entire* `messages` array (system prompt + every prior
+> turn) into one text blob sent as a single Chathub turn — still exactly
+> what stateless per-request clients already expect, and still what every
+> `tools` request uses. Tool/function calling (`tools` / `tool_calls`) is
+> **emulated by prompting, on a backend with no native concept of it, and
+> it is probabilistic — not a guarantee**. See "Known limitations" before
+> depending on either of these for a real agent loop. **If your client is
+> OpenHands, prefer its own client-side "mock function calling" mode over
+> this proxy's `tools` emulation — it is dramatically more reliable (3/3 vs.
+> ~coin-flip in testing); see "Using this with a coding agent" below.**
 
 **Fully self-contained.** The entire project is the one file,
 `m365_openai_proxy.py`. It uses only the Python 3 standard library — no
@@ -82,16 +87,26 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
 
 ## Known limitations
 
-- **Multi-turn memory is context-stuffing, not native Sydney state.** Every
-  call still mints a brand-new Sydney `ConversationId` — this proxy renders
-  the whole incoming `messages` array (system/developer instructions + all
-  prior turns) into one text blob and sends that as a single Chathub turn.
-  This works well for clients that resend their full conversation on every
-  request (Aider does this), but the effective prompt grows with the
-  conversation, so very long sessions may eventually hit whatever
-  context/size limit Sydney enforces (unconfirmed, not surfaced by this
-  proxy). A client expecting genuine server-side thread continuation
-  independent of what it resends will not get that.
+- **Multi-turn memory prefers Sydney's own native conversation state, with
+  context-stuffing as an automatic fallback.** Confirmed by a live
+  experiment (see REVERSE_ENGINEERING.md's "Sydney-native conversation
+  continuity" section) that Sydney honors a Chathub `ConversationId` reused
+  across independent connections as real server-side memory. When a
+  request with no `tools` exactly extends a conversation this proxy already
+  relayed (the common case for any client that resends its full growing
+  history, e.g. Aider, OpenHands' mock function calling), only the newest
+  message is sent over that same `ConversationId` instead of re-sending the
+  whole transcript. Anything that doesn't match — the first turn, edited
+  history, a request with `tools`, or a tracked session that's expired
+  (2-hour idle TTL, 500-entry cap) — falls back to the original behavior:
+  render the whole incoming `messages` array into one text blob and send it
+  as a single Chathub turn on a brand-new `ConversationId`. That fallback
+  path is still exactly what it always was, so the same caveat still
+  applies to it: the effective prompt grows with the conversation, and very
+  long fallback sessions may eventually hit whatever context/size limit
+  Sydney enforces (unconfirmed, not surfaced by this proxy). Disable
+  continuity entirely with `--disable-conversation-continuity` if you want
+  the old always-context-stuff behavior.
 - **Tool/function calling is emulated by prompting, and is probabilistic.**
   Sydney has no native `tools`/`tool_calls` mechanism at all. When a request
   includes `tools`, this proxy injects plain-text instructions teaching the
@@ -144,9 +159,11 @@ will actually work:
 - **[Aider](https://aider.chat/)** — works well, with no dependency on tool-
   calling emulation at all. Aider never asks the model to emit `tool_calls`;
   it asks for a diff/whole-file rewrite in plain text and applies it itself,
-  and it resends the full running conversation on every request (rendered
-  via this proxy's context-stuffing). Point it at this proxy with an
-  OpenAI-compatible model config, e.g.:
+  and it resends the full running conversation on every request -- this
+  proxy now recognizes that as a Sydney-native continuation from the second
+  turn onward (see "Known limitations" above), falling back to rendering it
+  via context-stuffing only for the first turn or if continuity ever misses.
+  Point it at this proxy with an OpenAI-compatible model config, e.g.:
 
   ```bash
   aider --openai-api-base http://127.0.0.1:8000/v1 --openai-api-key sk-unused \

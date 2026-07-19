@@ -224,25 +224,50 @@ untouched so you can see what was originally supplied.
 ------------------------------------------------------------------------------
 KNOWN LIMITATIONS
 ------------------------------------------------------------------------------
-- **Multi-turn memory is "context-stuffing", not native Sydney state.**
-  `_render_conversation_prompt()` renders the *entire* incoming `messages`
-  array (system/developer instructions + every prior user/assistant turn)
-  into one plain-text blob, and that whole blob becomes the single Chathub
-  turn's `message.text` -- `run_chat_turn()` still mints a brand-new random
-  Chathub `ConversationId` on every single API call, same as always. In
-  other words: this proxy does NOT use Sydney's own server-side memory (it
-  is unconfirmed whether reusing a stable `ConversationId` across calls
-  would even work -- see REVERSE_ENGINEERING.md); instead it relies on the
-  *client* resending its full growing conversation every request, which is
-  exactly what stateless per-request clients like Aider already do. Two
-  practical consequences: (1) the effective prompt sent to Sydney grows with
-  the conversation, so very long-running sessions may eventually hit
-  whatever context/size limit Sydney enforces (unconfirmed, not yet
-  surfaced by this proxy); (2) a client that expects Sydney's *own*
-  memory/threading semantics (e.g. server-side conversation continuation
-  independent of what the client resends) will not get that -- it gets
-  exactly the transcript it sent, replayed back through one fresh Sydney
-  turn, every time.
+- **Multi-turn memory now prefers Sydney's own native conversation state,
+  with context-stuffing kept as an automatic fallback for whatever doesn't
+  fit that.** A live experiment (`experiments/probe_conversation_reuse.py`,
+  see REVERSE_ENGINEERING.md's "Sydney-native conversation continuity"
+  section) confirmed that Sydney DOES honor a `ConversationId` reused
+  across a brand-new, independent Chathub WebSocket connection as real
+  server-side conversation memory -- a turn taught a secret word, then
+  closed, was correctly recalled by a second, unrelated connection reusing
+  the same `ConversationId` with no history resent, while a control turn
+  using a fresh `ConversationId` correctly showed no memory at all. Based
+  on that, `ConversationSessionStore` (see its docstring, just above
+  `make_handler`) tracks, per proxy process, a best-effort mapping from "the
+  exact `messages` array a client has seen so far" to the Sydney
+  `ConversationId` that already holds that history server-side. When an
+  incoming request's `messages` array exactly extends a previously-seen one
+  (the common case for essentially every OpenAI-style client, since they
+  all resend their full growing history) AND the request has no `tools`,
+  this proxy sends ONLY the newest message as the next Chathub turn on that
+  reused `ConversationId`, instead of re-rendering and re-sending the
+  entire conversation every time.
+
+  This is fully additive and safe-by-construction: it is never used to
+  produce output that couldn't have been produced before it existed.
+  Anything that doesn't cleanly match a tracked session -- the first turn
+  of a conversation, edited/branched/reordered history, a request that
+  includes `tools` (deliberately excluded -- see the section comment above
+  `_conversation_fingerprint`), a different credential, or a session this
+  process has never seen (including after a restart -- the store is
+  in-memory only, never persisted) -- simply falls back to this proxy's
+  original, always-correct behavior: render the *entire* incoming
+  `messages` array into one text blob and send it as a single turn on a
+  brand-new `ConversationId`, exactly as if this feature didn't exist. A
+  turn that tries to continue a tracked session and fails is caught, the
+  session is forgotten, and (for non-streaming requests only -- see
+  `_run_plain_turn`'s docstring for why streaming can't safely do the same)
+  the SAME request transparently retries once as a brand-new conversation
+  rather than surfacing an error. Disable this entirely with
+  `--disable-conversation-continuity` if you want the old
+  always-context-stuff behavior. Two things this does NOT change: (1)
+  Sydney's own server-side conversation size/quota limits still apply and
+  still aren't surfaced by this proxy; (2) a tracked session is local to
+  this one proxy PROCESS (in memory, not persisted) -- restarting the proxy
+  always starts cold, with every conversation falling back to fresh
+  context-stuffing until it's seen once more.
 - `usage` (prompt/completion/total tokens) in every response is hardcoded
   to zero -- this proxy does no token counting at all.
 - One Chathub WebSocket is opened, used for exactly one turn, and closed
@@ -425,7 +450,7 @@ import uuid
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.6"
+PROXY_VERSION = "0.7"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -1674,10 +1699,22 @@ class TokenCache:
 # ==============================================================================
 
 
-def open_chathub(auth):
+def open_chathub(auth, conversation_id=None):
+    """Opens one Chathub WebSocket. `conversation_id`, if given, is used
+    verbatim as the Chathub `ConversationId` -- passing the SAME value
+    across separate calls (separate WebSocket connections, separate HTTP
+    requests) is how a Sydney-native conversation continuation reuses
+    Sydney's own server-side conversation memory instead of starting a
+    fresh conversation each time (confirmed live: see
+    REVERSE_ENGINEERING.md's "Sydney-native conversation continuity"
+    section -- a second, independent WebSocket connection reusing a prior
+    call's `ConversationId` got a reply demonstrating knowledge of that
+    prior call's turn, with no history resent). If omitted, a fresh random
+    one is minted, exactly as this function always did before that
+    capability existed."""
     session_id = str(uuid.uuid4())
     session_id_nodash = session_id.replace("-", "")
-    conversation_id = str(uuid.uuid4())
+    conversation_id = conversation_id or str(uuid.uuid4())
 
     query = urllib.parse.urlencode(
         {
@@ -1879,11 +1916,14 @@ def stream_chat_reply(ws, timeout_s=120):
     raise ProtocolError("timed out waiting for a Chathub reply")
 
 
-def run_chat_turn(token_cache, text, **kwargs):
+def run_chat_turn(token_cache, text, conversation_id=None, **kwargs):
     """End-to-end: cached/refreshed Sydney auth -> one Chathub turn -> yields
-    text deltas. Generator; the WebSocket is closed once exhausted."""
+    text deltas. Generator; the WebSocket is closed once exhausted.
+    `conversation_id`, if given, is passed straight through to
+    `open_chathub()` -- see its docstring for why reusing one across calls
+    matters."""
     auth = token_cache.get()
-    ws, session_id = open_chathub(auth)
+    ws, session_id = open_chathub(auth, conversation_id=conversation_id)
     try:
         send_chat_message(ws, session_id, text, **kwargs)
         yield from stream_chat_reply(ws)
@@ -1914,6 +1954,208 @@ def _message_text(m):
         ]
         return "\n".join(p for p in parts if p)
     return ""
+
+
+# ------------------------------------------------------------------------------
+# Sydney-native conversation continuity
+#
+# Live-confirmed (see REVERSE_ENGINEERING.md's "Sydney-native conversation
+# continuity" section for the exact probe and transcript): opening a BRAND
+# NEW Chathub WebSocket -- fresh session id, fresh trace/request ids, no
+# history resent -- but reusing a PRIOR call's `ConversationId` gets a reply
+# that demonstrates knowledge of that prior call's turn. Sydney's server-side
+# conversation memory is keyed on `ConversationId` itself, not on keeping one
+# WebSocket connection alive, so it's usable across separate, independent
+# `/v1/chat/completions` HTTP requests exactly like this proxy already
+# handles everything else.
+#
+# The OpenAI chat-completions API is stateless, though: the client resends
+# its whole growing `messages[]` array every call and this proxy is given no
+# conversation id of its own to key on. So recognizing "this request is a
+# continuation of a conversation I already relayed to Sydney" has to be done
+# by fingerprinting `messages[]` itself -- see _conversation_fingerprint and
+# ConversationSessionStore below. A request is treated as a continuation
+# exactly when its `messages[:-1]` matches (in the fields that matter) some
+# earlier request's `messages[]` PLUS the assistant reply this proxy
+# returned for it -- i.e. the client did exactly what an OpenAI-style client
+# does: took the previous response, appended it to the transcript, appended
+# one new turn, and resent the whole thing. When that's true, only the
+# newest message needs to be sent to Sydney (see _render_continuation_delta)
+# -- Sydney already remembers everything before it.
+#
+# Any time this can't be established with confidence -- the very first turn
+# of a conversation, a branched/edited history, `tools` present (see below),
+# a different credential, or this process having restarted (the store is
+# in-memory only) -- this proxy falls back to the pre-existing
+# context-stuffing behavior with a brand-new `ConversationId`, exactly as if
+# this feature didn't exist. A false negative here just costs one extra
+# context-stuffed turn; it is never a correctness problem. Turned off
+# entirely with --disable-conversation-continuity.
+#
+# Deliberately restricted to requests with no `tools`: the tool-calling
+# emulation below already works by re-injecting its whole instructions block
+# from scratch on every turn as independent, stateless Chathub calls (see
+# _run_tool_call_turn's docstring -- "Sydney has no memory to preserve
+# across a retry anyway"), and is already probabilistic on its own. Reusing
+# a live Sydney conversation underneath that mechanism too would add a
+# second axis of uncertainty (does Sydney's memory of the injected tool
+# schema survive exactly as well as its memory of ordinary dialogue? -- not
+# yet tested) to a feature that's already only roughly a coin flip; keeping
+# the two mutually exclusive for now means neither can destabilize the
+# other. Revisit if `tools` + continuity turns out to be worth the extra
+# validation work.
+# ------------------------------------------------------------------------------
+
+
+def _conversation_fingerprint(messages):
+    """Stable identity for "this exact `messages[]` array", used as the
+    ConversationSessionStore's lookup key. Hashes each message's role, name,
+    rendered text, `tool_calls`, and `tool_call_id` in order -- anything
+    else in a message dict (extra client-specific fields) is ignored, but
+    any difference in these fields, their order, or the message count
+    changes the fingerprint.
+
+    Deliberately strict, on purpose: a false negative (two fingerprints
+    differ when the conversation is "really" the same) just costs one extra
+    context-stuffed turn -- always safe. A false positive (two different
+    conversations hashing the same) would risk answering from the wrong
+    conversation's Sydney-side memory -- never safe. SHA-256 over an
+    unambiguous per-message encoding (NUL between fields, unit-separator
+    between messages) makes an accidental collision between two
+    genuinely-different conversations not a practical concern."""
+    hasher = hashlib.sha256()
+    for m in messages:
+        hasher.update(str(m.get("role", "")).encode("utf-8", "replace"))
+        hasher.update(b"\0")
+        hasher.update(str(m.get("name", "")).encode("utf-8", "replace"))
+        hasher.update(b"\0")
+        hasher.update(_message_text(m).encode("utf-8", "replace"))
+        hasher.update(b"\0")
+        tool_calls = m.get("tool_calls")
+        if tool_calls:
+            hasher.update(json.dumps(tool_calls, sort_keys=True).encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(str(m.get("tool_call_id", "")).encode("utf-8", "replace"))
+        hasher.update(b"\x1f")  # unit separator between messages
+    return hasher.hexdigest()
+
+
+def _render_continuation_delta(message):
+    """Renders just the NEWEST message's text for a Sydney-native
+    continuation turn (see ConversationSessionStore) -- Sydney already has
+    everything before it in its own server-side memory, so unlike
+    `_render_conversation_prompt` this sends only the delta, not the whole
+    transcript. Returns None if there's no usable text (the caller then
+    falls back to a fresh, context-stuffed turn, same as
+    `_render_conversation_prompt` returning None would)."""
+    text = _message_text(message)
+    if message.get("role") == "tool":
+        # Continuation is only ever attempted for requests with no `tools`
+        # (see the section comment above), so this shouldn't normally be
+        # reached -- kept as a graceful degrade, not an assumption, in case
+        # a conversation used tools on an earlier turn before the client
+        # stopped passing `tools` on later ones.
+        text = f"(Result of an earlier request: {text or '(empty result)'})"
+    return text or None
+
+
+class ConversationSession:
+    """One entry in ConversationSessionStore: the stable Sydney
+    `ConversationId` a completed turn used, plus enough bookkeeping to
+    decide whether it's still safe to reuse."""
+
+    __slots__ = ("conversation_id", "oid", "created_at", "last_used_at", "turn_count")
+
+    def __init__(self, conversation_id, oid):
+        self.conversation_id = conversation_id
+        self.oid = oid
+        self.created_at = time.time()
+        self.last_used_at = self.created_at
+        self.turn_count = 1
+
+
+class ConversationSessionStore:
+    """Recognizes when a `/v1/chat/completions` request is an exact
+    continuation of a conversation this proxy already relayed to Sydney, so
+    that turn can reuse Sydney's own server-side conversation memory (a
+    stable Chathub `ConversationId`) instead of context-stuffing the whole
+    growing transcript into one big turn every single call -- see the
+    section comment above for the full design rationale.
+
+    Keyed by `_conversation_fingerprint()`, not by any client-supplied id --
+    the OpenAI API is stateless and gives this proxy nothing else to key on.
+    `oid` is checked on lookup too, as cheap defense-in-depth against
+    reusing a session across a credential change this process didn't expect
+    (in practice one running proxy process speaks as one fixed identity, so
+    this should never actually differ).
+
+    Bounded in size (MAX_SESSIONS, LRU eviction) and in time (IDLE_TTL_S) so
+    a long-running proxy process can't accumulate entries without limit --
+    this cache is correctness-neutral (an evicted entry just costs one
+    extra context-stuffed turn, never a wrong answer), so simple bounds are
+    enough; nothing here needs to be persisted across a proxy restart or be
+    perfectly precise. Thread-safe: `make_handler` wires one shared instance
+    into a `ThreadingHTTPServer`.
+
+    Not guarded against two genuinely concurrent requests that happen to
+    share an identical `messages[:-1]` (e.g. a client retrying the same call
+    twice in parallel) -- both could look up and reuse the same
+    `ConversationId` at once. Accepted for this proxy's intended
+    single-local-client, one-request-at-a-time usage model; not a concern
+    for the normal case."""
+
+    MAX_SESSIONS = 500
+    IDLE_TTL_S = 2 * 60 * 60  # 2 hours
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sessions = {}  # fingerprint -> ConversationSession
+
+    def lookup(self, fingerprint, oid):
+        with self._lock:
+            self._evict_expired_locked()
+            session = self._sessions.get(fingerprint)
+            if session is None or session.oid != oid:
+                return None
+            session.last_used_at = time.time()
+            session.turn_count += 1
+            return session
+
+    def remember(self, fingerprint, conversation_id, oid):
+        with self._lock:
+            self._evict_expired_locked()
+            if (
+                fingerprint not in self._sessions
+                and len(self._sessions) >= self.MAX_SESSIONS
+            ):
+                self._evict_lru_locked()
+            self._sessions[fingerprint] = ConversationSession(conversation_id, oid)
+
+    def forget(self, fingerprint):
+        """Evicts one cached session -- called when a Chathub turn that
+        tried to reuse it failed, so the client's very next attempt
+        (which necessarily resends the identical `messages[:-1]`, since
+        that's the OpenAI-client contract this whole mechanism relies on)
+        gets a clean cache miss and falls back to a brand-new conversation,
+        rather than repeatedly retrying the same possibly-broken
+        `ConversationId` forever. A no-op if `fingerprint` is None or
+        already gone."""
+        if fingerprint is None:
+            return
+        with self._lock:
+            self._sessions.pop(fingerprint, None)
+
+    def _evict_expired_locked(self):
+        cutoff = time.time() - self.IDLE_TTL_S
+        expired = [k for k, s in self._sessions.items() if s.last_used_at < cutoff]
+        for k in expired:
+            del self._sessions[k]
+
+    def _evict_lru_locked(self):
+        if not self._sessions:
+            return
+        oldest_key = min(self._sessions, key=lambda k: self._sessions[k].last_used_at)
+        del self._sessions[oldest_key]
 
 
 # ------------------------------------------------------------------------------
@@ -2144,23 +2386,25 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
     one Chathub turn's `message.text`.
 
     Sydney/Chathub has no native `messages` concept: one Chathub turn is a
-    single freeform text string, and every call to run_chat_turn() mints a
-    brand-new Chathub ConversationId (whether Sydney would honor a *stable*
-    ConversationId as server-side memory across turns is unconfirmed and
-    untested -- see REVERSE_ENGINEERING.md -- so this proxy does not rely on
-    that and instead treats every Chathub turn as independent).
+    single freeform text string. This function renders a FRESH conversation
+    turn -- the whole running transcript, context-stuffed into one blob --
+    for whichever call ends up minting a brand-new Chathub `ConversationId`:
+    either the genuine first turn of a conversation, or any turn
+    ConversationSessionStore didn't recognize as a continuation (see that
+    class and the "Sydney-native conversation continuity" section comment
+    above `_conversation_fingerprint` for when Sydney's own server-side
+    memory is used instead -- confirmed live to work, see
+    REVERSE_ENGINEERING.md -- via `_render_continuation_delta`, which sends
+    only the newest message rather than this function's full-transcript
+    rendering).
 
-    Multi-turn conversations are instead supported the same way many
-    bridges handle backends with no native `system` role or message
-    history: "context-stuffing" -- the full running conversation (system
-    instructions + prior turns) is rendered as plain text and Sydney is
-    asked to continue it, with the whole thing discarded once the turn
-    completes. This is what makes stateless-per-request clients that
-    resend their full growing conversation on every call (e.g. a tool-
-    calling coding agent's follow-up request after a tool result) work
-    through this proxy: from Sydney's point of view each call is still a
-    single fresh one-shot turn, but that turn now contains everything the
-    client considers "the conversation so far."
+    Context-stuffing here is still what many bridges use for backends with
+    no native `system` role or message history, and is still exactly what
+    makes a stateless-per-request client's full growing conversation (e.g.
+    a tool-calling coding agent's follow-up request after a tool result)
+    work through this proxy on a cache miss: from Sydney's point of view
+    that call is still a single fresh one-shot turn, but the turn now
+    contains everything the client considers "the conversation so far."
 
     An assistant message carrying `tool_calls` (content may be null) is NOT
     rendered as its own conversation turn -- only real assistant dialogue
@@ -2317,10 +2561,120 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
     return "\n".join(lines)
 
 
-def make_handler(token_cache):
+class _ChatTurnPlan:
+    """Everything needed to run one Chathub turn for a `/v1/chat/completions`
+    request and then update the ConversationSessionStore afterwards --
+    built once by `_plan_chat_turn()` and used by both `_handle_full` and
+    `_handle_streaming`."""
+
+    __slots__ = (
+        "prompt",
+        "conversation_id",
+        "is_continuation",
+        "lookup_fingerprint",
+        "should_track",
+        "messages",
+        "tools",
+        "tool_choice",
+        "oid",
+    )
+
+    def __init__(
+        self,
+        prompt,
+        conversation_id,
+        is_continuation,
+        lookup_fingerprint,
+        should_track,
+        messages,
+        tools,
+        tool_choice,
+        oid,
+    ):
+        self.prompt = prompt
+        self.conversation_id = conversation_id
+        self.is_continuation = is_continuation
+        self.lookup_fingerprint = lookup_fingerprint
+        self.should_track = should_track
+        self.messages = messages
+        self.tools = tools
+        self.tool_choice = tool_choice
+        self.oid = oid
+
+
+def _fresh_conversation_turn(messages, tools, tool_choice):
+    """Builds the prompt + brand-new Sydney `ConversationId` for an ordinary,
+    non-continuation turn -- the pre-existing behavior (context-stuff the
+    whole `messages[]` array into one turn under a fresh conversation).
+    Returns `(prompt, conversation_id)`, or `(None, None)` if there's no
+    usable text in `messages` at all."""
+    prompt = _render_conversation_prompt(messages, tools=tools, tool_choice=tool_choice)
+    if prompt is None:
+        return None, None
+    return prompt, str(uuid.uuid4())
+
+
+def _plan_chat_turn(token_cache, messages, tools, tool_choice, conversation_sessions):
+    """Builds a `_ChatTurnPlan` for one `/v1/chat/completions` request:
+    recognizes a Sydney-native continuation when possible (see
+    ConversationSessionStore), else falls back to the pre-existing
+    context-stuffed, brand-new-conversation behavior. Returns None if
+    there's no usable text in `messages` at all.
+
+    `conversation_sessions` is None when continuity is disabled
+    (--disable-conversation-continuity) -- every request then takes the
+    fresh-conversation path, identical to this proxy's behavior before this
+    feature existed."""
+    should_track = conversation_sessions is not None and not tools
+    oid = token_cache.get().oid if should_track else None
+
+    if should_track and len(messages) >= 2:
+        lookup_fingerprint = _conversation_fingerprint(messages[:-1])
+        session = conversation_sessions.lookup(lookup_fingerprint, oid)
+        if session is not None:
+            delta = _render_continuation_delta(messages[-1])
+            if delta is not None:
+                logging.info(
+                    "recognized as a Sydney-native continuation "
+                    "(conversation_id=%s, turn=%d) -- sending only the newest "
+                    "message (delta_length=%d chars) instead of context-stuffing",
+                    session.conversation_id,
+                    session.turn_count,
+                    len(delta),
+                )
+                return _ChatTurnPlan(
+                    prompt=delta,
+                    conversation_id=session.conversation_id,
+                    is_continuation=True,
+                    lookup_fingerprint=lookup_fingerprint,
+                    should_track=True,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    oid=oid,
+                )
+
+    prompt, conversation_id = _fresh_conversation_turn(messages, tools, tool_choice)
+    if prompt is None:
+        return None
+    return _ChatTurnPlan(
+        prompt=prompt,
+        conversation_id=conversation_id,
+        is_continuation=False,
+        lookup_fingerprint=None,
+        should_track=should_track,
+        messages=messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        oid=oid,
+    )
+
+
+def make_handler(token_cache, conversation_sessions):
     """Builds a request handler class bound to one TokenCache (in turn bound
     to one CredentialStore) -- the single configured Microsoft identity this
-    proxy instance speaks as."""
+    proxy instance speaks as -- and one ConversationSessionStore (or None if
+    --disable-conversation-continuity was given)."""
 
     class ProxyHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -2424,10 +2778,10 @@ def make_handler(token_cache):
             messages = body.get("messages") or []
             tools = body.get("tools") or None
             tool_choice = body.get("tool_choice")
-            prompt = _render_conversation_prompt(
-                messages, tools=tools, tool_choice=tool_choice
+            plan = _plan_chat_turn(
+                token_cache, messages, tools, tool_choice, conversation_sessions
             )
-            if prompt is None:
+            if plan is None:
                 self._error(400, "no usable message content found in 'messages'")
                 return
 
@@ -2435,21 +2789,110 @@ def make_handler(token_cache):
             stream = bool(body.get("stream", False))
             logging.info(
                 "chat completion request from %s: %d message(s), rendered_prompt_length=%d chars, "
-                "stream=%s, model=%r, tools=%d",
+                "stream=%s, model=%r, tools=%d, continuation=%s",
                 self.address_string(),
                 len(messages),
-                len(prompt),
+                len(plan.prompt),
                 stream,
                 model,
                 len(tools or []),
+                plan.is_continuation,
             )
 
             if stream:
-                self._handle_streaming(prompt, model, tools_requested=bool(tools))
+                self._handle_streaming(plan, model)
             else:
-                self._handle_full(prompt, model, tools_requested=bool(tools))
+                self._handle_full(plan, model)
 
-        def _handle_streaming(self, prompt, model, tools_requested=False):
+        def _run_plain_turn(self, plan):
+            """Runs one plain-text (no `tools`) Chathub turn per `plan`,
+            with ConversationSessionStore bookkeeping: on success, remembers
+            the resulting conversation state under a fingerprint of
+            `messages + [this reply]` so the client's next call can be
+            recognized as a continuation. If `plan` WAS a continuation and
+            the Chathub turn failed, forgets the now-suspect cached session
+            and retries once as a brand-new, fully context-stuffed
+            conversation before giving up -- safe here (unlike the
+            streaming path below) because nothing has been written to the
+            HTTP response yet at this point."""
+            try:
+                text = "".join(
+                    run_chat_turn(
+                        token_cache, plan.prompt, conversation_id=plan.conversation_id
+                    )
+                )
+            except Exception:
+                if not plan.is_continuation:
+                    raise
+                logging.warning(
+                    "Sydney-native continuation turn failed (conversation_id=%s) "
+                    "-- forgetting the cached session and retrying once as a "
+                    "brand-new conversation",
+                    plan.conversation_id,
+                    exc_info=True,
+                )
+                conversation_sessions.forget(plan.lookup_fingerprint)
+                fresh_prompt, fresh_conversation_id = _fresh_conversation_turn(
+                    plan.messages, plan.tools, plan.tool_choice
+                )
+                if fresh_prompt is None:
+                    raise
+                plan.prompt = fresh_prompt
+                plan.conversation_id = fresh_conversation_id
+                plan.is_continuation = False
+                text = "".join(
+                    run_chat_turn(
+                        token_cache, plan.prompt, conversation_id=plan.conversation_id
+                    )
+                )
+
+            if plan.should_track:
+                new_fingerprint = _conversation_fingerprint(
+                    plan.messages + [{"role": "assistant", "content": text}]
+                )
+                conversation_sessions.remember(
+                    new_fingerprint, plan.conversation_id, plan.oid
+                )
+            return text
+
+        def _stream_plain_turn(self, plan):
+            """Generator equivalent of `_run_plain_turn` for the streaming
+            path: yields text deltas, doing the same success-path
+            bookkeeping, but -- unlike `_run_plain_turn` -- does NOT retry a
+            failed continuation turn in place. Once a delta has been
+            flushed to the client there is no safe way to restart a fresh
+            conversation without duplicating output, so a broken
+            continuation is only forgotten here (so the client's own next
+            request, resending the same transcript, gets a clean cache miss
+            and a fresh conversation) rather than retried."""
+            parts = []
+            try:
+                for delta in run_chat_turn(
+                    token_cache, plan.prompt, conversation_id=plan.conversation_id
+                ):
+                    parts.append(delta)
+                    yield delta
+            except Exception:
+                if plan.is_continuation:
+                    logging.warning(
+                        "Sydney-native continuation turn failed mid-stream "
+                        "(conversation_id=%s) -- forgetting the cached session "
+                        "so the next request starts fresh",
+                        plan.conversation_id,
+                    )
+                    conversation_sessions.forget(plan.lookup_fingerprint)
+                raise
+
+            if plan.should_track:
+                text = "".join(parts)
+                new_fingerprint = _conversation_fingerprint(
+                    plan.messages + [{"role": "assistant", "content": text}]
+                )
+                conversation_sessions.remember(
+                    new_fingerprint, plan.conversation_id, plan.oid
+                )
+
+        def _handle_streaming(self, plan, model):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -2459,6 +2902,7 @@ def make_handler(token_cache):
 
             completion_id = f"chatcmpl-{uuid.uuid4().hex}"
             created = int(time.time())
+            tools_requested = bool(plan.tools)
 
             def emit(delta_obj, finish_reason=None):
                 chunk = {
@@ -2482,7 +2926,7 @@ def make_handler(token_cache):
                     # whole reply is collected first, then emitted as one
                     # chunk. Documented as a known limitation. See
                     # _run_tool_call_turn for why this retries internally.
-                    text, tool_calls = _run_tool_call_turn(token_cache, prompt)
+                    text, tool_calls = _run_tool_call_turn(token_cache, plan.prompt)
                     if tool_calls:
                         # Leftover text is deliberately dropped here, not
                         # surfaced as delta content -- see _handle_full's
@@ -2510,7 +2954,7 @@ def make_handler(token_cache):
                         finish_reason = "stop"
                 else:
                     first = True
-                    for delta in run_chat_turn(token_cache, prompt):
+                    for delta in self._stream_plain_turn(plan):
                         emit(
                             {"role": "assistant", "content": delta}
                             if first
@@ -2553,13 +2997,14 @@ def make_handler(token_cache):
                 except OSError:
                     pass
 
-        def _handle_full(self, prompt, model, tools_requested=False):
+        def _handle_full(self, plan, model):
             completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            tools_requested = bool(plan.tools)
             try:
                 if tools_requested:
-                    text, tool_calls = _run_tool_call_turn(token_cache, prompt)
+                    text, tool_calls = _run_tool_call_turn(token_cache, plan.prompt)
                 else:
-                    text, tool_calls = "".join(run_chat_turn(token_cache, prompt)), []
+                    text, tool_calls = self._run_plain_turn(plan), []
             except Exception as e:
                 # See the comment in _handle_streaming's except clause: broad
                 # on purpose, so any bug still produces a diagnosable log entry.
@@ -2710,13 +3155,15 @@ def _log_startup_banner(args):
         platform.platform(),
     )
     logging.info(
-        "args: host=%s port=%d credentials_prefix=%s log_file=%s log_level=%s init_credentials=%s",
+        "args: host=%s port=%d credentials_prefix=%s log_file=%s log_level=%s "
+        "init_credentials=%s disable_conversation_continuity=%s",
         args.host,
         args.port,
         args.credentials_prefix,
         args.log_file,
         args.log_level,
         args.init_credentials,
+        args.disable_conversation_continuity,
     )
     logging.info("cwd=%s script=%s", os.getcwd(), os.path.abspath(__file__))
     logging.info("=" * 78)
@@ -2790,6 +3237,15 @@ def main():
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="log verbosity for --log-file (default: INFO)",
     )
+    parser.add_argument(
+        "--disable-conversation-continuity",
+        action="store_true",
+        help="always context-stuff the whole conversation into a brand-new Sydney "
+        "conversation on every call, never reusing Sydney's own server-side "
+        "conversation memory -- this proxy's original behavior. Continuity is "
+        "enabled by default (see module docstring's 'Sydney-native conversation "
+        "continuity' section); this is an escape hatch if it ever causes trouble",
+    )
     args = parser.parse_args()
 
     _configure_logging(args.log_file, getattr(logging, args.log_level))
@@ -2844,12 +3300,19 @@ def main():
         )
         sys.exit(1)
 
-    handler_cls = make_handler(token_cache)
+    conversation_sessions = (
+        None if args.disable_conversation_continuity else ConversationSessionStore()
+    )
+    handler_cls = make_handler(token_cache, conversation_sessions)
     server = _LoggingHTTPServer((args.host, args.port), handler_cls)
     logging.info(
-        "listening on http://%s:%d (Ctrl+C to stop) -- no auth required on the API itself",
+        "listening on http://%s:%d (Ctrl+C to stop) -- no auth required on the API "
+        "itself; Sydney-native conversation continuity is %s",
         args.host,
         args.port,
+        "disabled (--disable-conversation-continuity)"
+        if conversation_sessions is None
+        else "enabled",
     )
     try:
         server.serve_forever()
