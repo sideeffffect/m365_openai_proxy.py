@@ -309,19 +309,30 @@ KNOWN LIMITATIONS
 
   **IMPORTANT if your client is OpenHands: prefer OpenHands' own
   client-side "mock function calling" mode over this proxy's emulation
-  above.** OpenHands' SDK has a `native_tool_calling=False` flag on its
-  `LLM` config that converts tools to text and parses the reply entirely
-  on OpenHands' own side, sending this proxy NO `tools` field at all (so
-  this proxy's emulation above never runs). Tested 3 of 3 full sessions
-  succeeded, all verified correct on disk -- dramatically more reliable
-  than either this proxy's emulation or OpenHands' native tool-calling
-  mode (1 of 2 sessions). This flag isn't exposed through the OpenHands
-  CLI's normal settings/env-var surface in the tested version -- it
-  requires directly seeding a persisted `agent_settings.json` file -- see
-  REVERSE_ENGINEERING.md's "OpenHands' own client-side 'mock function
-  calling'" section for the exact setup. Does not transfer to OpenCode (no
-  equivalent client-side fallback exists) or to Goose (it DOES have an
-  analogous mechanism, "Toolshim", but it doesn't help here -- see next).
+  above -- but it is NOT unconditionally reliable, see below.**
+  OpenHands' SDK has a `native_tool_calling=False` flag on its `LLM`
+  config that converts tools to text and parses the reply entirely on
+  OpenHands' own side, sending this proxy NO `tools` field at all (so this
+  proxy's emulation above never runs). Initial test: 3 of 3 full sessions
+  succeeded. A much larger follow-up load test (26 sessions, 7 batches --
+  single-edit, multi-step-with-terminal-verification, multi-file,
+  concurrent sessions, and an iterative debug loop) found **17 of 17
+  (100%) success on ordinary implement/edit/verify task shapes including
+  concurrency**, dramatically more reliable than either this proxy's
+  emulation or OpenHands' native tool-calling mode (1 of 2 sessions) --
+  but only **1 of 9 (11%) success reasoning about/fixing code containing a
+  function whose name contradicts its own behavior** (e.g. a `subtract`
+  that adds), which reproducibly (regardless of wording, tests, or tool
+  use) makes Sydney return a genuinely empty completion -- a third failure
+  mode, distinct from refusal-text and code-interpreter self-preemption.
+  This flag isn't exposed through the OpenHands CLI's normal settings/
+  env-var surface in the tested version -- it requires directly seeding a
+  persisted `agent_settings.json` file -- see REVERSE_ENGINEERING.md's
+  "OpenHands' own client-side 'mock function calling'" and "deep,
+  adversarial load-testing" sections for the exact setup and full trial
+  data. Does not transfer to OpenCode (no equivalent client-side fallback
+  exists) or to Goose (it DOES have an analogous mechanism, "Toolshim",
+  but it doesn't help here -- see next).
 
   Goose's own "Toolshim" (`GOOSE_TOOLSHIM=1`) has the same architecture as
   OpenHands' mock function calling -- sends `tools: []` to this proxy and

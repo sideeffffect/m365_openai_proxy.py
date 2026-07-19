@@ -79,19 +79,40 @@ sections below are where that lives.
   but-unreliable and OpenCode/Goose as not-currently-working, not all three
   as equally "probabilistic."
 - **OpenHands' own client-side "mock function calling" — dramatically more
-  reliable, and the recommended configuration**: OpenHands' SDK has a
-  `native_tool_calling=False` flag that converts tools to text and parses
-  the reply entirely on OpenHands' own side, sending this proxy NO `tools`
-  field at all (bypassing this proxy's emulation above completely). Tested
-  3 of 3 full sessions succeeded, all verified correct on disk, all
-  confirmed via the proxy log to have sent `tools=0` throughout. This flag
+  reliable, and the recommended configuration, now deep-load-tested**:
+  OpenHands' SDK has a `native_tool_calling=False` flag that converts
+  tools to text and parses the reply entirely on OpenHands' own side,
+  sending this proxy NO `tools` field at all (bypassing this proxy's
+  emulation above completely). Initial test: 3 of 3 full sessions
+  succeeded. A much larger follow-up load test (26 sessions across 7
+  batches — single-edit, multi-step-with-terminal-verification,
+  multi-file, concurrent sessions, and an iterative debug loop — see the
+  "deep, adversarial load-testing" update near the end of this document)
+  found **17 of 17 (100%) success across ordinary implement/edit/verify
+  task shapes, including concurrency**, but only **1 of 9 (11%) success on
+  a specific task shape**: reasoning about or fixing code containing a
+  function whose name contradicts its own behavior (e.g. a `subtract` that
+  adds) — which appeared to reproducibly trigger a genuinely **empty
+  completion**, a third failure mode distinct from the refusal-text and
+  code-interpreter-self-preemption patterns documented elsewhere in this
+  file. **Important correction found immediately after this test (see the
+  dated "Correction" subsection near the end of this document): the same
+  account was separately confirmed to hit an explicit, Sydney-labeled
+  volume-based rate limit shortly afterward, and the misleading-name
+  batches were run last in the session (highest cumulative request
+  count) — so this specific causal story is unconfirmed and may instead
+  (or also) be volume-based throttling that was never isolated as an
+  independent variable.** Treat the 17/17-vs-1/9 headline numbers as real,
+  but the "misleadingly-named code is the trigger" explanation as
+  retracted pending a volume-controlled retest. This flag
   isn't exposed through the OpenHands CLI's normal settings/env-var
   surface in the installed version — it requires directly seeding a
   persisted `agent_settings.json` — see the "OpenHands' own client-side
-  'mock function calling'" update near the end of this document for the
-  exact setup and full trial data. Does not transfer to OpenCode (no
-  equivalent client-side fallback exists at all) or to Goose (it DOES have
-  an analogous mechanism, "Toolshim" — see next bullet — but it didn't
+  'mock function calling'" and "deep, adversarial load-testing" updates
+  near the end of this document for the exact setup and full trial data.
+  Does not transfer to OpenCode (no equivalent client-side fallback exists
+  at all) or to Goose (it DOES have an analogous mechanism, "Toolshim" —
+  see next bullet — but it didn't
   help here, for a fully understood reason).
 - **Goose's own "Toolshim" — has the same architecture as OpenHands' mock
   function calling, but doesn't help here, for a specific and now fully
@@ -1975,4 +1996,221 @@ convention trials earlier in this document) -- it would need its own live
 A/B trial to confirm before being called a fix rather than a guess.
 
 
+
+
+## Update: deep, adversarial load-testing of OpenHands' mock function calling — 17/17 on typical tasks, but a new failure mode found under a specific task shape
+
+Following up on the "3/3 sessions succeeded" result documented above, the user
+asked for a "much deeper and thorough" test of OpenHands' client-side mock
+function calling specifically to find its actual reliability ceiling, not
+just confirm the happy path again. This work was done in an isolated git
+worktree (`../python-copilot-m365-openhands-load-test`, branch
+`openhands-mockfc-load-test`) with its own dedicated proxy instance
+(port 8321) to avoid colliding with any other concurrent session.
+
+### Test design
+
+Five batches, each a full, independently-verified `openhands --headless
+--json --always-approve` session (fresh `OPENHANDS_PERSISTENCE_DIR` +
+fresh project directory per trial, same `native_tool_calling=False` seeding
+recipe documented in the section above), escalating in complexity and
+covering a dimension the original 3-trial test didn't:
+
+- **Batch A -- baseline** (4 trials): the original "add a `subtract`
+  function, print the file" task, repeated for a larger sample in a fresh
+  environment.
+- **Batch B -- multi-step verification** (6 trials): edit the file, THEN
+  use the `terminal` tool to run a Python one-liner exercising the new
+  function and report its output -- forces a `file_editor` -> `terminal`
+  chain (4-5 tool calls) rather than just one edit.
+- **Batch C -- multi-file, more tools** (4 trials): a two-file project
+  (`calc.py` + `test_calc.py`), add a function to one file AND a
+  corresponding test to the other, then run a verification one-liner
+  exercising all three test functions via `terminal` -- 6-7 tool calls
+  across two files.
+- **Batch D -- concurrency** (3 trials, run genuinely simultaneously via
+  three parallel background processes hitting the same proxy port): one
+  trial each from batches A/B/C's task shapes, run at the same time, to
+  stress the proxy's `ThreadingHTTPServer` and confirm no cross-talk
+  between concurrent Chathub sessions.
+- **Batch E -- iterative debug loop** (4 trials): a project seeded with a
+  *deliberately incorrect* `subtract(a, b)` implementation (`return a + b`)
+  and a test that would catch it, with instructions to run the tests, find
+  the failure, fix it, then re-verify -- this is a materially different
+  task shape from A-D: it requires the model to process a **failing test
+  result** and self-correct, which is a core pattern in real agentic coding
+  sessions that neither the earlier 3-trial test nor batches A-D exercised
+  at all.
+
+### Results, Batches A-D: 17 of 17 full sessions succeeded
+
+Every single trial across A, B, C, and D completed with the file(s) on
+disk matching the requested change exactly, and a coherent, correct final
+summary message. The tool-call sequences recorded in each session's own
+JSONL event log (parsed independently of the model's own claims) confirm
+genuine tool use throughout, e.g.:
+
+- Batch A: `['file_editor', 'file_editor', 'file_editor', 'finish']` (x4)
+- Batch B: `['file_editor', 'file_editor', 'terminal', 'finish']` (or a
+  4-edit variant), each with the terminal tool actually reporting the
+  correct computed value (x6)
+- Batch C: 6-7 step sequences spanning both files plus a `terminal` test
+  run reporting `ALL PASS` (x4)
+- Batch D: the three concurrent sessions' final file states matched their
+  own individual tasks exactly, with zero evidence of cross-talk; one
+  session spontaneously used the `task_tracker` tool as well, and still
+  completed correctly (x3)
+
+Across these 17 sessions the proxy handled 88 chat-completion requests
+total with **zero exceptions/tracebacks logged** and **every single request
+confirmed to carry `tools=0`** (i.e. OpenHands' mock function calling
+never once fell back to sending this proxy real `tools`, and this proxy's
+own emulation was never invoked). This is a materially larger and more
+demanding sample than the original 3-trial test and it holds up completely:
+**100% success (17/17) across single-edit, multi-step-with-verification,
+multi-file, and concurrent-session task shapes.**
+
+### Results, Batch E (+ 2 follow-up differential batches): a genuine new failure mode found -- 1 of 9 succeeded
+
+Batch E (original wording, "if a test fails, find and fix the bug... report
+the final test output") succeeded in only **1 of 4** trials -- a sharp,
+reproducible drop from the 100% seen in A-D. Digging into the 3 failures
+(not just noting the outcome): every failing turn's raw event log showed
+the agent received a completely **empty assistant message** (`"text": ""`)
+turn after turn, 3-4 times in a row, until OpenHands gave up and finished
+with an empty final summary. Cross-checked directly against this proxy's
+own log (not inferred): every one of those turns shows
+`reply_length=0 chars` -- Sydney itself returned a genuinely empty
+completion, not a truncated one, not an exception, not this proxy's own
+bug. In the one successful trial (Batch E, trial 1), by contrast, every
+turn had a substantive 250-450 character reply.
+
+This is a **previously undocumented failure mode**, distinct from both
+patterns already established in this document (a flat refusal *sentence*,
+or self-preemption via the code interpreter): here Sydney returns *nothing
+at all*, silently.
+
+**Two follow-up differential batches, run specifically to isolate the
+trigger** (not to just re-confirm the failure):
+
+- **Batch F** (3 trials): the exact same buggy fixture, but with the task
+  wording changed to avoid the words "bug"/"fix"/"fail" entirely (neutral
+  phrasing: "make any necessary changes... so that all assertions
+  succeed"). Result: **0 of 3 succeeded** -- if anything worse than Batch
+  E, and confirms this is NOT the same "the word 'tool' triggers bad
+  behavior" mechanism documented earlier in this file (no tool-related
+  words are anywhere in this fixture or task at all, since `tools=0`
+  throughout mock-fc mode) -- wording is not the variable.
+- **Batch G** (2 trials): the same buggy `calc.py`, but with a task that
+  never mentions `test_calc.py`, never asks to run any command, and simply
+  says "the `subtract` function should return a minus b; correct it if it
+  doesn't." Result: **0 of 2 succeeded**. This rules out the
+  terminal-verification loop and the presence of a test file as the
+  trigger -- the empty-completion behavior reproduces even in a single-shot,
+  no-tool-chain-required task.
+
+Combined: **1 of 9 sessions succeeded** whenever the project on disk
+contained this specific buggy fixture (a function literally named
+`subtract` whose body performs addition), regardless of wording, whether a
+test file was involved, or whether any verification command was ever run.
+All 25 individual zero-length replies recorded across this entire load
+test (out of 118 total requests) occurred within these three batches (one
+isolated, non-blocking zero-length reply also occurred once during Batch A
+but didn't prevent that session's overall success -- OpenHands' own
+conversation loop tolerated it and continued, simply re-prompting on the
+next step). **Zero** zero-length replies occurred in the 17 successful
+Batches A-D sessions covering ordinary add/edit/verify work.
+
+### Working hypothesis (not fully confirmed) and honest caveats
+
+The most likely explanation, given the isolation results above: Sydney's
+safety/content layer reacts specifically to being shown (and asked to
+reason about) a function whose **name doesn't match its actual behavior**
+-- `subtract` that adds -- independent of surrounding wording, tests, or
+tool use. This is a different trigger category from the two already
+documented in this file (a literal keyword; a fabricated "assistant
+already acted" history shape) -- here the triggering signal appears to be
+in the **code's own semantic content**. This was not tested against other
+"deliberately wrong code" shapes (e.g. an off-by-one, a wrong comparison
+operator, a genuinely subtle bug rather than a name/behavior mismatch this
+blatant) -- it's possible a less blatant mismatch would not trigger this at
+all, which would point specifically at "obviously mislabeled/misleading
+code" rather than "any bug" as the real trigger. That distinction was not
+isolated here and is flagged as the natural next experiment if this is
+worth pursuing further. 1/9 across all differential trials is a strong,
+reproducible signal (not noise) -- but the sample (9 sessions across 3
+small variations of ONE fixture) is still small enough that "this specific
+pattern" vs. "some broader class of pattern this fixture happens to
+represent" remains an open question.
+
+### Practical implication
+
+The headline finding from the earlier section -- OpenHands' own mock
+function calling is dramatically more reliable than this proxy's own
+`tools` emulation -- **holds up and is now backed by a much larger, more
+demanding sample**: 17 of 17 (100%) across single-edit, multi-step,
+multi-file, and concurrent task shapes, with zero proxy-side errors. But
+it is **not unconditionally reliable**: a specific, now-reproduced task
+shape (reasoning about/fixing code whose behavior contradicts its own
+name) drops success to roughly 1 in 9, via a distinct failure mode (silent
+empty completions) that has no relationship to the tool-calling mechanism
+itself -- it reproduces with zero tools offered, zero mention of tools,
+and no terminal use at all. Anyone relying on this configuration for real
+debugging/bug-fixing workloads (as opposed to straightforward
+implement-a-function work) should expect this specific pattern to be a
+real reliability cliff, not a hypothetical one.
+
+### Correction, found right after finishing this test: the "misleading function name" theory is confounded with request volume, and may be wrong
+
+Shortly after wrapping up the batches above, the SAME underlying account
+(checked via the separate, non-load-test proxy instance on its own port,
+sharing the same credential) was tested with the most trivial possible
+prompt ("Reply with just: OK") and got back Sydney's own explicit,
+unambiguous rate-limit response: `"We're temporarily unable to respond to
+this volume of requests. Please try again later."` This is a genuine,
+labeled throttle -- not inferred, not a guess -- and it persisted across a
+full proxy restart with a freshly-exchanged access token, confirming it is
+an account/tenant-level throttle enforced server-side by Sydney, not
+anything tied to this proxy's process state.
+
+This matters because it changes how the "empty completion on
+misleadingly-named code" finding above should be read. Batches E, F, and G
+were the **last three batches run**, after Batches A-D had already sent 88
+requests in this same session -- i.e., they ran at the point in the session
+where cumulative request volume was highest. **It is very plausible that
+what looked like a content-triggered failure (buggy/misleadingly-named
+code specifically) was actually, wholly or partly, volume-based throttling
+that happened to coincide with when the buggy-code batches were run** --
+the empty-completion failure mode (a `200 OK` with `reply_length=0 chars`,
+no error) could plausibly be an earlier, "soft" stage of the same
+throttling mechanism that later escalated into the hard, explicit refusal
+message once the account crossed some threshold. The proxy's own log
+timestamps are consistent with this: the empty-completion failures cluster
+in the second half of the session (Batches E onward), not randomly
+throughout it, which is what a volume-based effect predicts and a
+content-based one does not.
+
+**Net effect on the finding above: downgrade "misleadingly-named/buggy code
+causes silent empty completions" from a confirmed content-based trigger to
+an unconfirmed hypothesis that a request-volume confound was not
+controlled for.** The three differential batches (F: neutral wording, G:
+no test file/no terminal) still rule out *wording* and *tool-chain-length*
+as the trigger -- those varied while volume kept climbing across the same
+session, and the failure persisted regardless -- but they do NOT rule out
+volume/rate-limiting as the dominant or sole factor, since volume was
+never held constant as an independent variable (every batch in this test
+ran later in the session than the one before it, so volume and "which
+batch" are perfectly correlated and cannot be separated post hoc). Properly
+isolating this would require re-running the Batch E/F/G fixture *first*,
+in a fresh session with no prior request volume, and separately measuring
+where the explicit throttle message starts appearing as a function of
+request count/rate on this account -- neither of which was done here.
+**Treat the "17/17 clean, 1/9 on misleading-name code" headline number as
+real and reproducible (it is), but treat the specific causal story
+(safety-layer reaction to misleadingly-named code) as retracted pending a
+volume-controlled retest** -- this is exactly the kind of correction this
+document has made before (see the AADSTS70000 section) and is called out
+explicitly here for the same reason: a plausible-looking theory that
+wasn't adequately isolated should be labeled as such, not left standing
+uncorrected once better evidence arrives.
 
