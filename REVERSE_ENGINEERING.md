@@ -1173,6 +1173,110 @@ shot and turn this from "confirmed by reading source" to "confirmed on the
 wire" — the same bar every other finding in this document was held to before
 being implemented.
 
+## Update: Local MCP bridge — live-probed on the wire (findings; deliberately NOT implemented in the proxy)
+
+Rather than wait for a browser-side capture, the four open unknowns above were
+attacked directly: a standalone probe (`experiments/probe_local_mcp.py`)
+stands up a **fake in-process MCP server** (`probe_server`, one tool
+`get_probe_secret` returning a sentinel only the tool could know), advertises
+it to Sydney over this project's existing Chathub connection exactly as the
+browser's `warmupLocalMCPPlugins()` does, answers whatever Sydney invokes back,
+and dumps every frame. Run live against the real backend with the saved
+credential, it settled **three of the four unknowns** and turned the fourth
+from "unknown" into a **specific, reproduced blocker**.
+
+### Confirmed on the wire (previously only inferred)
+
+1. **Local MCP is reachable/enabled for the tested tenant.** The
+   `LocalMcpDiscovery` warmup advertisement (`{type:"LocalMcpDiscovery",
+   serverIds:["probe_server"], disableDescriptorCache:true}`, sent as a
+   fire-and-forget SignalR `send` invocation) reliably made Sydney turn around
+   and invoke `mcp_describe` on the client with
+   `{"server_ids":["probe_server"]}`. (Resolves unknown #3.)
+2. **The invocation carries an `invocationId`.** Every `mcp_describe` arrived
+   as a SignalR type:1 Invocation *with* an `invocationId` (`s1`, `s12`, `s86`,
+   `s143`, `s180`, …), and answering it with a type:3 Completion keyed by that
+   same id was accepted — i.e. ASP.NET Core SignalR **"client results" is
+   genuinely in play**, exactly as the "How the client's return value gets back
+   to the server" section theorized. (Resolves unknown #1.)
+3. **The outgoing advertisement shape and the describe client-result shape are
+   accepted.** Sydney describes successfully (no error frame); the envelope
+   documented above (`schema_version` / `correlation_id` / `response.{status,
+   message, payload}` with `payload` a JSON-encoded string) is the right one.
+   (Resolves the "exact shape" half of unknown #4.)
+
+### The remaining blocker (now specific and reproduced): tools don't surface to the model
+
+In this proxy's default scenario (`source=officeweb`, `scenario=
+OfficeWebIncludedCopilot`, `agentHost=Bizchat.FullScreen`), Sydney performs the
+describe **handshake** but never **surfaces** the described tool to the model,
+so it never sends `invoke_local_plugin`. Across seven live runs the model, when
+asked to enumerate its own capabilities, lists its built-ins
+(`python`, `image_gen`, `web.run`, `container.*`, …) and explicitly reports
+**"NO get_probe_secret"**, and when asked to use the tool it flatly refuses
+("I don't have access to any tool named `get_probe_secret`"). Every reachable
+lever was tried and none changed this:
+
+- extra connection `variants` (`feature.EnableMcpServerDynamicTools`,
+  `feature.EnableLocalMcp`, `EnableLocalMcp`, `feature.EnableLocalMcpPlugin`);
+- `feature.EnableMcpServerDynamicTools` delivered *in the chat payload* via a
+  `sydneyConfigurationParameters.variants` field (the exact place the officeweb
+  bundle injects it — for the FinanceAndOperations agent);
+- `feature.DisableDynamicToolValidation` (there IS server-side dynamic-tool
+  validation that could silently drop a tool — turning it off changed nothing);
+- a `plugins:[{Id:"probe_server",Source:"LocalMcp"}]` entry in the chat request;
+- the `server.transport` field as both a string and an object;
+- both enumerate-intent and invoke-intent prompts;
+- describe-first ordering (warmup → answer describe → *then* send the user turn,
+  mirroring the browser's connection-start sequence).
+
+**Strongest inference (conf ~0.65 on the exact cause, ~0.9 that it's not
+request-param-fixable):** dynamic-tool *surfacing* is gated to a
+**declarative-agent / GptId context** the default web-chat scenario can't
+reach. Two independent signals point there: `feature.EnableMcpServerDynamicTools`
+appears in the bundle **only** as an agent-scoped setting (contributed by an
+agent's `settingsBuilder`), and the `invoke_local_plugin` path keys everything
+off `e.clientData.pluginInfo.GptId` — i.e. an invoked local tool is bound to a
+GPT/agent. The describe handshake pre-caches descriptors regardless, but
+without an agent context the tools are never injected into the model's prompt.
+
+### Decision: findings documented, NOT implemented in the proxy
+
+A working transport-layer bridge was actually prototyped (a pure-stdlib stdio
+MCP host — `StdioMCPClient` + `LocalMCPHost` — that answers Sydney's
+`mcp_discover`/`mcp_describe`/`invoke_local_plugin` invocations, threaded
+through the Chathub turn and gated behind `--enable-local-mcp`). It passed an
+offline test against a real mock MCP subprocess and its handshake was verified
+live end-to-end (warmup sent → Sydney called `mcp_describe` back → the host
+serviced it). **But it was deliberately NOT merged into `m365_openai_proxy.py`,
+and that prototype code was reverted**, for one decisive reason: in the only
+scenario this proxy can connect as (`OfficeWebIncludedCopilot`), the surfacing
+blocker above means Sydney never actually sends `invoke_local_plugin`, so the
+bridge — however correct — can never fire end-to-end. Shipping a feature that
+cannot be used (and that carries per-turn cost: an extra warmup + describe
+round-trip on every turn) is worse than not shipping it:
+
+- It would add a user-facing `--enable-local-mcp` flag that does nothing useful,
+  which is a support/maintenance liability and a credibility cost against this
+  project's "confirmed on the wire before shipping" bar.
+- The earlier plan to *replace* the probabilistic prompt-emulation with this
+  bridge is off the table entirely: a bridge that never triggers would be a
+  straight regression for the clients that work today (Aider, OpenHands
+  mock-function-calling).
+
+So the value of the work — the protocol knowledge — is preserved **here** (this
+section) plus the reproducible live probe `experiments/probe_local_mcp.py`,
+rather than as dormant, unusable code in the shipped single-file proxy. The
+proxy itself is unchanged.
+
+**Concrete next step to actually enable this**, whenever it's worth revisiting:
+re-run `experiments/probe_local_mcp.py` while a Local-MCP-enabled declarative
+agent is selected (a real `GptId` in `threadLevelGptId`/`selectedGptId`), which
+is where the bundle evidence says surfacing lives. If that makes Sydney emit
+`invoke_local_plugin`, the prototype bridge (recoverable from this branch's
+history) becomes worth landing; until then, the emulation path in
+`m365_openai_proxy.py` remains the only tool-calling mechanism that works.
+
 ## Update: goal re-scoped to "drive a coding agent via m365 Copilot", multi-turn implemented via context-stuffing
 
 The actual end goal was clarified: not "faithfully replicate every Sydney

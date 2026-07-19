@@ -122,11 +122,24 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   text instead) even after retries, especially on longer/more complex
   system prompts. Sydney's own REAL tool-invocation mechanism (Local MCP)
   is reverse-engineered and documented in `REVERSE_ENGINEERING.md`'s "Local
-  MCP tool-calling bridge" section but remains **unimplemented** — it would
-  sidestep all of the above, at the cost of a genuine architecture mismatch
-  (Sydney's invocation is synchronous/mid-turn; OpenAI tool-calling is
-  async across separate HTTP requests) that's a substantial separate
-  project, not a quick patch.
+  MCP tool-calling bridge" section but remains **unimplemented in this
+  proxy** — deliberately. It was live-probed against the real backend
+  (`experiments/probe_local_mcp.py`), which **confirmed on the wire** that
+  Local MCP is reachable for the tested tenant (our warmup advertisement
+  makes Sydney call `mcp_describe` back), that the invocation carries an
+  `invocationId` (SignalR "client results" is real), and that the wire
+  shapes are accepted — **but** that in this proxy's default
+  (`OfficeWebIncludedCopilot`, non-agent) scenario Sydney does the describe
+  *handshake* yet never *surfaces* the tool to the model, so it never sends
+  `invoke_local_plugin`. Surfacing appears gated to a declarative-agent /
+  `GptId` context this scenario can't reach. A working stdlib bridge was
+  prototyped and verified live up to that point, but was intentionally NOT
+  merged: a bridge that can't fire end-to-end in the only reachable scenario
+  would be unusable code (and an added per-turn round-trip) shipped into a
+  single-file proxy. The hard-won protocol details and the exact blocker are
+  preserved in `REVERSE_ENGINEERING.md` and the reproducible probe instead —
+  see there for the concrete next step (an MCP-enabled declarative agent)
+  that would unlock it.
 - `usage` (token counts) in every response is always zero — no token
   counting is implemented.
 - One Chathub WebSocket is opened and closed per HTTP request — no
@@ -388,14 +401,18 @@ Run `python3 m365_openai_proxy.py --help` for all flags, including
 See `REVERSE_ENGINEERING.md` for the full protocol reverse-engineering
 writeup this implementation is based on (Chathub/SignalR wire format, the
 FOCI token-family auth chain, the MSAL cache-encryption algorithm, etc).
-`experiments/` holds small, ad-hoc scripts used while developing the
-Sydney-native conversation continuity feature — `probe_conversation_reuse.py`
-(live-tests against the real backend that a reused `ConversationId` carries
-real server-side memory), `dump_frames.py` (raw SignalR frame dump, used to
-find the rate-limit handling gap), and `test_continuity_offline.py` (a
-network-free test of the HTTP-layer wiring itself, with `run_chat_turn`
-stubbed out — see REVERSE_ENGINEERING.md for what each one found). None of
-them are part of the shipped proxy or required to run it.
+`experiments/` holds small, ad-hoc scripts used while developing/investigating
+features — `probe_conversation_reuse.py` (live-tests against the real backend
+that a reused `ConversationId` carries real server-side memory),
+`dump_frames.py` (raw SignalR frame dump, used to find the rate-limit handling
+gap), `test_continuity_offline.py` / `test_throttle_429_offline.py` /
+`test_token_refresh_race_offline.py` (network-free tests of the HTTP-layer
+wiring, with `run_chat_turn` stubbed out), and `probe_local_mcp.py` (the live
+probe that confirmed Sydney's Local MCP handshake on the wire and pinned down
+the tool-surfacing blocker — see the "Local MCP tool-calling bridge" section
+of REVERSE_ENGINEERING.md). See REVERSE_ENGINEERING.md for what each one found.
+None of them are part of the shipped proxy or required to run it — and, per
+`AGENTS.md`, unlike the proxy itself they may use any Python tooling/libraries.
 
 ## Requirements
 
