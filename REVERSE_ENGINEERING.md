@@ -77,7 +77,32 @@ sections below are where that lives.
   "production-scale end-to-end validation" and "Goose CLI validation"
   updates near the end of this document. Treat OpenHands as demonstrated-
   but-unreliable and OpenCode/Goose as not-currently-working, not all three
-  as equally "probabilistic."
+  as equally "probabilistic." **This whole picture is for the PRIOR,
+  single-convention design** -- see the next bullet for what changed.
+- **"Code-mode" tool-calling emulation (implemented, IS shipped) — a second,
+  independent convention added alongside "action_request", tried in
+  alternation across retries** in direct response to the user asking for a
+  much deeper investigation into making OpenCode/native-OpenHands/native-Goose
+  reliable. Rather than fighting Sydney's strong, repeatedly-observed habit
+  of solving things by writing and "running" Python code (which
+  "action_request" mode does, by explicitly suppressing Sydney's own code
+  interpreter), "code" mode leans directly into it: the model is told a
+  Python function `invoke_capability(name, arguments)` is already loaded in
+  its environment and is asked to call it from ordinary code, parsed back
+  out via a real Python AST walk (not a regex). `_run_tool_call_turn()` now
+  cycles through BOTH conventions across its retry attempts rather than
+  retrying one fixed convention, since live A/B testing found neither
+  dominates the other in every situation (see the "code-mode tool-calling
+  emulation" section for the exact numbers: "code" mode won 6/6 vs.
+  "action_request"'s 0/6 on a simple single-capability request in one
+  session, but "action_request" won 4/5 vs. "code" mode's 2/5 at realistic
+  coding-agent scale in the same session). **Live end-to-end re-validation
+  against the real OpenCode/OpenHands/Goose CLIs with this new two-
+  convention design was blocked by the Sydney-side request throttling
+  discovered during this same investigation** (see two bullets below) —
+  check this document's "code-mode tool-calling emulation" section for
+  whether that live re-validation was completed by the time you're reading
+  this, or whether it's still an open follow-up.
 - **OpenHands' own client-side "mock function calling" — dramatically more
   reliable, and the recommended configuration**: OpenHands' SDK has a
   `native_tool_calling=False` flag that converts tools to text and parses
@@ -109,6 +134,20 @@ sections below are where that lives.
   -caught Ollama fallback call, `Network error: Could not connect to
   localhost:11434`) rather than just inferred — see the dated "Goose's own
   'Toolshim'" update near the end of this document.
+- **Sydney-side request throttling — a genuinely new discovery**: after
+  roughly 40-50 Chathub turns opened in a few minutes (during this same
+  investigation's own A/B testing), Sydney started silently returning
+  completely EMPTY completions (`Chathub reply complete (total_length=0
+  chars)`, no error, no `AuthError`) for every request -- including plain,
+  tools-free chat turns completely unrelated to tool-calling. This had
+  never been observed before in this project. It did not clear within 45
+  seconds, and was still present after roughly 30 minutes of testing in
+  this update. `_looks_like_throttled_empty_reply()` now detects this and
+  both `_handle_full`/`_handle_streaming` surface it as an explicit error
+  instead of a silent, misleadingly-successful empty `200` response — see
+  the "code-mode tool-calling emulation" section for the full timeline and
+  why this matters directly for agentic-loop reliability (a working coding
+  agent generates exactly this kind of request burst).
 - **Not actually in this repo**: none of the `.har` capture files or
   `Chathub.log.jsonl` referenced throughout this document were ever committed
   (they carry live session cookies/tokens and are `.gitignore`d) — this
@@ -1973,6 +2012,201 @@ outcome (Sydney may still self-preempt with its code interpreter even
 without the word "tool" present, exactly as seen in several `<action_request>`
 convention trials earlier in this document) -- it would need its own live
 A/B trial to confirm before being called a fix rather than a guess.
+
+## Update: "code-mode" tool-calling emulation -- leaning into Sydney's own code-writing habit instead of fighting it
+
+Following the Goose Toolshim investigation, the user asked for a much
+deeper investigation into making OpenCode, "normal" OpenHands CLI (native
+tool-calling, not the mock-function-calling mode from the earlier update),
+and "normal" Goose CLI (native tool-calling / real MCP tools, not Toolshim)
+actually work reliably, and to implement whatever came out of it. This work
+was done in an isolated git worktree (`feature/code-mode-tool-calling`,
+sibling directory `python-copilot-m365-code-mode`) rather than on `master`,
+per the user's explicit request, with a PR opened rather than committing
+directly.
+
+### The idea
+
+Every failure mode documented so far in this file for the "action_request"
+convention (Sydney's own code interpreter self-preempting instead of
+following the convention; a flat refusal triggered by the word "tool") has
+one thing in common: Sydney has a very strong, extremely consistently
+observed preference for solving things by **writing and "running" Python
+code** the moment it thinks a task requires doing something rather than
+just answering in words. Every single "action_request" failure captured in
+this document that wasn't a flat refusal took the SAME shape: Sydney wrote
+and ran its own Python snippet trying to solve the task itself, rather than
+emitting our JSON-in-tags convention.
+
+The "action_request" convention's fix for this was to fight it -- strip
+Sydney's own code-interpreter-related `OPTIONS_SETS` entries and explicitly
+tell it "you have no code interpreter this turn" so there's nothing left to
+reach for. That helps, but only partially (see the trial data throughout
+this document -- roughly a coin-flip per attempt even under the best
+measured conditions).
+
+"Code mode" tries the opposite: instead of suppressing Sydney's
+code-writing habit, it leans directly into it. The model is told its Python
+environment already has one extra function loaded and ready to call,
+`invoke_capability(name, arguments)`, and is asked to write and run
+ordinary Python code exactly the way it already tends to solve things --
+call `invoke_capability(...)` whenever it needs one of the declared
+capabilities, then read the return value. No JSON-in-tags convention, no
+"your other capabilities are disabled" framing, and (deliberately)
+`OPTIONS_SETS` is left FULL rather than stripped -- see `TOOL_MODE_OPTIONS_SETS`'s
+updated docstring -- since the whole point is to not fight the code
+interpreter this time.
+
+`_extract_code_mode_calls()` parses Sydney's reply for this call by finding
+every ```` ``` ````-fenced code block (Sydney's own code-interpreter convention
+reliably wraps generated code this way -- confirmed across every capture in
+this document, e.g. `"Coding and executing```python\n...\n```"`), parsing
+each one as a real Python AST via `ast.parse()`, and walking it for `Call`
+nodes whose function is a bare `Name` matching `invoke_capability`. This is
+deliberately more robust than a regex over the raw text: the model is free
+to write completely ordinary code around the call(s) -- comments, loops,
+multiple calls, `print()`-ing the result, checking `os.path.exists` first,
+whatever -- and the call(s) will still be found via `ast.literal_eval` on
+whichever AST nodes hold the name/arguments, handling both positional and
+keyword call styles. A block that isn't valid Python, or a call whose
+arguments aren't literal enough to evaluate (e.g. computed from a variable),
+is skipped rather than raised, same "degrade gracefully" policy as the
+"action_request" extractor.
+
+### Retrying across BOTH conventions, not just retrying the same one
+
+The existing retry loop (`_run_tool_call_turn`, previously fixed at 3
+attempts of the same "action_request" convention) was changed to cycle
+through `_TOOL_CALL_MODES = ("code", "action_request", "code")` -- each
+attempt renders an entirely fresh prompt from the original
+`messages`/`tools`/`tool_choice` using whichever convention that attempt
+number is assigned, rather than rendering the prompt once and retrying the
+identical text. This was a deliberate design choice, not an incidental
+side effect of adding a second convention: live A/B testing (below) found
+that neither convention dominates the other in every situation -- they fail
+in different, largely uncorrelated ways (Sydney's own code interpreter
+self-preempting vs. a flat refusal), so a request that fails under one
+convention has a meaningfully independent chance of succeeding under the
+other on the very next attempt. This required restructuring
+`_render_conversation_prompt()` to take a `mode` parameter and rendering
+lazily inside the retry loop instead of once up front in `_do_POST` (see
+the `_handle_streaming`/`_handle_full` signature changes -- they now accept
+`messages`/`tools`/`tool_choice` and defer to `_run_tool_call_turn` rather
+than a single pre-rendered `prompt` string, when `tools` is present).
+
+### Live A/B trial data (synthetic, direct-to-Sydney, no client CLI involved yet)
+
+All trials below were run directly against the real Sydney/Chathub backend
+via this proxy's own internals (bypassing the HTTP layer entirely, to
+isolate each convention/attempt cleanly), not through curl or a real CLI --
+that validation comes in a later section once these results justified
+going further.
+
+**Simple case** (one tool, `read_file`, one plain user message asking to
+read a file that only exists on the user's real machine -- the same
+"genuinely can't be faked by Sydney's own sandboxed interpreter" test used
+throughout this document):
+
+| Convention | Result |
+|---|---|
+| "code" mode alone | **6 / 6** |
+| "action_request" mode alone | **0 / 6** |
+
+A dramatic, clean result in one direction -- but see the realistic-scale
+trial below before concluding "code" mode simply wins outright.
+
+**Realistic scale** (a ~2KB system prompt modeled on real coding-agent
+system prompts, 5 tools with verbose descriptions, closer to what
+OpenCode/Goose/OpenHands actually send):
+
+| Convention | Result |
+|---|---|
+| "code" mode alone | **2 / 5** |
+| "action_request" mode alone | **4 / 5** |
+| Combined (alternating retry, up to 3 attempts) | **3 / 5** |
+
+This is the important finding that shaped the final design: **at larger
+scale, "action_request" actually did BETTER than "code" mode** in this
+particular trial, the reverse of the simple-case result. Neither convention
+is a strictly superior replacement for the other -- they have different
+failure profiles that interact with prompt scale/complexity differently,
+which is exactly the justification for retrying across BOTH conventions
+(`_TOOL_CALL_MODES`) rather than committing to just one. The combined
+retry's 3/5 sits between the two individual rates in this small sample,
+consistent with (though not proof of) the "different, largely
+uncorrelated failure modes" theory -- a larger sample would be needed to
+pin this down more precisely, and was not collected due to the request
+throttling discovered next.
+
+### A genuinely new discovery: Sydney-side request throttling shows up as a SILENT EMPTY completion
+
+While running the trials above (on the order of 40-50 Chathub turns opened
+across a few minutes, cumulative with everything else tested earlier in
+this session), every single request -- **including plain, tools-free chat
+turns with no relation to tool-calling at all** -- started returning a
+Chathub turn that completes normally (no error, no `AuthError` message)
+but with **zero characters of content**:
+
+```
+sending chat message: ... tool_mode=None
+Chathub reply complete (total_length=0 chars)
+```
+
+This was reproduced repeatedly and ruled out as a bug in this proxy's own
+tool-calling code specifically -- a bare, tools-free
+`run_chat_turn(token_cache, "Say hello in exactly three words.")` call,
+completely unrelated to anything added in this update, returned the exact
+same empty completion. It did **not** clear after waiting 45 seconds, and
+was still present after several minutes total -- this is not a
+sub-one-minute burst limiter, whatever it is.
+
+This had never been observed or documented before in this project despite
+extensive live testing throughout this document, almost certainly because
+no prior single testing session had generated this much request volume in
+this short a window. The Chathub protocol's own `throttling:
+{maxNumUserMessagesInConversation, ...}` field (mentioned earlier in this
+document) is presumably related, though this proxy has never observed it
+populated with anything that would let it detect the condition
+proactively -- only reactively, after already getting an empty reply.
+
+**This matters directly for the reliability goal this update is about**:
+a coding agent that's actually working (making many tool calls, each with
+this proxy's own internal retry-up-to-3 loop on top) generates exactly the
+kind of request burst that appears to trigger this. Silently returning an
+empty `200 OK` completion in that situation -- which is what this proxy did
+before this fix -- is a serious reliability problem in its own right,
+independent of which tool-calling convention is in use: the agent has no
+way to distinguish "the model had nothing to say" from "you're being
+throttled, stop and back off" if both look like an ordinary empty success.
+
+**Fix implemented**: `_looks_like_throttled_empty_reply(text)` detects a
+whitespace-only reply, and both `_handle_full` and `_handle_streaming` now
+treat that as an error (a `503`/`upstream_throttled` JSON error for the
+non-streaming path; an SSE error event for the streaming path) rather than
+a silent, misleadingly-successful empty completion -- for BOTH the
+tools-present and plain-chat code paths, since the underlying condition
+isn't specific to tool-calling at all.
+
+### Still to do in this update (tracked here, completed in the next dated section)
+
+- Live end-to-end validation against the real OpenCode, native-mode
+  OpenHands CLI, and native-mode Goose CLI, once the account-level
+  throttling above clears enough to run them without immediately hitting
+  it again -- this is the actual deliverable this investigation is for,
+  and the synthetic A/B data above, while a real and useful signal, is not
+  a substitute for it (see this document's own repeated emphasis
+  elsewhere on confirming things against real clients, not just curl).
+  **Status when this was committed**: the throttling had not cleared after
+  ~30 minutes of intermittent checking (a single plain tools-free chat
+  turn was used as the least-intrusive possible probe, spaced minutes
+  apart specifically to avoid extending the throttle further by
+  generating more load while checking on it). Rather than continuing to
+  block indefinitely on an upstream condition with an unknown clear time,
+  this was shipped as a real, honestly-labeled in-progress PR with strong
+  synthetic evidence and a documented, code-reviewable design, and the
+  live CLI re-validation is being completed as a follow-up once the
+  account recovers -- check the git history / PR conversation after this
+  commit for whether that follow-up has landed.
 
 
 
