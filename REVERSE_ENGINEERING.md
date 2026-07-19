@@ -36,13 +36,28 @@ sections below are where that lives.
   key, then AES-GCM with a fixed all-zero IV — **not** raw AES-GCM with the
   base key directly, which is why early brute-force attempts at this failed.
   See the "MSAL localStorage cache-encryption algorithm — SOLVED" section.
-- **Multi-turn conversation**: implemented via context-stuffing (the full
-  `messages` array is rendered into one text blob per Chathub turn) rather
-  than server-side `ConversationId` reuse — see the "goal re-scoped to
-  'drive a coding agent'" update near the end of this document. Whether
-  Sydney would honor a *resumed* `ConversationId` at all remains genuinely
-  unexplored (every capture so far is a brand-new single-turn conversation);
-  whether `msal.cache.encryption` is `HttpOnly` is also still unconfirmed.
+- **Multi-turn conversation**: now Sydney-native where possible, with
+  context-stuffing kept as the automatic fallback — see the "Sydney-native
+  conversation continuity" update near the end of this document. A live
+  probe confirmed reusing a prior call's `ConversationId` on a brand-new,
+  independent Chathub WebSocket connection gets a reply demonstrating real
+  server-side memory of that prior call, with no history resent; a control
+  turn on a fresh `ConversationId` correctly showed none. `m365_openai_proxy.py`
+  now recognizes when an incoming request's `messages[]` array is an exact
+  continuation of a conversation it already relayed and, in that case, sends
+  only the newest message on the reused `ConversationId` instead of
+  re-rendering and resending the whole growing transcript every time
+  (`ConversationSessionStore`). Whether `msal.cache.encryption` is
+  `HttpOnly` is still unconfirmed.
+- **Sydney's own rate limiting has a failure mode this proxy didn't handle
+  until now**: a throttled turn ("We're temporarily unable to respond to
+  this volume of requests. Please try again later.") arrives as a `bot`
+  message with `turnState: "Failed"` inside a `type:2` (StreamItem) frame —
+  NOT via the normal `type:1`/`target:"update"` streaming path — so it used
+  to be silently swallowed, completing as an empty but ostensibly
+  successful reply. `stream_chat_reply()` now recognizes this shape and
+  raises `ThrottledError` instead. Found by accident while live-testing the
+  conversation-continuity feature above (see that section).
 - **Tool-calling bridge (Local MCP)**: Sydney/Chathub has a real, concrete
   mechanism for invoking Model Context Protocol tools from the client side —
   `mcp_discover`/`mcp_describe`/`invoke_local_plugin` SignalR invocation
@@ -2228,6 +2243,208 @@ isn't specific to tool-calling at all.
   live CLI re-validation is being completed as a follow-up once the
   account recovers -- check the git history / PR conversation after this
   commit for whether that follow-up has landed.
+
+## Update: Sydney-native conversation continuity -- live-confirmed and implemented
+
+Every update above accepted, as a settled design decision, that "whether
+Sydney would honor a *resumed* `ConversationId` at all remains genuinely
+unexplored" (see the "goal re-scoped" update) and built multi-turn support
+entirely on context-stuffing instead. This update actually tested that
+open question live, got a clear answer, and implemented a Sydney-native
+mode on top of it.
+
+### The probe
+
+`experiments/probe_conversation_reuse.py` (not part of the shipped proxy --
+an ad-hoc script kept for anyone who wants to re-run or extend this test)
+does the following against the real backend, using this repo's own
+already-configured credentials:
+
+1. Mints one `ConversationId`, then opens a Chathub WebSocket (fresh
+   `session_id`, fresh trace/request ids -- exactly what a brand-new
+   independent `/v1/chat/completions` HTTP request would do) and sends a
+   turn teaching a synthetic secret word ("For this conversation only, the
+   secret code word is 'zylophant-47'..."), with `isStartOfSession: true`.
+   Closes that connection once the reply completes.
+2. Opens a **second, completely independent** WebSocket -- new `session_id`,
+   new trace/request ids, `isStartOfSession: false` -- reusing the exact
+   same `ConversationId` from step 1. Sends: "Without me repeating it: what
+   was the secret code word I told you a moment ago in this same
+   conversation?" No history is resent at all -- the ENTIRE turn 1 exchange
+   is absent from this request's `message.text`.
+3. As a control, opens a **third** independent WebSocket with a **brand-new**
+   `ConversationId` and sends the identical question from step 2.
+
+### The result (live transcript, run against a real M365 Copilot account)
+
+```
+--- turn 1 (new WS #1, isStartOfSession=True): teach the secret word ---
+bot reply:
+Noted: the conversation-only code word is "zylophant-47."
+
+--- turn 2 (BRAND NEW WS #2, same ConversationId, isStartOfSession=False) ---
+bot reply:
+The code word was zylophant-47.
+
+--- control turn (BRAND NEW WS #3, BRAND NEW ConversationId) ---
+bot reply:
+You haven't told me any secret code word in this conversation.
+The only message from you in this chat is the question asking me to recall
+it, so there is no code word for me to retrieve. If you mentioned one in a
+different conversation, I don't have access to that conversation's contents.
+```
+
+Turn 2 recalled the secret word with zero history resent; the control turn,
+differing ONLY in using a fresh `ConversationId`, correctly showed no
+knowledge at all. This settles the open question: **Sydney's conversation
+memory is keyed server-side on `ConversationId` itself, not on keeping one
+WebSocket connection alive or on the client resending history.** It survives
+a completely new WebSocket connection with new session/trace/request ids.
+Not yet tested: how long this memory persists (minutes? hours? indefinitely
+until some quota?), whether it survives an access-token refresh mid-
+conversation (shouldn't matter -- `ConversationId` and the bearer token are
+independent query params), or whether Sydney enforces any conversation-count
+limit per account that this would now bump into faster.
+
+### What was implemented on top of this
+
+`m365_openai_proxy.py` now has a `ConversationSessionStore` (see its
+docstring, and the "Sydney-native conversation continuity" section comment
+above `_conversation_fingerprint`) that recognizes when an incoming
+`/v1/chat/completions` request is an exact continuation of a conversation
+this proxy already relayed -- fingerprinting the `messages[]` array itself,
+since the OpenAI API is stateless and gives this proxy nothing else to key
+on. A request counts as a continuation exactly when its `messages[:-1]`
+matches (in the fields that matter) some earlier request's `messages[]`
+PLUS the assistant reply this proxy returned for it -- i.e. the client did
+exactly what every OpenAI-style client already does: took the previous
+response, appended it to the transcript, appended one new turn, and resent
+the whole thing. When that's recognized, only the newest message is sent to
+Sydney on the reused `ConversationId`, instead of `_render_conversation_
+prompt()`'s full-transcript context-stuffing.
+
+Key design choices, and why:
+
+- **Deliberately restricted to requests with no `tools`.** The tool-calling
+  emulation is already probabilistic on its own (see the "tool-calling
+  emulation" update); reusing a live Sydney conversation underneath it too
+  would add a second, untested axis of uncertainty (does Sydney's memory of
+  the injected tool schema survive turn-to-turn as reliably as its memory of
+  ordinary dialogue?) to a feature that's already roughly a coin flip. Kept
+  mutually exclusive with continuity for now -- worth its own live A/B
+  trial before combining them.
+- **Always falls back safely.** A cache miss for any reason (first turn,
+  edited/reordered history, `tools` present, a different credential, or
+  this process having restarted -- the store is in-memory only, never
+  persisted) just costs one extra context-stuffed turn on a brand-new
+  `ConversationId`, identical to this proxy's behavior before this feature
+  existed. A false positive (treating two different conversations as the
+  same one) would be the actually unsafe failure mode, which is why
+  `_conversation_fingerprint()` is deliberately strict (hashes role, name,
+  text, `tool_calls`, and `tool_call_id` for every message, in order).
+- **Tracked sessions are single-use -- a real bug this caught during
+  development, not just defensive programming.** The first implementation
+  had `ConversationSessionStore.lookup()` merely READ the matching entry,
+  leaving it in place for future lookups too. `experiments/
+  test_continuity_offline.py`'s "branch" case (send turn 1, then two
+  DIFFERENT possible turn 2's from the same point) caught this immediately:
+  both turn-2 variants matched the same cached entry and both reused the
+  same `ConversationId` -- but Sydney's own conversation state is one
+  linear, mutable timeline, so whichever branch got there SECOND would
+  actually be talking to a Sydney conversation whose real server-side
+  history now also contains the FIRST branch's turn, a turn that branch's
+  own local `messages[]` array knows nothing about. That's silent cross-
+  branch information leakage into a reply, not just a wasted optimization
+  -- exactly the kind of false positive the design was supposed to avoid,
+  just from staleness rather than hash collision. Fixed by making
+  `lookup()` POP the matching entry (see `ConversationSessionStore`'s
+  docstring): the first branch to arrive gets the fast path, any other
+  branch from the same point gets a clean cache miss and falls back to a
+  brand-new conversation. Caught by an offline, network-free test built
+  specifically to validate this feature's control flow without spending
+  Sydney's own live quota -- see "A third, self-referential finding" below
+  for why that test existed in the first place.
+- **A continuation that fails still gets one recovery attempt.** For
+  non-streaming requests, a Chathub turn that fails on a reused
+  `ConversationId` forgets that cached session and transparently retries
+  once as a brand-new, fully context-stuffed conversation before surfacing
+  an error to the client (`_run_plain_turn`). Streaming requests can't
+  safely do this once any delta has already been flushed to the client, so
+  they only forget the stale session (so the client's own next attempt gets
+  a clean cache miss) rather than retrying in place.
+- **`--disable-conversation-continuity`** is the escape hatch back to the
+  old always-context-stuff behavior, in keeping with this project's general
+  pattern of operator-controlled flags for anything that changes live
+  backend behavior.
+
+### A second, unrelated bug found by accident while live-testing this
+
+While running the probe and the modified proxy's real HTTP server back to
+back (several Chathub turns in a short window), Sydney's own rate limiting
+kicked in -- and exposed a pre-existing gap that had nothing to do with
+conversation continuity. Dumping raw frames for a throttled turn
+(`experiments/dump_frames.py`) showed:
+
+```json
+{"type": 2, "invocationId": "0", "item": {"messages": [
+  {"text": "Reply with exactly: hello world", "author": "user", ...},
+  {"text": "We're temporarily unable to respond to this volume of requests. Please try again later.",
+   "turnState": "Failed", "author": "bot", "contentOrigin": "BotConnection", ...}
+]}}
+```
+
+This refusal message arrives inside a `type:2` (StreamItem) frame's
+`item.messages[]` -- a frame `stream_chat_reply()` had always ignored
+entirely (the old comment called it just "StreamItem echo of our own
+message"). The normal `type:1`/`target:"update"` path this function relies
+on for the bot's reply never carries this text at all when the turn is
+refused this way. Net effect, confirmed against BOTH the unmodified
+pre-existing proxy and this update on the same rate-limited account: a
+throttled turn silently completed as a normal, successful, EMPTY chat
+completion (`"content": ""`, `finish_reason: "stop"`, HTTP 200) -- no error,
+no indication anything went wrong, which is about the worst possible shape
+for an agent loop to receive (indistinguishable from "the model chose to
+say nothing"). `stream_chat_reply()` now checks `type:2` frames for a `bot`
+message with `turnState: "Failed"` (only when no reply text has streamed
+yet, so a normal completed turn's own trailing StreamItem echo is never
+mistaken for a failure) and raises a new `ThrottledError` instead, which
+surfaces as a normal HTTP 502 with Sydney's own refusal text as the error
+message. `ConversationSessionStore`'s retry logic deliberately does NOT
+retry a `ThrottledError` in place (see `_run_plain_turn`) -- the backend is
+over capacity, not upset with a specific `ConversationId`, so an immediate
+retry on a fresh conversation would just burn a second doomed call instead
+of surfacing the real, actionable reason to the client.
+
+### A third, self-referential finding: this update's own live testing got rate-limited
+
+Once `stream_chat_reply()`'s throttle handling above made the failure mode
+visible instead of silent, it became clear that the account used for all
+this live testing (the probe, `dump_frames.py`, and manual HTTP checks
+against the running proxy -- maybe a dozen real Chathub turns in a short
+span) had tripped Sydney's own "too much volume" limit, and it did not
+clear within several minutes of waiting between checks. Rather than keep
+spending live quota chasing a second confirmation of the HTTP-layer wiring
+(the core mechanism -- reusing a `ConversationId` across independent
+WebSocket connections -- was already conclusively confirmed by the probe
+in the section above), the rest of the `ConversationSessionStore`/
+`_plan_chat_turn`/`_run_plain_turn`/`_stream_plain_turn` wiring was instead
+validated with `experiments/test_continuity_offline.py`: a real HTTP
+server (`_LoggingHTTPServer` + `make_handler`), with `run_chat_turn`
+monkeypatched to a fake, network-free stand-in, driven by real
+`urllib.request` POSTs. This spends zero Sydney quota and, per the "single-
+use" bug above, is what actually caught the one real bug in this feature
+during development -- a case the live probe (single linear conversation,
+no branching) would never have exercised at all.
+
+This is, unintentionally, a small real-world demonstration of exactly the
+problem this whole update addresses: an agent hammering `/v1/chat/
+completions` in a tight loop can and will run into Sydney's own rate
+limiting, and until the `ThrottledError` fix above, this proxy gave that
+agent no way to tell "Sydney is temporarily refusing requests, back off and
+retry" apart from "the model produced an empty response, must have been
+its plain judgement" -- a distinction that matters a great deal to any
+agent loop deciding what to do next.
+
 
 
 
