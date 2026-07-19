@@ -1,3 +1,40 @@
+[project]
+name = "m365-openai-proxy"
+version = "0.0.0"
+description = "An OpenAI-compatible proxy for Microsoft 365 Copilot, shipped as a single stdlib-only Python file."
+readme = "README.md"
+requires-python = ">=3.11"
+# The shipped proxy (m365_openai_proxy.py) has NO runtime dependencies, by
+# design -- it is pure Python standard library so it can be dropped onto any
+# machine with a Python 3 interpreter and run with nothing to install. Keep
+# this list empty forever (see AGENTS.md).
+dependencies = []
+
+[dependency-groups]
+# Developer-only tooling, managed by uv (`uv sync`). NONE of this is required
+# to run the proxy -- it is the "workshop" around the stdlib-only deliverable:
+# the test suite, the linter/formatter, and the security scanner CI runs.
+# Exact versions are pinned in uv.lock (`uv sync` / `uv run`).
+dev = [
+    "pytest>=8",
+    "ruff>=0.14",
+    "bandit>=1.9",
+]
+
+[tool.uv]
+# There is nothing to build here -- the product is a single script, not an
+# installable package. Treat this as a virtual project so `uv sync` only
+# manages the dev tooling and never tries to build/install m365_openai_proxy.
+package = false
+
+[tool.pytest.ini_options]
+# Put the repo root on sys.path so the offline tests can
+# `import m365_openai_proxy` directly (the proxy lives at the repo root as a
+# single file, not under a package). `tests/` holds the network-free suite;
+# `scripts/` holds live, credential-requiring probes that are NOT tests.
+pythonpath = ["."]
+testpaths = ["tests"]
+
 [tool.bandit]
 # This project is a single stdlib-only script (see README) -- there is no
 # build system here, this file exists solely to hold bandit's config.

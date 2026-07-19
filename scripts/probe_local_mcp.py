@@ -34,7 +34,7 @@ Env flags (all optional; default = closest-to-browser):
   PROBE_NO_EXTRA=1               do NOT append the extra MCP variants to URL
   PROBE_PROMPT=invoke|<text>     override the user turn (default = enumerate)
 
-NOT part of the shipped proxy. Run directly:  python3 experiments/probe_local_mcp.py
+NOT part of the shipped proxy. Run directly:  python3 scripts/probe_local_mcp.py
 """
 
 import json

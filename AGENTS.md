@@ -26,8 +26,8 @@ Concretely, inside `m365_openai_proxy.py`:
 - If a feature genuinely cannot be done in stdlib, that is a signal the feature
   does not belong *in the proxy* — see the next section.
 - Keep it a single file. Do not split the proxy into a package/modules.
-- The supported interpreter range is **Python 3.9–3.13** (see CI). Don't use
-  syntax/stdlib newer than 3.9 supports.
+- The supported interpreter range is **Python 3.11–3.13** (see CI). Don't use
+  syntax/stdlib newer than 3.11 supports.
 
 If you are ever tempted to add a dependency to the proxy: **don't.** Either
 implement it in stdlib, or move it out of the proxy (below).
@@ -37,45 +37,52 @@ implement it in stdlib, or move it out of the proxy (below).
 The single-file, stdlib-only rule applies **only to the shipped
 `m365_openai_proxy.py`**. All the scaffolding around it is unrestricted:
 
-- **Tests, experiments, and dev/investigation scripts** (`experiments/…`) may
-  `uv`/`pip install` and import **any** third-party library — pytest, real MCP
-  SDKs, HTTP clients, whatever helps. They are developer tools, are **not part
-  of the shipped proxy**, and are never required to run it. They may import the
-  proxy as a module (`import m365_openai_proxy as proxy`) to exercise its
-  internals, and may stub/monkeypatch it (see the `test_*_offline.py` scripts).
+- **The test suite** (`tests/…`, run with `pytest`) and **dev/investigation
+  scripts** (`scripts/…`) may `uv`/`pip install` and import **any** third-party
+  library — pytest, real MCP SDKs, HTTP clients, whatever helps. They are
+  developer tools, are **not part of the shipped proxy**, and are never
+  required to run it. They import the proxy as a module
+  (`import m365_openai_proxy as proxy`) to exercise its internals, and may
+  stub/monkeypatch it (see the offline suite under `tests/`). The dev tooling
+  is managed with **uv** (`uv sync` / `uv run …`); see `pyproject.toml`'s
+  `[dependency-groups] dev` and `uv.lock`.
 - **CI and local dev tooling** (ruff, bandit, coverage, etc.) are installed
   freely — see `.github/workflows/ci.yml`.
 - Prefer this split deliberately: when something useful needs a real library
   (e.g. a mock MCP server subprocess, a fuzzer, a load-test harness), build it
-  under `experiments/` with whatever deps it wants, and keep the proxy pristine.
+  under `tests/` (if it's an automated test) or `scripts/` (if it's a manual
+  probe) with whatever deps it wants, and keep the proxy pristine.
 
 Rule of thumb: **the proxy is the deliverable and stays dependency-free; the
 tooling is a workshop and can use any tool in the shed.**
 
 ## What CI enforces (make it green locally before pushing)
 
-`.github/workflows/ci.yml` runs, on every PR:
+`.github/workflows/ci.yml` runs, on every PR (dev tooling via **uv**):
 
-1. **Lint** — `ruff check .`
-2. **Format** — `ruff format --check .`
-3. **Security** — `bandit -c pyproject.toml m365_openai_proxy.py`
+1. **Lint** — `uv run ruff check .`
+2. **Format** — `uv run ruff format --check .`
+3. **Security** — `uv run bandit -c pyproject.toml m365_openai_proxy.py`
    (config + skip rationale live in `pyproject.toml`'s `[tool.bandit]`; suppress
    any true positive inline with `# nosec BXXX: <reason>`, not by widening the
    global skips).
-4. **Smoke test** — byte-compile + a `--help` run (which imports the module and
-   so exercises the pure-Python AES self-check) on **Python 3.9–3.13** on
-   Linux, and 3.9 + 3.13 on macOS and Windows.
+4. **Tests** — `uv run pytest` on **Python 3.11–3.13**.
+5. **Smoke test** — byte-compile + a `--help` run (which imports the module and
+   so exercises the pure-Python AES self-check) on **Python 3.11–3.13** on
+   Linux, and 3.11 + 3.13 on macOS and Windows. This job uses a bare
+   interpreter (no uv, no `pip install`) to prove the proxy runs with nothing
+   installed.
 
 Run the same locally before pushing (this order — format, then lint, then
 compile, then tests):
 
 ```bash
-ruff format .
-ruff check .
+uv run ruff format .
+uv run ruff check .
+uv run bandit -c pyproject.toml m365_openai_proxy.py
 python3 -m py_compile m365_openai_proxy.py
 python3 m365_openai_proxy.py --help >/dev/null      # imports module + AES self-check
-# offline (no-network) tests -- run from the repo root:
-for t in experiments/test_*_offline.py; do python3 "$t"; done
+uv run pytest                                       # offline (no-network) suite
 ```
 
 `CodeQL` also runs (`.github/workflows/codeql.yml`).
@@ -107,7 +114,12 @@ metadata. Preserve this when editing.
   (Chathub/SignalR wire format, FOCI/MSAL auth chain, cache-encryption, the
   Local MCP tool-calling bridge findings, etc.). Keep new protocol findings
   here.
-- `experiments/` — developer-only scripts and offline tests (may use any deps).
+- `tests/` — the offline (network-free) `pytest` suite (may use any deps);
+  `conftest.py` holds the shared fixtures.
+- `scripts/` — developer-only live probes needing real credentials/network
+  (may use any deps); **not** run in CI.
 - `README.md` — user-facing usage and the compatibility/limitations picture.
-- `pyproject.toml` — exists solely to hold the `bandit` config (no build
-  system; there is nothing to build).
+- `pyproject.toml` — project metadata, the uv-managed `[dependency-groups] dev`
+  tooling, and the `pytest` + `bandit` config. There is no build system; the
+  product is a single script, so `[tool.uv] package = false`.
+- `uv.lock` — the pinned dev-tooling lockfile (committed).

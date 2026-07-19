@@ -9,6 +9,9 @@ request-curl.sh
 __pycache__/
 *.pyc
 
+# uv-managed dev virtualenv (the tooling "workshop"; never the shipped proxy)
+.venv/
+
 # Live credentials for manual testing -- never commit these
 .refresh_token
 *.token
