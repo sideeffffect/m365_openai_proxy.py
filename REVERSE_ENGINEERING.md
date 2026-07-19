@@ -2217,7 +2217,7 @@ throttled, stop and back off" if both look like an ordinary empty success.
 
 **Fix implemented**: `_looks_like_throttled_empty_reply(text)` detects a
 whitespace-only reply, and both `_handle_full` and `_handle_streaming` now
-treat that as an error (a `503`/`upstream_throttled` JSON error for the
+treat that as an error (a `429`/`upstream_throttled` JSON error for the
 non-streaming path; an SSE error event for the streaming path) rather than
 a silent, misleadingly-successful empty completion -- for BOTH the
 tools-present and plain-chat code paths, since the underlying condition
@@ -2408,8 +2408,10 @@ say nothing"). `stream_chat_reply()` now checks `type:2` frames for a `bot`
 message with `turnState: "Failed"` (only when no reply text has streamed
 yet, so a normal completed turn's own trailing StreamItem echo is never
 mistaken for a failure) and raises a new `ThrottledError` instead, which
-surfaces as a normal HTTP 502 with Sydney's own refusal text as the error
-message. `ConversationSessionStore`'s retry logic deliberately does NOT
+surfaces as an HTTP 429/`upstream_throttled` error with Sydney's own
+refusal text as the error message (the same shape as the
+empty-reply-based throttle detection, so clients see one uniform signal
+for "back off and retry" regardless of which form the throttle takes). `ConversationSessionStore`'s retry logic deliberately does NOT
 retry a `ThrottledError` in place (see `_run_plain_turn`) -- the backend is
 over capacity, not upset with a specific `ConversationId`, so an immediate
 retry on a fresh conversation would just burn a second doomed call instead

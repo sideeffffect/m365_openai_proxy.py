@@ -413,7 +413,7 @@ KNOWN LIMITATIONS
   with `tools`. It did not clear within 45 seconds, only after several
   minutes. `_looks_like_throttled_empty_reply()` detects this and both
   `_handle_full`/`_handle_streaming` now surface it as an explicit error
-  (a `503`/`upstream_throttled` JSON error, or an SSE error event for
+  (a `429`/`upstream_throttled` JSON error, or an SSE error event for
   streaming) instead of a silent `200`-with-empty-content response that
   would otherwise be indistinguishable from "the model genuinely answered
   with nothing." If you hit this, back off for a few minutes before
@@ -498,7 +498,7 @@ import uuid
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.7"
+PROXY_VERSION = "0.8"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -3399,9 +3399,10 @@ def make_handler(token_cache, conversation_sessions):
                         # raising here (rather than emitting a fake
                         # successful empty completion) routes this into the
                         # `except Exception` handler below, which surfaces
-                        # it as a proper SSE error event instead of a silent
+                        # it as a proper SSE error event (type
+                        # `upstream_throttled`) instead of a silent
                         # "the assistant said nothing" success.
-                        raise ProtocolError(
+                        raise ThrottledError(
                             "Sydney returned a completely empty reply -- this "
                             "usually means Microsoft is temporarily throttling "
                             "this account after a burst of requests; wait a "
@@ -3424,7 +3425,7 @@ def make_handler(token_cache, conversation_sessions):
                         # _looks_like_throttled_empty_reply's docstring for
                         # why this is treated as an error, not a valid
                         # (if terse) empty answer.
-                        raise ProtocolError(
+                        raise ThrottledError(
                             "Sydney returned a completely empty reply -- this "
                             "usually means Microsoft is temporarily throttling "
                             "this account after a burst of requests; wait a "
@@ -3459,7 +3460,12 @@ def make_handler(token_cache, conversation_sessions):
                 logging.exception(
                     "chat completion (streaming) %s failed", completion_id
                 )
-                err = {"error": {"message": str(e), "type": "proxy_error"}}
+                err_type = (
+                    "upstream_throttled"
+                    if isinstance(e, ThrottledError)
+                    else "proxy_error"
+                )
+                err = {"error": {"message": str(e), "type": err_type}}
                 try:
                     self.wfile.write(f"data: {json.dumps(err)}\n\n".encode("utf-8"))
                     self.wfile.flush()
@@ -3476,6 +3482,14 @@ def make_handler(token_cache, conversation_sessions):
                     )
                 else:
                     text, tool_calls = self._run_plain_turn(plan), []
+            except ThrottledError as e:
+                # Sydney explicitly refused the turn with its own rate-limit
+                # message -- surface it as 429 (Too Many Requests), the code
+                # OpenAI clients/SDKs already know to back off and retry on,
+                # matching the empty-reply throttle detection below.
+                logging.exception("chat completion %s throttled", completion_id)
+                self._error(429, str(e), err_type="upstream_throttled")
+                return
             except Exception as e:
                 # See the comment in _handle_streaming's except clause: broad
                 # on purpose, so any bug still produces a diagnosable log entry.
@@ -3496,7 +3510,7 @@ def make_handler(token_cache, conversation_sessions):
                     completion_id,
                 )
                 self._error(
-                    503,
+                    429,
                     "Sydney returned a completely empty reply. This usually "
                     "means Microsoft is temporarily throttling this account "
                     "after a burst of requests -- wait a bit (a minute or "

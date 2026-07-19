@@ -140,7 +140,10 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   a WebSocket frame shape this proxy silently ignored, so a throttled turn
   used to complete as a normal, empty, HTTP 200 response with no
   indication anything was wrong — now it raises a clear error instead
-  (`ThrottledError`, surfaced as a 502 with Sydney's own refusal text).
+  (`ThrottledError`, surfaced as a 429/`upstream_throttled` with Sydney's
+  own refusal text -- the status code OpenAI clients already back off and
+  retry on; a silent empty reply, the other observed throttle shape, is
+  surfaced the same way).
 - Credential values (especially a plaintext refresh token grabbed from the
   Network tab) can go stale if MSAL rotates them in the background before
   you finish pasting them in — capture the credential files close together
