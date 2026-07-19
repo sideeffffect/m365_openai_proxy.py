@@ -815,7 +815,7 @@ SIGNALR_RS = "\x1e"  # SignalR JSON Hub Protocol record separator
 # proxy's injected tool-calling emulation -- confirmed live during
 # development: a weather question got a flat refusal, and a basic-arithmetic
 # "use the calculator tool" request got silently answered via Sydney's own
-# code interpreter instead of our requested `<tool_call>` convention (see
+# code interpreter instead of our requested `<action_request>` convention (see
 # REVERSE_ENGINEERING.md's "Tool-calling emulation" section). When a request
 # includes `tools`, this proxy asks Sydney with these capabilities stripped,
 # so the model has nothing to reach for except our injected convention.
@@ -1604,6 +1604,17 @@ class TokenCache:
         self._auth = None
 
     def get(self):
+        # The cache check AND the refresh exchange both run while the lock is
+        # held -- not just the final cache write. This is deliberate: an Entra
+        # refresh token is single-use and is invalidated the instant it is
+        # redeemed, so if two request threads (this is a ThreadingHTTPServer)
+        # both slipped past the cache check while it was cold/expired and each
+        # POSTed the same refresh token, the second redemption would come back
+        # as `invalid_grant` and that request would fail. Holding the lock
+        # across the exchange serializes it: the first thread to find the
+        # cache cold refreshes while any others wait on the lock, and each of
+        # those then re-checks the fast path below and reuses the token the
+        # first thread just cached, rather than re-redeeming a now-dead one.
         with self._lock:
             if self._auth and self._auth.expires_at - 60 > time.time():
                 logging.debug(
@@ -1613,60 +1624,59 @@ class TokenCache:
                 )
                 return self._auth
 
-        logging.info(
-            "cached Sydney access token missing or near expiry; exchanging refresh token"
-        )
-        refresh_token = self.store.current()
-        body = exchange_refresh_token(
-            refresh_token, oid=self.store.oid_hint, tid=self.store.tid_hint
-        )
-
-        new_rt = body.get("refresh_token")
-        if new_rt:
-            self.store.rotate(new_rt)
-
-        access_token = body.get("access_token")
-        if not access_token:
-            # Deliberately log/raise only `body`'s KEYS, never its values --
-            # `body` can itself contain a fresh access_token/refresh_token/
-            # id_token even in this "missing access_token" branch (e.g. a
-            # differently-shaped response), so including the dict verbatim
-            # here would risk leaking a live credential into the exception
-            # message (and from there, into logs).
-            logging.error(
-                "token exchange response had no access_token (response keys=%s)",
-                list(body.keys()),
+            logging.info(
+                "cached Sydney access token missing or near expiry; exchanging refresh token"
             )
-            raise AuthError(
-                f"token exchange response had no access_token (response keys={list(body.keys())})"
-            )
-        claims = jwt_claims(access_token)
-        auth = SydneyAuth(
-            access_token=access_token,
-            oid=claims.get("oid"),
-            tid=claims.get("tid"),
-            expires_at=claims.get("exp", time.time() + 300),
-        )
-        if not auth.oid or not auth.tid:
-            # Same reasoning as above: log only the claim NAMES present, not
-            # their values (which can include the signed-in user's email/UPN).
-            logging.error(
-                "access_token was missing oid/tid claims (claims present=%s)",
-                list(claims.keys()),
-            )
-            raise AuthError(
-                f"access_token was missing oid/tid claims (claims present={list(claims.keys())})"
+            refresh_token = self.store.current()
+            body = exchange_refresh_token(
+                refresh_token, oid=self.store.oid_hint, tid=self.store.tid_hint
             )
 
-        logging.info(
-            "Sydney access token acquired: oid=%s tid=%s expires_in=%ss",
-            auth.oid,
-            auth.tid,
-            body.get("expires_in", "?"),
-        )
-        with self._lock:
+            new_rt = body.get("refresh_token")
+            if new_rt:
+                self.store.rotate(new_rt)
+
+            access_token = body.get("access_token")
+            if not access_token:
+                # Deliberately log/raise only `body`'s KEYS, never its values --
+                # `body` can itself contain a fresh access_token/refresh_token/
+                # id_token even in this "missing access_token" branch (e.g. a
+                # differently-shaped response), so including the dict verbatim
+                # here would risk leaking a live credential into the exception
+                # message (and from there, into logs).
+                logging.error(
+                    "token exchange response had no access_token (response keys=%s)",
+                    list(body.keys()),
+                )
+                raise AuthError(
+                    f"token exchange response had no access_token (response keys={list(body.keys())})"
+                )
+            claims = jwt_claims(access_token)
+            auth = SydneyAuth(
+                access_token=access_token,
+                oid=claims.get("oid"),
+                tid=claims.get("tid"),
+                expires_at=claims.get("exp", time.time() + 300),
+            )
+            if not auth.oid or not auth.tid:
+                # Same reasoning as above: log only the claim NAMES present, not
+                # their values (which can include the signed-in user's email/UPN).
+                logging.error(
+                    "access_token was missing oid/tid claims (claims present=%s)",
+                    list(claims.keys()),
+                )
+                raise AuthError(
+                    f"access_token was missing oid/tid claims (claims present={list(claims.keys())})"
+                )
+
+            logging.info(
+                "Sydney access token acquired: oid=%s tid=%s expires_in=%ss",
+                auth.oid,
+                auth.tid,
+                body.get("expires_in", "?"),
+            )
             self._auth = auth
-        return auth
+            return auth
 
 
 # ==============================================================================
@@ -2049,7 +2059,7 @@ def _neutralize_tool_word(text):
 
 
 def _extract_tool_calls(reply_text):
-    """Parses `reply_text` for this proxy's `<tool_call>{...}</tool_call>`
+    """Parses `reply_text` for this proxy's `<action_request>{...}</action_request>`
     convention (see `_render_tools_block`). Returns `(remaining_text,
     tool_calls)`: `tool_calls` is a list of `{"id", "name", "arguments_json"}`
     dicts (already carrying a synthesized OpenAI-style call id and a

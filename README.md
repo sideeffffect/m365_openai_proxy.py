@@ -271,9 +271,13 @@ FOCI token-family auth chain, the MSAL cache-encryption algorithm, etc).
 
 ## Requirements
 
-Python 3 standard library only, no third-party packages. Developed and
-tested against Python 3.12; no version-specific stdlib features are
-knowingly used, but only 3.12 has been verified.
+Python 3 standard library only, no third-party packages. CI smoke-tests
+this script (byte-compile, plus a `--help` run that imports the module and
+so exercises the pure-Python AES-256-GCM self-check) on Python 3.9 through
+3.13 on Linux, and on the oldest and newest of those (3.9 and 3.13) on
+macOS and Windows as well. Functional end-to-end use — which needs live
+Microsoft credentials and so can't run in CI — was developed and verified
+against Python 3.12.
 
 ## License
 
