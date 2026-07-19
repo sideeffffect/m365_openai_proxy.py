@@ -175,24 +175,61 @@ will actually work:
 
 - **[OpenHands CLI](https://docs.openhands.dev/)** — **the recommended way
   to use this proxy with an agentic coding CLI, via its own client-side
-  "mock function calling" mode rather than this proxy's `tools` emulation.**
-  OpenHands' SDK has a `native_tool_calling=False` flag on its `LLM` config
-  that converts tool schemas to text in the prompt itself and parses the
-  reply back into real tool calls **entirely on the OpenHands side** —
-  it sends this proxy plain `messages` with no `tools` field at all, so
-  this proxy's own probabilistic emulation never even runs. Tested
-  end-to-end: **3 out of 3 full sessions succeeded**, each one genuinely
-  reading and editing a real file via real tool calls and verified correct
-  on disk every time — confirmed via the proxy's own log that every request
-  across all three sessions carried `tools=0`. This is dramatically more
-  reliable than either this proxy's own emulation (a roughly-coin-flip
-  per-attempt rate) or OpenHands' *native* tool-calling mode (the default,
-  tested separately at 1 of 2 sessions succeeding). See
-  REVERSE_ENGINEERING.md's "OpenHands mock function calling" section for
-  the exact setup — the OpenHands CLI package doesn't expose this flag
-  through its normal settings/env-var surface, so it requires directly
-  seeding a persisted `agent_settings.json` with the flag set — and the
-  full trial data.
+  "mock function calling" mode rather than this proxy's `tools` emulation —
+  but not unconditionally reliable; read the caveat below before depending
+  on it for real debugging work.** OpenHands' SDK has a
+  `native_tool_calling=False` flag on its `LLM` config that converts tool
+  schemas to text in the prompt itself and parses the reply back into real
+  tool calls **entirely on the OpenHands side** — it sends this proxy
+  plain `messages` with no `tools` field at all, so this proxy's own
+  probabilistic emulation never even runs.
+
+  An initial test succeeded 3 of 3 sessions. A much larger, deliberately
+  adversarial follow-up load test (26 full sessions across 7 batches —
+  single-file edits, multi-step tasks requiring a `terminal` verification
+  step, multi-file edits, three genuinely concurrent sessions against the
+  same proxy instance, and an iterative debug loop) found:
+  - **17 of 17 (100%) succeeded** on ordinary implement/edit/verify task
+    shapes — single edits, edit-then-verify chains, multi-file edits, and
+    concurrent sessions all passed completely, each independently verified
+    by inspecting the actual file(s) on disk afterward (not just trusting
+    the agent's own summary). Confirmed via the proxy's own log that every
+    one of the 88 requests these sessions generated carried `tools=0`, with
+    zero proxy-side exceptions.
+  - **Only 1 of 9 (11%) succeeded on a specific, now-reproduced task
+    shape**: asking the model to review or fix code containing a function
+    whose name contradicts its own behavior (e.g. a `subtract(a, b)` that
+    actually returns `a + b`). This reproduced regardless of how the task
+    was worded, whether a test file was involved, or whether any terminal
+    command was ever run — three independent variations all landed at
+    essentially the same near-total failure rate. The failure mode itself
+    is new and different from anything documented elsewhere in this
+    project: Sydney returns a **completely empty completion** (confirmed
+    directly in the proxy's own log, `reply_length=0 chars`), not a
+    refusal message and not a code-interpreter workaround. **Important
+    caveat found right after this test**: the same account was separately
+    confirmed to hit an explicit, Sydney-labeled volume-based rate limit
+    shortly afterward, and these particular batches ran last in the test
+    session (highest cumulative request count) — so whether the trigger is
+    really "misleadingly-named code" or actually (or also) request-volume
+    throttling that coincided with when these batches happened to run was
+    never isolated. Treat the 17/17-vs-1/9 numbers as real and
+    reproducible, but the specific "misleading function name" explanation
+    as unconfirmed — see REVERSE_ENGINEERING.md's dated "Correction"
+    subsection for the full reasoning.
+
+  **Practical takeaway**: this configuration is genuinely excellent for
+  straightforward "implement this / edit this / verify it" work — the
+  100%-on-17-sessions result is real and reproducible — but treat
+  debugging/bug-fixing workloads specifically as an open reliability risk
+  until this failure mode is better understood, and be aware that heavy
+  request volume against this account can also trigger Sydney's own
+  explicit rate limiting (`"We're temporarily unable to respond to this
+  volume of requests"` — a real, labeled error, not a silent failure) if
+  you run many sessions back-to-back in a short window. See
+  REVERSE_ENGINEERING.md's "OpenHands mock function calling" and "deep,
+  adversarial load-testing" sections for the exact setup, all trial data,
+  and the differential tests plus the volume-confound correction.
 
   If you don't want to go through that persisted-config route, OpenHands'
   *native* tool-calling mode (the default, via `--override-with-envs`
