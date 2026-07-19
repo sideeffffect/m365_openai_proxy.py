@@ -4,20 +4,21 @@ A single, self-contained, stdlib-only Python 3 script that exposes an
 OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`) backed by
 `https://m365.cloud.microsoft`'s Copilot chat backend.
 
-> **Before you integrate this with anything:** each `/v1/chat/completions`
-> call still opens a fresh, brand-new Sydney conversation under the hood —
-> Sydney's own server-side conversation memory is never used. Multi-turn
-> history works by "context-stuffing": the proxy renders the *entire*
-> `messages` array (system prompt + every prior turn) into one text blob
-> and sends that as a single Chathub turn, which is exactly what stateless
-> per-request clients already expect. Tool/function calling (`tools` /
-> `tool_calls`) is now implemented, but it is **emulated by prompting, on
-> a backend with no native concept of it, and it is probabilistic — not a
-> guarantee**. See "Known limitations" before depending on it for a real
-> agent loop. **If your client is OpenHands, prefer its own client-side
-> "mock function calling" mode over this proxy's `tools` emulation — it is
-> dramatically more reliable (3/3 vs. ~coin-flip in testing); see "Using
-> this with a coding agent" below.**
+> **Before you integrate this with anything:** multi-turn conversations now
+> reuse Sydney's own server-side conversation memory when possible (live-
+> confirmed — see REVERSE_ENGINEERING.md's "Sydney-native conversation
+> continuity" section), falling back automatically to the original
+> "context-stuffing" behavior (rendering the *entire* `messages` array into
+> one text blob per Chathub turn) whenever that can't be established —
+> `tools`-using requests always take the context-stuffing path for now (see
+> "Known limitations"). Tool/function calling (`tools` / `tool_calls`) is
+> implemented, but it is **emulated by prompting, on a backend with no
+> native concept of it, and it is probabilistic — not a guarantee**. See
+> "Known limitations" before depending on it for a real agent loop. **If
+> your client is OpenHands, prefer its own client-side "mock function
+> calling" mode over this proxy's `tools` emulation — it is dramatically
+> more reliable (3/3 vs. ~coin-flip in testing); see "Using this with a
+> coding agent" below.**
 
 **Fully self-contained.** The entire project is the one file,
 `m365_openai_proxy.py`. It uses only the Python 3 standard library — no
@@ -82,16 +83,25 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
 
 ## Known limitations
 
-- **Multi-turn memory is context-stuffing, not native Sydney state.** Every
-  call still mints a brand-new Sydney `ConversationId` — this proxy renders
-  the whole incoming `messages` array (system/developer instructions + all
-  prior turns) into one text blob and sends that as a single Chathub turn.
-  This works well for clients that resend their full conversation on every
-  request (Aider does this), but the effective prompt grows with the
-  conversation, so very long sessions may eventually hit whatever
-  context/size limit Sydney enforces (unconfirmed, not surfaced by this
-  proxy). A client expecting genuine server-side thread continuation
-  independent of what it resends will not get that.
+- **Multi-turn memory now prefers Sydney's own native conversation state,
+  with context-stuffing kept as an automatic fallback.** A live experiment
+  confirmed Sydney honors a `ConversationId` reused across a brand-new,
+  independent Chathub WebSocket connection as real server-side conversation
+  memory — see REVERSE_ENGINEERING.md's "Sydney-native conversation
+  continuity" section for the full transcript. When an incoming request's
+  `messages[]` array is recognized as an exact continuation of a
+  conversation this proxy already relayed (and the request has no `tools`
+  — see below), only the newest message is sent on the reused
+  `ConversationId`, instead of re-rendering and resending the whole growing
+  transcript every time. Any time that can't be established with
+  confidence — the first turn of a conversation, edited/branched history,
+  `tools` present, or the proxy having restarted (this is in-memory only,
+  never persisted) — it falls back to the original behavior: render the
+  whole `messages` array into one text blob and send it as a single turn on
+  a brand-new `ConversationId`. This is fully additive: it never changes
+  what a request can produce, only how much has to be resent to get it.
+  Disable it entirely with `--disable-conversation-continuity` if you ever
+  need the old always-context-stuff behavior.
 - **Tool/function calling is emulated by prompting, and is probabilistic.**
   Sydney has no native `tools`/`tool_calls` mechanism at all. When a request
   includes `tools`, this proxy injects plain-text instructions teaching the
@@ -121,9 +131,16 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   counting is implemented.
 - One Chathub WebSocket is opened and closed per HTTP request — no
   connection pooling or reuse.
-- Sydney's own per-conversation rate limiting isn't specially handled or
-  surfaced; if you hit a quota, whatever Sydney returns is passed through
-  as-is.
+- Sydney's own per-conversation rate limiting (the `throttling:
+  {maxNumUserMessagesInConversation, ...}` field) isn't specially handled
+  or surfaced; if you hit that quota, whatever Sydney returns is passed
+  through as-is. Its separate, apparently account/backend-wide "too much
+  volume right now" rate limit IS now surfaced properly, though (found
+  live while testing conversation continuity above): it used to arrive in
+  a WebSocket frame shape this proxy silently ignored, so a throttled turn
+  used to complete as a normal, empty, HTTP 200 response with no
+  indication anything was wrong — now it raises a clear error instead
+  (`ThrottledError`, surfaced as a 502 with Sydney's own refusal text).
 - Credential values (especially a plaintext refresh token grabbed from the
   Network tab) can go stale if MSAL rotates them in the background before
   you finish pasting them in — capture the credential files close together
@@ -263,11 +280,20 @@ invalidates the previous one on each redemption) — the other three files
 are left untouched.
 
 Run `python3 m365_openai_proxy.py --help` for all flags, including
-`--host`/`--port`, `--credentials-prefix`, `--log-file`/`--log-level`.
+`--host`/`--port`, `--credentials-prefix`, `--log-file`/`--log-level`,
+`--disable-conversation-continuity`.
 
 See `REVERSE_ENGINEERING.md` for the full protocol reverse-engineering
 writeup this implementation is based on (Chathub/SignalR wire format, the
 FOCI token-family auth chain, the MSAL cache-encryption algorithm, etc).
+`experiments/` holds small, ad-hoc scripts used while developing the
+Sydney-native conversation continuity feature — `probe_conversation_reuse.py`
+(live-tests against the real backend that a reused `ConversationId` carries
+real server-side memory), `dump_frames.py` (raw SignalR frame dump, used to
+find the rate-limit handling gap), and `test_continuity_offline.py` (a
+network-free test of the HTTP-layer wiring itself, with `run_chat_turn`
+stubbed out — see REVERSE_ENGINEERING.md for what each one found). None of
+them are part of the shipped proxy or required to run it.
 
 ## Requirements
 
