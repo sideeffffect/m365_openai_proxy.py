@@ -2670,6 +2670,82 @@ def _extract_code_mode_calls(reply_text):
     return reply_text, tool_calls
 
 
+#: Matches one `<parameter=security_risk>...` entry inside a client-rendered
+#: (not this proxy's own) `<function=name>...</function>` block -- see
+#: `_scrub_security_risk_param`. Handles both the properly-closed form
+#: (`<parameter=security_risk>LOW</parameter>`) and the form some replies
+#: leave unclosed (relying on the next `<parameter=`/`</function>` as the
+#: implicit boundary), without swallowing the newline that separates it from
+#: a *following* parameter.
+_SECURITY_RISK_PARAM_RE = re.compile(
+    r"\n[ \t]*<parameter=security_risk>"
+    r".*?(?=\n<parameter=|\n</function>|</parameter>)(?:</parameter>)?",
+    re.DOTALL,
+)
+
+
+def _scrub_security_risk_param(text):
+    """Strips any `<parameter=security_risk>...` entry from `text`.
+
+    This proxy doesn't implement or participate in OpenHands' (or any other
+    coding agent's) own prompted, non-native tool-calling convention --
+    `<function=name><parameter=X>value</parameter>...</function>` rendered
+    entirely inside the CLIENT's system prompt and parsed back out of the
+    plain-chat reply by the CLIENT itself, invisible to this proxy (see
+    `_extract_tool_calls`/`_extract_code_mode_calls` for the two conventions
+    this proxy *does* own). But Sydney reliably includes a `security_risk`
+    parameter on every such call -- following the in-context examples baked
+    into the client's own prompt -- and at least one such client's parser
+    hard-rejects it for read-only tools (e.g. `finish`), whose schema never
+    declares it as allowed. That rejection round-trips as a second, fixed-up
+    call plus a visible validation-error message, both landing in the
+    client's transcript as confusing noise on top of the model's own
+    reply. Stripping the parameter here means the client's parser never
+    sees it and never has anything to reject, so the retry (and the noise)
+    never happens. Purely a string-level workaround for one third-party
+    parser's behavior, not a tool-calling convention this proxy speaks."""
+    if "<parameter=security_risk>" not in text:
+        return text
+    return _SECURITY_RISK_PARAM_RE.sub("", text)
+
+
+#: Opening tag of the client-rendered tool-call convention `_scrub_security_
+#: risk_param` cleans up -- see `_plain_reply_deltas`.
+_FUNCTION_CALL_TAG = "<function="
+
+
+def _plain_reply_deltas(deltas):
+    """Wraps a plain-chat (no `tools`) delta generator so an ordinary prose
+    reply keeps streaming incrementally exactly as before, while a reply
+    that turns out to open with a `_FUNCTION_CALL_TAG` block is instead
+    fully buffered and run through `_scrub_security_risk_param` before being
+    emitted as one final chunk -- such a block can't be safely edited until
+    it has fully arrived, the same reason the `tools`-present path below is
+    already fully buffered rather than truly incremental. Peeks at only the
+    first `len(_FUNCTION_CALL_TAG)` characters to decide which mode applies,
+    so ordinary prose pays no more than one short buffering delay before
+    streaming resumes normally."""
+    it = iter(deltas)
+    buffered = ""
+    for delta in it:
+        buffered += delta
+        if len(buffered) >= len(_FUNCTION_CALL_TAG):
+            break
+    else:
+        if buffered:
+            yield buffered
+        return
+
+    if not buffered.lstrip().startswith(_FUNCTION_CALL_TAG):
+        yield buffered
+        yield from it
+        return
+
+    for delta in it:
+        buffered += delta
+    yield _scrub_security_risk_param(buffered)
+
+
 _TOOL_CALL_MAX_ATTEMPTS = 3
 _TOOL_CALL_MODES = ("code", "action_request", "code")
 
@@ -3434,7 +3510,7 @@ def make_handler(token_cache, conversation_sessions):
                         finish_reason = "stop"
                 else:
                     first = True
-                    for delta in self._stream_plain_turn(plan):
+                    for delta in _plain_reply_deltas(self._stream_plain_turn(plan)):
                         emit(
                             {"role": "assistant", "content": delta}
                             if first
@@ -3497,7 +3573,8 @@ def make_handler(token_cache, conversation_sessions):
                         token_cache, plan.messages, plan.tools, plan.tool_choice
                     )
                 else:
-                    text, tool_calls = self._run_plain_turn(plan), []
+                    text = _scrub_security_risk_param(self._run_plain_turn(plan))
+                    tool_calls = []
             except ThrottledError as e:
                 # Sydney explicitly refused the turn with its own rate-limit
                 # message -- surface it as 429 (Too Many Requests), the code
