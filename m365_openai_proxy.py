@@ -254,58 +254,66 @@ KNOWN LIMITATIONS
 - **Tool/function calling is EMULATED and probabilistic, not a guarantee.**
   Sydney has no native OpenAI-style `tools`/`tool_calls` mechanism this proxy
   can use (its real one, Local MCP, is a separate, unimplemented, much
-  harder project -- see below). What this proxy does instead: when a
-  request includes `tools`, it injects a plain-text instructions block
-  (`_render_tools_block()`) teaching the model a fixed textual convention
-  (`<action_request>{"name": ..., "arguments": {...}}</action_request>`)
-  and parses that back out of the reply (`_extract_tool_calls()`) into a
-  real OpenAI `tool_calls` response. This is entirely prompt-level steering
-  with NO formal contract -- live testing during development found:
-    - Sydney's own built-in capabilities (its code interpreter, mainly) very
-      often preempt this convention entirely -- it just tries to satisfy the
-      request itself first, even for things it structurally cannot do (e.g.
-      reading a file from the *user's* machine, which its sandboxed
-      interpreter has no access to).
+  harder project -- see below). This proxy instead teaches the model ONE OF
+  TWO independent textual conventions per attempt, cycling through both
+  across retries (`_TOOL_CALL_MODES`, `_run_tool_call_turn()`), and parses
+  whichever one the model actually used back into a real OpenAI `tool_calls`
+  response:
+    - **"code" mode** (`_render_tools_block_code_mode()` /
+      `_extract_code_mode_calls()`): tells the model its Python execution
+      environment already has one extra function loaded,
+      `invoke_capability(name, arguments)`, and asks it to call it from
+      ordinary code exactly the way it already strongly prefers to solve
+      things -- Sydney's own code interpreter is left ENABLED for this mode
+      (not suppressed) since the whole point is to lean into that habit
+      rather than fight it. The reply is parsed via a real Python AST walk
+      (`ast.parse()` + `ast.literal_eval()`), not a regex, so the model can
+      write whatever ordinary code it wants around the call(s).
+    - **"action_request" mode** (`_render_tools_block()` /
+      `_extract_tool_calls()`): the original convention -- a JSON object
+      wrapped in `<action_request>...</action_request>` tags, with Sydney's
+      own code-interpreter-ish `OPTIONS_SETS` entries and `BingWebSearch`
+      plugin explicitly suppressed so there's nothing else for it to reach
+      for instead.
+  Both remain entirely prompt-level steering with NO formal contract -- live
+  testing during development found:
+    - Neither convention dominates the other in every situation: a small
+      live A/B trial found "code" mode winning heavily on a simple
+      single-capability request (6/6 vs "action_request"'s 0/6 in the same
+      session) but "action_request" doing BETTER at realistic
+      coding-agent scale (4/5 vs "code" mode's 2/5) -- see
+      REVERSE_ENGINEERING.md's "code-mode tool-calling emulation" section
+      for the exact trial data. This is why `_run_tool_call_turn()` cycles
+      through BOTH conventions across its retry attempts rather than
+      retrying one fixed convention -- they appear to fail in different,
+      largely uncorrelated ways (Sydney's own code interpreter
+      self-preempting vs. a flat refusal), so trying the other convention
+      on the next attempt is a meaningfully different roll of the dice, not
+      just "try again and hope."
     - The literal word "tool"/"tools" ANYWHERE in the rendered prompt --
       including in the CLIENT's own system prompt, which this proxy cannot
-      control -- measurably makes this worse. This proxy actively launders
-      that word out of the entire prompt when `tools` is present
-      (`_neutralize_tool_word()`), which helps but does not fix it outright.
-    - Even under the best (simplest, single-capability, word-laundered)
-      conditions measured, the model followed the convention roughly HALF
-      the time on a single attempt. This proxy retries automatically up to
-      3 times per turn (`_run_tool_call_turn()`) when the first attempt
-      doesn't produce a call, which raises the effective success rate
-      substantially -- but retrying costs latency (each attempt is a full
-      Chathub round trip) and still isn't 100%.
-    - Continuing a conversation *after* a tool result required its own fix:
-      naively rendering "the assistant already called X" as a fabricated
-      prior turn reliably triggered a flat refusal on the next reply (a
-      classic prompt-injection SHAPE, even with entirely mundane content).
-      Folding the tool result into the next turn as ordinary user-supplied
-      context instead of a fabricated assistant/tool history entry fixed
-      this specific failure mode.
-  See REVERSE_ENGINEERING.md's "Tool-calling emulation" section for the
-  full trial-by-trial account. **Real end-to-end testing against the actual
-  OpenHands, OpenCode, and Goose CLIs** (not just synthetic curl requests)
-  found a stark asymmetry, documented in REVERSE_ENGINEERING.md's
-  "production-scale end-to-end validation" and "Goose CLI validation"
-  sections: OpenHands CLI achieved one genuine, fully verified success (the
-  agent read a real file, edited it for real via a real tool call, and gave
-  a correct final summary) out of two full sessions tried; OpenCode CLI
-  failed in all three full sessions tried (never once produced a working
-  tool call), even after adding a recency-bias mitigation and raising the
-  retry budget to 5 -- its real system prompt plus full tool schema list
-  runs 30-40KB; Goose CLI failed in all four full sessions tried, across
-  two different tool-count configurations (18 tools -> flat refusal; 5
-  tools -> code-interpreter self-preemption instead), suggesting tool
-  count/prompt size affects *which* avoidance behavior Sydney reaches for
-  without being sufficient on its own to fix the underlying problem. Net
-  assessment, revised in light of this: usable for occasional/low-stakes
-  tool use and has demonstrated real (if unreliable) success with OpenHands
-  specifically, but should NOT be assumed to work with OpenCode or Goose as
-  currently implemented, and NOT be relied on for any long unattended
-  agentic loop regardless of client.
+      control -- measurably makes both conventions worse. This proxy
+      actively launders that word out of the entire prompt when `tools` is
+      present (`_neutralize_tool_word()`), which helps but does not fix it
+      outright.
+    - Continuing a conversation *after* a tool result required its own fix,
+      applying to both conventions: naively rendering "the assistant
+      already called X" as a fabricated prior turn reliably triggered a
+      flat refusal on the next reply (a classic prompt-injection SHAPE,
+      even with entirely mundane content). Folding the tool result into the
+      next turn as ordinary user-supplied context instead of a fabricated
+      assistant/tool history entry fixed this specific failure mode --
+      phrased to match whichever convention that turn is using (see
+      `_fold_pending()`).
+  See REVERSE_ENGINEERING.md's "Tool-calling emulation" and "code-mode
+  tool-calling emulation" sections for the full trial-by-trial account,
+  including real end-to-end testing against the actual OpenHands, OpenCode,
+  and Goose CLIs (not just synthetic curl requests) with the PRIOR
+  ("action_request"-only) design -- see REVERSE_ENGINEERING.md for whether
+  that picture has been re-validated against the current two-convention
+  design by the time you're reading this, since that live re-validation may
+  have been blocked by the Sydney-side request throttling discovered and
+  documented below, and could still be in progress.
 
   **IMPORTANT if your client is OpenHands: prefer OpenHands' own
   client-side "mock function calling" mode over this proxy's emulation
@@ -358,6 +366,24 @@ KNOWN LIMITATIONS
   into a genuine architecture mismatch (Sydney's invocation is synchronous,
   mid-turn, and presumably timeout-bound) that is a substantial separate
   project, not a quick patch, and would sidestep everything above.
+
+- **A completely empty reply from Sydney is treated as an error, not a
+  silent success -- this usually means Microsoft-side request throttling,
+  not that the model had nothing to say.** Discovered during this proxy's
+  own tool-calling A/B testing: after roughly 40-50 requests in a few
+  minutes, Sydney started returning Chathub turns that complete normally
+  (no error, no `AuthError`) but with zero characters of content -- for a
+  PLAIN tools-free chat turn just as much as a tool-calling one, so this is
+  a general Sydney-side behavior, not specific to anything this proxy does
+  with `tools`. It did not clear within 45 seconds, only after several
+  minutes. `_looks_like_throttled_empty_reply()` detects this and both
+  `_handle_full`/`_handle_streaming` now surface it as an explicit error
+  (a `503`/`upstream_throttled` JSON error, or an SSE error event for
+  streaming) instead of a silent `200`-with-empty-content response that
+  would otherwise be indistinguishable from "the model genuinely answered
+  with nothing." If you hit this, back off for a few minutes before
+  retrying -- see REVERSE_ENGINEERING.md's "Sydney-side request throttling"
+  section for the full timeline this was based on.
 
 ------------------------------------------------------------------------------
 REVERSE-ENGINEERING PROVENANCE / CONFIDENCE
@@ -413,6 +439,7 @@ USAGE
 """
 
 import argparse
+import ast
 import base64
 import hashlib
 import hmac
@@ -823,13 +850,17 @@ SIGNALR_RS = "\x1e"  # SignalR JSON Hub Protocol record separator
 # Sydney's own built-in plugins/capabilities (BingWebSearch via the `plugins`
 # field; the code interpreter and image-gen capabilities via `cwc_code_
 # interpreter*`/`flux*`/`gptv*` OPTIONS_SETS entries) reliably preempt this
-# proxy's injected tool-calling emulation -- confirmed live during
+# proxy's "action_request" tool-calling convention -- confirmed live during
 # development: a weather question got a flat refusal, and a basic-arithmetic
 # "use the calculator tool" request got silently answered via Sydney's own
-# code interpreter instead of our requested `<action_request>` convention (see
-# REVERSE_ENGINEERING.md's "Tool-calling emulation" section). When a request
-# includes `tools`, this proxy asks Sydney with these capabilities stripped,
-# so the model has nothing to reach for except our injected convention.
+# code interpreter instead of our requested `<action_request>` convention
+# (see REVERSE_ENGINEERING.md's "Tool-calling emulation" section). When
+# using the "action_request" convention, this proxy asks Sydney with these
+# capabilities stripped, so the model has nothing to reach for except our
+# injected convention. The other convention this proxy can use, "code" mode
+# (see _TOOL_CALL_MODES), does the opposite on purpose -- it LEANS INTO
+# these same capabilities rather than fighting them, so it does NOT use this
+# list; see _render_tools_block_code_mode's docstring.
 TOOL_MODE_OPTIONS_SETS = [
     o
     for o in OPTIONS_SETS
@@ -1778,22 +1809,26 @@ def send_chat_message(
     locale="en-US",
     timezone="UTC",
     timezone_offset=0,
-    tools_requested=False,
+    tool_mode=None,
 ):
     trace_id = str(uuid.uuid4())
     logging.info(
-        "sending chat message: session_id=%s trace_id=%s text_length=%d chars locale=%s tools_requested=%s",
+        "sending chat message: session_id=%s trace_id=%s text_length=%d chars locale=%s tool_mode=%s",
         session_id,
         trace_id,
         len(text),
         locale,
-        tools_requested,
+        tool_mode,
     )
-    # When the client wants OpenAI-style tool-calling, suppress Sydney's own
-    # built-in plugins/capabilities (BingWebSearch, code interpreter, image
-    # gen) -- see TOOL_MODE_OPTIONS_SETS's comment for why.
-    options_sets = TOOL_MODE_OPTIONS_SETS if tools_requested else OPTIONS_SETS
-    plugins = [] if tools_requested else [{"Id": "BingWebSearch", "Source": "BuiltIn"}]
+    # "action_request" mode suppresses Sydney's own code-interpreter-ish
+    # OPTIONS_SETS entries (it fights against them, see
+    # TOOL_MODE_OPTIONS_SETS's docstring); "code" mode deliberately does NOT
+    # (it leans into them instead -- see
+    # _render_tools_block_code_mode's docstring for why).
+    options_sets = (
+        TOOL_MODE_OPTIONS_SETS if tool_mode == "action_request" else OPTIONS_SETS
+    )
+    plugins = [] if tool_mode else [{"Id": "BingWebSearch", "Source": "BuiltIn"}]
     payload = {
         "type": 4,
         "target": "chat",
@@ -1982,12 +2017,33 @@ _TOOL_CALL_OPEN = "<action_request>"
 _TOOL_CALL_CLOSE = "</action_request>"
 _TOOL_CALL_RE = re.compile(r"<action_request>\s*(.*?)\s*</action_request>", re.DOTALL)
 
+_CODE_MODE_INVOKE_NAME = "invoke_capability"
+_CODE_FENCE_RE = re.compile(r"```(?:\w+)?\s*\n(.*?)```", re.DOTALL)
+
+# Two independent conventions this proxy can teach the model, tried in this
+# order across retry attempts (see _TOOL_CALL_MODES/_run_tool_call_turn):
+#   "code" -- ask the model to call a pre-loaded Python function,
+#     invoke_capability(name, arguments), from ordinary code it writes and
+#     "runs" via Sydney's own code interpreter -- i.e. lean INTO Sydney's
+#     strong, repeatedly-observed preference for solving things by writing
+#     and executing Python, instead of fighting it. See
+#     _render_tools_block_code_mode's docstring and REVERSE_ENGINEERING.md's
+#     "Code-mode tool-calling emulation" section for the live-testing
+#     rationale and results.
+#   "action_request" -- the original convention: a JSON object wrapped in
+#     <action_request>...</action_request> tags, with Sydney's own code
+#     interpreter/plugins explicitly suppressed so there's nothing else for
+#     it to reach for. Kept as a fallback since it's a completely different
+#     mechanism from "code" mode and occasionally succeeds when "code" mode
+#     doesn't (or vice versa) -- see REVERSE_ENGINEERING.md.
+
 
 def _render_tools_block(tools, tool_choice):
     """Renders an OpenAI `tools` array (+ `tool_choice`) into the plain-text
-    instructions block that teaches the model this proxy's tool-calling
-    convention: a single-line JSON object `{"name": ..., "arguments": {...}}`
-    wrapped in `<action_request>...</action_request>` tags.
+    instructions block for the "action_request" convention: a single-line
+    JSON object `{"name": ..., "arguments": {...}}` wrapped in
+    `<action_request>...</action_request>` tags. See
+    `_render_tools_block_code_mode` for the other ("code") convention.
 
     The specific wording here is NOT arbitrary -- it was arrived at by live
     trial-and-error against the real Sydney backend (see
@@ -2034,15 +2090,7 @@ def _render_tools_block(tools, tool_choice):
         "",
         "Capabilities you can request this way:",
     ]
-    for t in tools:
-        fn = t.get("function") or {}
-        name = fn.get(
-            "name", "?"
-        )  # left untouched -- must round-trip verbatim, see _neutralize_tool_word's docstring
-        desc = _neutralize_tool_word(fn.get("description", ""))
-        params = fn.get("parameters", {})
-        lines.append(f"- {name}: {desc}")
-        lines.append(f"  parameters schema: {json.dumps(params)}")
+    lines.extend(_render_capability_list(tools))
 
     if isinstance(tool_choice, dict):
         forced_name = (tool_choice.get("function") or {}).get("name")
@@ -2060,6 +2108,93 @@ def _render_tools_block(tools, tool_choice):
     return "\n".join(lines)
 
 
+def _render_tools_block_code_mode(tools, tool_choice):
+    """Renders an OpenAI `tools` array (+ `tool_choice`) into the plain-text
+    instructions block for the "code" convention: rather than fighting
+    Sydney's strong, repeatedly-observed preference for solving things by
+    writing and "running" Python code (see `_render_tools_block`'s docstring
+    for the failed attempts to suppress that behavior), this convention
+    leans directly into it. The model is told its Python environment
+    already has one extra function loaded, `invoke_capability(name,
+    arguments)`, and is asked to call it from ordinary code exactly the way
+    it already tends to solve things -- no JSON-in-tags convention, no
+    "your other capabilities are disabled" framing.
+
+    `_extract_code_mode_calls()` parses the resulting code (from inside
+    Sydney's own ```-fenced code blocks, which it reliably uses for
+    anything it treats as "code to run") for calls to this function via a
+    real Python AST walk, so the model is free to write whatever ordinary
+    code it wants around the call(s) -- loops, comments, multiple calls,
+    print()-ing the result, etc. -- and they'll still be found. See
+    REVERSE_ENGINEERING.md's "Code-mode tool-calling emulation" section for
+    the live-testing rationale and results this design is based on.
+
+    Still prompt-level steering, not a guarantee -- same caveat as
+    `_render_tools_block`."""
+    lines = [
+        "",
+        "Your Python code execution environment has one extra function "
+        "already loaded and ready to use -- you do not need to define it "
+        "yourself, it's already there:",
+        "",
+        f"    {_CODE_MODE_INVOKE_NAME}(name, arguments)",
+        "",
+        "Write and run ordinary Python code exactly as you already would "
+        "for any other task. Whenever you need one of the capabilities "
+        f"listed below, call {_CODE_MODE_INVOKE_NAME}(name, arguments) with "
+        "the capability's name (a string) and its arguments (a dict "
+        "matching the schema shown for it), then read its return value "
+        "before continuing -- for example:",
+        "",
+        f"    result = {_CODE_MODE_INVOKE_NAME}("
+        "'<capability name>', {<arguments matching its schema>})",
+        "    print(result)",
+        "",
+        "If you don't need any of these capabilities for this reply, just "
+        "answer normally in plain text without writing any code at all. "
+        "You can call more than one of them in the same script if you need "
+        "to, and can write as much ordinary code around the call(s) as you "
+        "need.",
+        "",
+        "Capabilities available this way:",
+    ]
+    lines.extend(_render_capability_list(tools))
+
+    if isinstance(tool_choice, dict):
+        forced_name = (tool_choice.get("function") or {}).get("name")
+        if forced_name:
+            lines.append("")
+            lines.append(
+                f"You MUST call {_CODE_MODE_INVOKE_NAME}('{forced_name}', ...) now."
+            )
+    elif tool_choice == "required":
+        lines.append("")
+        lines.append(
+            f"You MUST call {_CODE_MODE_INVOKE_NAME}(...) now, for one of the "
+            "capabilities above."
+        )
+
+    return "\n".join(lines)
+
+
+def _render_capability_list(tools):
+    """Shared by both `_render_tools_block()` and
+    `_render_tools_block_code_mode()`: renders each tool's name (left
+    untouched -- must round-trip verbatim, see _neutralize_tool_word's
+    docstring), neutralized description, and JSON parameters schema as a
+    `"- name: description"` / `"  parameters schema: {...}"` pair of
+    lines."""
+    lines = []
+    for t in tools:
+        fn = t.get("function") or {}
+        name = fn.get("name", "?")
+        desc = _neutralize_tool_word(fn.get("description", ""))
+        params = fn.get("parameters", {})
+        lines.append(f"- {name}: {desc}")
+        lines.append(f"  parameters schema: {json.dumps(params)}")
+    return lines
+
+
 _TOOL_WORD_RE = re.compile(r"\btools?\b", re.IGNORECASE)
 
 
@@ -2073,15 +2208,16 @@ def _neutralize_tool_word(text):
     CLIENT's own system prompt or user message content, completely outside
     this proxy's own injected instructions -- reliably makes Sydney fall
     back to preempting the request with its own real built-in capabilities
-    (the code interpreter, mainly) instead of ever considering this proxy's
-    `<action_request>` convention, confirmed by live A/B testing during
-    development (see REVERSE_ENGINEERING.md's "Tool-calling emulation"
-    section). Coding-agent system prompts (OpenCode's, OpenHands', etc.)
-    are saturated with exactly this word ("you have access to the following
-    tools", tool names/descriptions, etc.), so this proxy cannot simply ask
-    callers to avoid it -- it has to actively launder it out of the entire
-    rendered prompt whenever `tools` is present. Applied only to free-form
-    text (system/user/assistant/tool-result content and tool descriptions),
+    (the code interpreter, mainly) instead of ever considering either of
+    this proxy's tool-calling conventions ("action_request" or "code"),
+    confirmed by live A/B testing during development (see
+    REVERSE_ENGINEERING.md's "Tool-calling emulation" section). Coding-agent
+    system prompts (OpenCode's, OpenHands', etc.) are saturated with exactly
+    this word ("you have access to the following tools", tool
+    names/descriptions, etc.), so this proxy cannot simply ask callers to
+    avoid it -- it has to actively launder it out of the entire rendered
+    prompt whenever `tools` is present. Applied only to free-form text
+    (system/user/assistant/tool-result content and tool descriptions),
     never to the structural JSON (a tool's `name` field, argument/schema
     keys) that this proxy needs to parse back out of the reply verbatim."""
 
@@ -2094,17 +2230,17 @@ def _neutralize_tool_word(text):
 
 
 def _extract_tool_calls(reply_text):
-    """Parses `reply_text` for this proxy's `<action_request>{...}</action_request>`
-    convention (see `_render_tools_block`). Returns `(remaining_text,
-    tool_calls)`: `tool_calls` is a list of `{"id", "name", "arguments_json"}`
-    dicts (already carrying a synthesized OpenAI-style call id and a
-    compact-JSON-encoded arguments string, ready to drop into an OpenAI
-    `tool_calls` response entry), and `remaining_text` is whatever plain text
-    was outside the tags (may be empty). A tag pair with unparseable/
-    incomplete JSON inside is logged and dropped rather than raised -- the
-    model attempted a tool call but produced broken output, which should
-    surface to the client as "the model didn't call a tool" rather than
-    crash this proxy's response entirely."""
+    """Parses `reply_text` for the "action_request" convention's
+    `<action_request>{...}</action_request>` tags (see `_render_tools_block`).
+    Returns `(remaining_text, tool_calls)`: `tool_calls` is a list of
+    `{"id", "name", "arguments_json"}` dicts (already carrying a synthesized
+    OpenAI-style call id and a compact-JSON-encoded arguments string, ready
+    to drop into an OpenAI `tool_calls` response entry), and `remaining_text`
+    is whatever plain text was outside the tags (may be empty). A tag pair
+    with unparseable/incomplete JSON inside is logged and dropped rather
+    than raised -- the model attempted a tool call but produced broken
+    output, which should surface to the client as "the model didn't call a
+    tool" rather than crash this proxy's response entirely."""
     tool_calls = []
 
     def _handle(match):
@@ -2133,28 +2269,168 @@ def _extract_tool_calls(reply_text):
     return remaining, tool_calls
 
 
+def _extract_invoke_args(call_node):
+    """Given an `ast.Call` node for `invoke_capability(...)`, returns
+    `(name, arguments)` by literal-evaluating whichever AST nodes hold them
+    -- handles both positional (`invoke_capability('x', {...})`) and keyword
+    (`invoke_capability(name='x', arguments={...})`) call styles, and any
+    mix of the two. Raises `ValueError` if the call doesn't actually carry a
+    usable name/arguments pair (e.g. the model computed them from a
+    variable rather than writing a literal) -- the caller treats that as
+    "this particular call couldn't be parsed", not a hard failure."""
+    positional = list(call_node.args)
+    keywords = {kw.arg: kw.value for kw in call_node.keywords if kw.arg}
+
+    name_node = keywords.get("name")
+    if name_node is None and positional:
+        name_node = positional[0]
+    arguments_node = keywords.get("arguments")
+    if arguments_node is None and len(positional) > 1:
+        arguments_node = positional[1]
+
+    if name_node is None:
+        raise ValueError("invoke_capability(...) call has no name argument")
+    name = ast.literal_eval(name_node)
+    arguments = ast.literal_eval(arguments_node) if arguments_node is not None else {}
+    if not isinstance(name, str):
+        raise ValueError("invoke_capability(...) name argument is not a string")
+    if not isinstance(arguments, dict):
+        raise ValueError("invoke_capability(...) arguments argument is not a dict")
+    return name, arguments
+
+
+def _extract_code_mode_calls(reply_text):
+    """Parses `reply_text` for calls to the "code" convention's function,
+    `invoke_capability(name, arguments)` (see
+    `_render_tools_block_code_mode`), inside any ```-fenced code block(s) in
+    the reply -- Sydney's own code-interpreter convention reliably wraps
+    generated code this way (e.g. "Coding and executing```python\n...\n```"),
+    confirmed across many live captures during development; if no fenced
+    block is found at all, the entire reply is tried as a last resort, in
+    case the model wrote bare code with no fence.
+
+    Each candidate block is parsed as a real Python AST via `ast.parse()`
+    and walked for `Call` nodes whose function is a bare `Name` matching
+    `_CODE_MODE_INVOKE_NAME` -- this means the model is free to write
+    completely ordinary Python around the call(s) (comments, loops,
+    multiple calls, whatever) and they'll still be found, unlike a naive
+    regex over the raw text. A block that isn't valid Python at all, or an
+    `invoke_capability(...)` call whose arguments aren't literal enough for
+    `ast.literal_eval` (see `_extract_invoke_args`), is skipped rather than
+    raised -- same "degrade to no call, don't crash" policy as
+    `_extract_tool_calls`.
+
+    Returns `(remaining_text, tool_calls)` in the same shape as
+    `_extract_tool_calls` for symmetry, though `remaining_text` is unused by
+    every current caller (same as it already effectively was for the
+    "action_request" convention -- see `_run_tool_call_turn`'s callers,
+    which always fall back to the RAW reply text, not a stripped version,
+    whenever no calls were found)."""
+    tool_calls = []
+    blocks = _CODE_FENCE_RE.findall(reply_text) or [reply_text]
+
+    for block in blocks:
+        try:
+            tree = ast.parse(block)
+        except (SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == _CODE_MODE_INVOKE_NAME
+            ):
+                continue
+            try:
+                name, arguments = _extract_invoke_args(node)
+            except ValueError as e:
+                logging.warning(
+                    "model emitted an %s(...) call this proxy couldn't parse "
+                    "the arguments of, skipping it: %r",
+                    _CODE_MODE_INVOKE_NAME,
+                    e,
+                )
+                continue
+            tool_calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "name": name,
+                    "arguments_json": json.dumps(arguments),
+                }
+            )
+
+    return reply_text, tool_calls
+
+
 _TOOL_CALL_MAX_ATTEMPTS = 3
+_TOOL_CALL_MODES = ("code", "action_request", "code")
 
 
-def _run_tool_call_turn(token_cache, prompt, max_attempts=_TOOL_CALL_MAX_ATTEMPTS):
-    """Runs one Chathub turn with `tools_requested=True`, retrying as brand-
-    new, independent Chathub turns (Sydney has no memory to preserve across
-    a retry anyway -- see `_render_conversation_prompt`'s docstring) up to
-    `max_attempts` times if the reply doesn't contain a parseable
-    `<action_request>` tag.
+def _looks_like_throttled_empty_reply(text):
+    """Returns True if `text` is empty or whitespace-only.
 
-    This retry exists because whether the underlying model actually follows
-    this proxy's tool-calling convention on any given turn is genuinely
-    probabilistic, not deterministic: live A/B testing during development
-    measured roughly a 50% success rate on even the simplest possible
-    single-capability request, with Sydney's own built-in code interpreter
-    silently preempting the rest of the time -- see REVERSE_ENGINEERING.md's
-    "Tool-calling emulation" section for the exact trial data and why a
-    single attempt alone was not an acceptable design. Retrying
-    substantially raises the *effective* success rate (if failures were
-    independent, 3 attempts at 50% each would be ~87.5%; REVERSE_ENGINEERING.md
-    documents the actual measured rate, which was somewhat lower --
-    consecutive failures are not perfectly independent in practice).
+    A completely empty reply from Sydney is NOT a normal "the model chose
+    to say nothing" outcome to treat as a valid (if boring) answer -- live
+    testing during development found this is what Sydney silently returns
+    once Microsoft-side throttling kicks in after a burst of requests in a
+    short window: no explicit error, no AuthError message, the Chathub
+    turn just completes normally (`Chathub reply complete (total_length=0
+    chars)` in this proxy's own log) with zero content, and this happens
+    for a *plain* chat turn just as much as a tool-calling one -- it is not
+    specific to anything this proxy does with `tools`. It was reproduced
+    reliably after roughly 40-50 requests in a few minutes during this
+    proxy's own tool-calling emulation A/B testing, and did not clear after
+    45 seconds, only after a few minutes (see REVERSE_ENGINEERING.md's
+    "Sydney-side request throttling" section for the exact timeline). The
+    Chathub protocol's own `throttling: {maxNumUserMessagesInConversation,
+    ...}` field (see REVERSE_ENGINEERING.md) is presumably related, though
+    this proxy has never observed it populated with anything informative
+    that would let it detect the condition proactively instead of
+    reactively (i.e. only after already getting an empty reply).
+
+    Treating this as a normal empty answer would silently confuse whoever's
+    on the other end of the API -- a coding agent has no way to distinguish
+    "the model genuinely had nothing to say" from "you're being throttled,
+    back off and retry later" if both come back as an ordinary 200 with
+    empty content. See this function's callers for how it's surfaced
+    instead (a clear error rather than a silent empty success)."""
+    return not text.strip()
+
+
+def _extract_calls_for_mode(mode, text):
+    """Dispatches to the extractor matching `mode` (see _TOOL_CALL_MODES) --
+    keeps _run_tool_call_turn's retry loop mode-agnostic."""
+    if mode == "code":
+        return _extract_code_mode_calls(text)
+    return _extract_tool_calls(text)
+
+
+def _run_tool_call_turn(
+    token_cache, messages, tools, tool_choice, max_attempts=_TOOL_CALL_MAX_ATTEMPTS
+):
+    """Runs one Chathub turn per attempt (up to `max_attempts`), each as a
+    brand-new, independent Chathub turn (Sydney has no memory to preserve
+    across a retry anyway -- see `_render_conversation_prompt`'s docstring),
+    retrying if the reply doesn't contain a parseable tool call. Unlike a
+    single fixed convention, each attempt's PROMPT is rendered fresh from
+    `messages`/`tools`/`tool_choice` using whichever convention
+    `_TOOL_CALL_MODES` assigns that attempt number (cycling through "code"
+    and "action_request" -- see that tuple's definition and
+    REVERSE_ENGINEERING.md's "Code-mode tool-calling emulation" section for
+    why trying more than one independent convention, rather than retrying
+    the same one, meaningfully raises the effective success rate): a prompt
+    that fails to get a parseable call under one convention on one attempt
+    may well succeed under the other on the very next attempt, since the
+    two conventions fail in different, largely uncorrelated ways (Sydney's
+    own code interpreter self-preempting vs. a flat refusal).
+
+    This retry-and-vary-convention design exists because whether the
+    underlying model actually follows either of this proxy's tool-calling
+    conventions on any given turn is genuinely probabilistic, not
+    deterministic -- see REVERSE_ENGINEERING.md's "Tool-calling emulation"
+    and "Code-mode tool-calling emulation" sections for the exact trial data
+    driving this design, including why a single attempt (or a single fixed
+    convention retried unchanged) was not judged an acceptable design.
 
     Returns `(text, tool_calls)` from whichever attempt produced tool_calls,
     or from the LAST attempt if none did across all attempts -- so the
@@ -2162,20 +2438,33 @@ def _run_tool_call_turn(token_cache, prompt, max_attempts=_TOOL_CALL_MAX_ATTEMPT
     "stop") rather than nothing at all."""
     text, tool_calls = "", []
     for attempt in range(1, max_attempts + 1):
-        text = "".join(run_chat_turn(token_cache, prompt, tools_requested=True))
-        _, tool_calls = _extract_tool_calls(text)
+        mode = _TOOL_CALL_MODES[(attempt - 1) % len(_TOOL_CALL_MODES)]
+        prompt = _render_conversation_prompt(
+            messages, tools=tools, tool_choice=tool_choice, mode=mode
+        )
+        logging.info(
+            "tool-call emulation attempt %d/%d: mode=%s rendered_prompt_length=%d chars",
+            attempt,
+            max_attempts,
+            mode,
+            len(prompt),
+        )
+        text = "".join(run_chat_turn(token_cache, prompt, tool_mode=mode))
+        _, tool_calls = _extract_calls_for_mode(mode, text)
         if tool_calls:
             if attempt > 1:
                 logging.info(
-                    "tool-call emulation succeeded on retry attempt %d/%d",
+                    "tool-call emulation succeeded on retry attempt %d/%d (mode=%s)",
                     attempt,
                     max_attempts,
+                    mode,
                 )
             return text, tool_calls
         logging.info(
-            "tool-call emulation attempt %d/%d produced no action_request block%s",
+            "tool-call emulation attempt %d/%d (mode=%s) produced no call%s",
             attempt,
             max_attempts,
+            mode,
             ""
             if attempt < max_attempts
             else " -- giving up, falling back to plain content",
@@ -2183,10 +2472,13 @@ def _run_tool_call_turn(token_cache, prompt, max_attempts=_TOOL_CALL_MAX_ATTEMPT
     return text, tool_calls
 
 
-def _render_conversation_prompt(messages, tools=None, tool_choice=None):
+def _render_conversation_prompt(
+    messages, tools=None, tool_choice=None, mode="action_request"
+):
     """Renders an OpenAI `messages[]` array (optionally plus a `tools`
-    schema list and `tool_choice`) into the single text blob that becomes
-    one Chathub turn's `message.text`.
+    schema list, `tool_choice`, and a tool-calling `mode` -- "action_request"
+    or "code", see the module-level comment above `_render_tools_block`)
+    into the single text blob that becomes one Chathub turn's `message.text`.
 
     Sydney/Chathub has no native `messages` concept: one Chathub turn is a
     single freeform text string, and every call to run_chat_turn() mints a
@@ -2223,10 +2515,11 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
     *user's* turn instead, worded as ordinary supplied context rather than
     fabricated assistant history, reliably avoided the refusal in the same
     A/B comparison -- see REVERSE_ENGINEERING.md's "Tool-calling emulation"
-    section for the exact trial transcripts. If `tools` is given,
-    `_render_tools_block()`'s instructions are appended to the system/
-    instructions section -- see the "Tool-calling emulation" comment block
-    above this function.
+    section for the exact trial transcripts. The exact wording of that fold
+    differs by `mode` (see `_fold_pending` below) so it stays consistent
+    with whichever convention this turn is using. If `tools` is given, the
+    instructions matching `mode` are appended to the system/instructions
+    section.
 
     For the simple common case of a single user-only message with no
     system prompt, no prior turns, and no `tools` (e.g. a quick curl test,
@@ -2248,13 +2541,21 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
         """Prepends any buffered tool-result text onto `text` as ordinary
         parenthetical context and clears the buffer -- see this function's
         caller-level docstring for why this replaces rendering a fabricated
-        assistant history turn."""
+        assistant history turn. Phrased to match `mode` so a "code"-mode
+        turn reads as a continuation of that turn's own code-execution
+        narrative rather than an unrelated JSON-request framing."""
         nonlocal pending_results
         if not pending_results:
             return text
-        preamble = "\n".join(
-            f"(Result of your earlier {n} request: {t})" for n, t in pending_results
-        )
+        if mode == "code":
+            preamble = "\n".join(
+                f"({_CODE_MODE_INVOKE_NAME}('{n}', ...) returned: {t})"
+                for n, t in pending_results
+            )
+        else:
+            preamble = "\n".join(
+                f"(Result of your earlier {n} request: {t})" for n, t in pending_results
+            )
         pending_results = []
         return f"{preamble}\n\n{text}" if text else preamble
 
@@ -2307,7 +2608,13 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
     if not turns:
         return None
 
-    tools_block = _render_tools_block(tools, tool_choice) if tools else None
+    tools_block = None
+    if tools:
+        tools_block = (
+            _render_tools_block_code_mode(tools, tool_choice)
+            if mode == "code"
+            else _render_tools_block(tools, tool_choice)
+        )
 
     # Simple case: exactly one user message, no system prompt, no tools --
     # send it verbatim, unchanged from this proxy's original behavior.
@@ -2348,14 +2655,23 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
         # at that scale than in this proxy's small (~2KB) test prompts (see
         # REVERSE_ENGINEERING.md's "Tool-calling emulation at production
         # scale" section). Kept short on purpose so it doesn't itself become
-        # a wall of buried text.
-        lines.append(
-            "### Reminder before you reply\n"
-            "You have no internet access or code execution this turn. If you "
-            "need information or to take an action, reply with ONLY one or "
-            f"more {_TOOL_CALL_OPEN}...{_TOOL_CALL_CLOSE} blocks as described "
-            "above and nothing else. Otherwise, reply normally in plain text."
-        )
+        # a wall of buried text. Worded to match `mode`.
+        if mode == "code":
+            lines.append(
+                "### Reminder before you reply\n"
+                "If you need one of the capabilities above, write and run a "
+                f"short Python snippet that calls {_CODE_MODE_INVOKE_NAME}"
+                "(name, arguments) and reads the result, exactly as described "
+                "above. Otherwise, just answer normally in plain text."
+            )
+        else:
+            lines.append(
+                "### Reminder before you reply\n"
+                "You have no internet access or code execution this turn. If you "
+                "need information or to take an action, reply with ONLY one or "
+                f"more {_TOOL_CALL_OPEN}...{_TOOL_CALL_CLOSE} blocks as described "
+                "above and nothing else. Otherwise, reply normally in plain text."
+            )
         lines.append("")
     lines.append("### Respond to this message")
     lines.append(f"{last_label}: {last_text}")
@@ -2469,32 +2785,72 @@ def make_handler(token_cache):
             messages = body.get("messages") or []
             tools = body.get("tools") or None
             tool_choice = body.get("tool_choice")
-            prompt = _render_conversation_prompt(
-                messages, tools=tools, tool_choice=tool_choice
-            )
+            model = body.get("model") or "m365-copilot"
+            stream = bool(body.get("stream", False))
+
+            if tools:
+                # Rendering is deferred into _run_tool_call_turn, which
+                # renders a FRESH prompt per retry attempt -- possibly in a
+                # different tool-calling mode each time (see
+                # _TOOL_CALL_MODES) -- rather than once up front. Still
+                # validate here that there's SOME usable content at all;
+                # that yes/no doesn't depend on which mode is used.
+                if (
+                    _render_conversation_prompt(
+                        messages, tools=tools, tool_choice=tool_choice
+                    )
+                    is None
+                ):
+                    self._error(400, "no usable message content found in 'messages'")
+                    return
+                logging.info(
+                    "chat completion request from %s: %d message(s), tools=%d, "
+                    "stream=%s, model=%r (prompt rendered per-attempt, see below)",
+                    self.address_string(),
+                    len(messages),
+                    len(tools),
+                    stream,
+                    model,
+                )
+                if stream:
+                    self._handle_streaming(
+                        None,
+                        model,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                    )
+                else:
+                    self._handle_full(
+                        None,
+                        model,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                    )
+                return
+
+            prompt = _render_conversation_prompt(messages)
             if prompt is None:
                 self._error(400, "no usable message content found in 'messages'")
                 return
-
-            model = body.get("model") or "m365-copilot"
-            stream = bool(body.get("stream", False))
             logging.info(
                 "chat completion request from %s: %d message(s), rendered_prompt_length=%d chars, "
-                "stream=%s, model=%r, tools=%d",
+                "stream=%s, model=%r, tools=0",
                 self.address_string(),
                 len(messages),
                 len(prompt),
                 stream,
                 model,
-                len(tools or []),
             )
-
             if stream:
-                self._handle_streaming(prompt, model, tools_requested=bool(tools))
+                self._handle_streaming(prompt, model)
             else:
-                self._handle_full(prompt, model, tools_requested=bool(tools))
+                self._handle_full(prompt, model)
 
-        def _handle_streaming(self, prompt, model, tools_requested=False):
+        def _handle_streaming(
+            self, prompt, model, messages=None, tools=None, tool_choice=None
+        ):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -2519,15 +2875,18 @@ def make_handler(token_cache):
                 self.wfile.flush()
 
             try:
-                if tools_requested:
+                if tools:
                     # Buffered mode: whether this reply is plain content or a
                     # tool call can only be known once the FULL text has been
-                    # seen (see _extract_tool_calls), so there is no true
-                    # incremental streaming when `tools` is present -- the
-                    # whole reply is collected first, then emitted as one
-                    # chunk. Documented as a known limitation. See
-                    # _run_tool_call_turn for why this retries internally.
-                    text, tool_calls = _run_tool_call_turn(token_cache, prompt)
+                    # seen (see _extract_tool_calls/_extract_code_mode_calls),
+                    # so there is no true incremental streaming when `tools`
+                    # is present -- the whole reply is collected first, then
+                    # emitted as one chunk. Documented as a known limitation.
+                    # See _run_tool_call_turn for why this retries internally
+                    # (and across more than one tool-calling convention).
+                    text, tool_calls = _run_tool_call_turn(
+                        token_cache, messages, tools, tool_choice
+                    )
                     if tool_calls:
                         # Leftover text is deliberately dropped here, not
                         # surfaced as delta content -- see _handle_full's
@@ -2550,6 +2909,19 @@ def make_handler(token_cache):
                             }
                         )
                         finish_reason = "tool_calls"
+                    elif _looks_like_throttled_empty_reply(text):
+                        # See _looks_like_throttled_empty_reply's docstring:
+                        # raising here (rather than emitting a fake
+                        # successful empty completion) routes this into the
+                        # `except Exception` handler below, which surfaces
+                        # it as a proper SSE error event instead of a silent
+                        # "the assistant said nothing" success.
+                        raise ProtocolError(
+                            "Sydney returned a completely empty reply -- this "
+                            "usually means Microsoft is temporarily throttling "
+                            "this account after a burst of requests; wait a "
+                            "bit (a minute or more) and try again"
+                        )
                     else:
                         emit({"role": "assistant", "content": text})
                         finish_reason = "stop"
@@ -2562,6 +2934,17 @@ def make_handler(token_cache):
                             else {"content": delta}
                         )
                         first = False
+                    if first:
+                        # No delta was ever yielded at all -- see
+                        # _looks_like_throttled_empty_reply's docstring for
+                        # why this is treated as an error, not a valid
+                        # (if terse) empty answer.
+                        raise ProtocolError(
+                            "Sydney returned a completely empty reply -- this "
+                            "usually means Microsoft is temporarily throttling "
+                            "this account after a burst of requests; wait a "
+                            "bit (a minute or more) and try again"
+                        )
                     finish_reason = "stop"
 
                 final = {
@@ -2598,11 +2981,15 @@ def make_handler(token_cache):
                 except OSError:
                     pass
 
-        def _handle_full(self, prompt, model, tools_requested=False):
+        def _handle_full(
+            self, prompt, model, messages=None, tools=None, tool_choice=None
+        ):
             completion_id = f"chatcmpl-{uuid.uuid4().hex}"
             try:
-                if tools_requested:
-                    text, tool_calls = _run_tool_call_turn(token_cache, prompt)
+                if tools:
+                    text, tool_calls = _run_tool_call_turn(
+                        token_cache, messages, tools, tool_choice
+                    )
                 else:
                     text, tool_calls = "".join(run_chat_turn(token_cache, prompt)), []
             except Exception as e:
@@ -2610,6 +2997,28 @@ def make_handler(token_cache):
                 # on purpose, so any bug still produces a diagnosable log entry.
                 logging.exception("chat completion %s failed", completion_id)
                 self._error(502, str(e))
+                return
+
+            if not tool_calls and _looks_like_throttled_empty_reply(text):
+                # See _looks_like_throttled_empty_reply's docstring: a
+                # completely empty reply is surfaced as an error, not a
+                # silent 200-with-empty-content "success" that would leave
+                # the caller unable to tell "the model said nothing" apart
+                # from "you're being throttled, back off and retry later".
+                logging.error(
+                    "chat completion %s got a completely empty reply from "
+                    "Sydney -- likely Microsoft-side throttling after a "
+                    "burst of requests, surfacing as an error",
+                    completion_id,
+                )
+                self._error(
+                    503,
+                    "Sydney returned a completely empty reply. This usually "
+                    "means Microsoft is temporarily throttling this account "
+                    "after a burst of requests -- wait a bit (a minute or "
+                    "more) and try again.",
+                    err_type="upstream_throttled",
+                )
                 return
 
             if tool_calls:
