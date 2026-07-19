@@ -224,25 +224,60 @@ untouched so you can see what was originally supplied.
 ------------------------------------------------------------------------------
 KNOWN LIMITATIONS
 ------------------------------------------------------------------------------
-- **Multi-turn memory is "context-stuffing", not native Sydney state.**
-  `_render_conversation_prompt()` renders the *entire* incoming `messages`
-  array (system/developer instructions + every prior user/assistant turn)
-  into one plain-text blob, and that whole blob becomes the single Chathub
-  turn's `message.text` -- `run_chat_turn()` still mints a brand-new random
-  Chathub `ConversationId` on every single API call, same as always. In
-  other words: this proxy does NOT use Sydney's own server-side memory (it
-  is unconfirmed whether reusing a stable `ConversationId` across calls
-  would even work -- see REVERSE_ENGINEERING.md); instead it relies on the
-  *client* resending its full growing conversation every request, which is
-  exactly what stateless per-request clients like Aider already do. Two
-  practical consequences: (1) the effective prompt sent to Sydney grows with
-  the conversation, so very long-running sessions may eventually hit
-  whatever context/size limit Sydney enforces (unconfirmed, not yet
-  surfaced by this proxy); (2) a client that expects Sydney's *own*
-  memory/threading semantics (e.g. server-side conversation continuation
-  independent of what the client resends) will not get that -- it gets
-  exactly the transcript it sent, replayed back through one fresh Sydney
-  turn, every time.
+- **Multi-turn memory now prefers Sydney's own native conversation state,
+  with context-stuffing kept as an automatic fallback for whatever doesn't
+  fit that.** A live experiment (`experiments/probe_conversation_reuse.py`,
+  see REVERSE_ENGINEERING.md's "Sydney-native conversation continuity"
+  section) confirmed that Sydney DOES honor a `ConversationId` reused
+  across a brand-new, independent Chathub WebSocket connection as real
+  server-side conversation memory -- a turn taught a secret word, then
+  closed, was correctly recalled by a second, unrelated connection reusing
+  the same `ConversationId` with no history resent, while a control turn
+  using a fresh `ConversationId` correctly showed no memory at all. Based
+  on that, `ConversationSessionStore` (see its docstring, just above
+  `make_handler`) tracks, per proxy process, a best-effort mapping from "the
+  exact `messages` array a client has seen so far" to the Sydney
+  `ConversationId` that already holds that history server-side. When an
+  incoming request's `messages` array exactly extends a previously-seen one
+  (the common case for essentially every OpenAI-style client, since they
+  all resend their full growing history) AND the request has no `tools`,
+  this proxy sends ONLY the newest message as the next Chathub turn on that
+  reused `ConversationId`, instead of re-rendering and re-sending the
+  entire conversation every time.
+
+  This is fully additive and safe-by-construction: it is never used to
+  produce output that couldn't have been produced before it existed.
+  Anything that doesn't cleanly match a tracked session -- the first turn
+  of a conversation, edited/reordered history, a request that includes
+  `tools` (deliberately excluded -- see the section comment above
+  `_conversation_fingerprint`), a different credential, or a session this
+  process has never seen (including after a restart -- the store is
+  in-memory only, never persisted) -- simply falls back to this proxy's
+  original, always-correct behavior: render the *entire* incoming
+  `messages` array into one text blob and send it as a single turn on a
+  brand-new `ConversationId`, exactly as if this feature didn't exist. A
+  tracked session is also strictly SINGLE-USE (popped, not just read, on a
+  match) specifically so that BRANCHED history -- two different follow-up
+  messages sent from the same earlier point, e.g. a client regenerating a
+  response, or two requests racing -- can never both reuse the same
+  `ConversationId`: only the first one to arrive gets the native-memory
+  fast path, the second gets a clean cache miss and falls back to a
+  brand-new conversation instead of corrupting either branch with the
+  other's content (a real bug caught live by
+  `experiments/test_continuity_offline.py`'s "branch" case during
+  development, not just a theoretical concern). A turn that tries to
+  continue a tracked session and fails is caught, the session is forgotten,
+  and (for non-streaming requests only -- see `_run_plain_turn`'s docstring
+  for why streaming can't safely do the same) the SAME request
+  transparently retries once as a brand-new conversation rather than
+  surfacing an error. Disable this entirely with
+  `--disable-conversation-continuity` if you want the old
+  always-context-stuff behavior. Two things this does NOT change: (1)
+  Sydney's own server-side conversation size/quota limits still apply and
+  still aren't surfaced by this proxy; (2) a tracked session is local to
+  this one proxy PROCESS (in memory, not persisted) -- restarting the proxy
+  always starts cold, with every conversation falling back to fresh
+  context-stuffing until it's seen once more.
 - `usage` (prompt/completion/total tokens) in every response is hardcoded
   to zero -- this proxy does no token counting at all.
 - One Chathub WebSocket is opened, used for exactly one turn, and closed
@@ -254,74 +289,96 @@ KNOWN LIMITATIONS
 - **Tool/function calling is EMULATED and probabilistic, not a guarantee.**
   Sydney has no native OpenAI-style `tools`/`tool_calls` mechanism this proxy
   can use (its real one, Local MCP, is a separate, unimplemented, much
-  harder project -- see below). What this proxy does instead: when a
-  request includes `tools`, it injects a plain-text instructions block
-  (`_render_tools_block()`) teaching the model a fixed textual convention
-  (`<action_request>{"name": ..., "arguments": {...}}</action_request>`)
-  and parses that back out of the reply (`_extract_tool_calls()`) into a
-  real OpenAI `tool_calls` response. This is entirely prompt-level steering
-  with NO formal contract -- live testing during development found:
-    - Sydney's own built-in capabilities (its code interpreter, mainly) very
-      often preempt this convention entirely -- it just tries to satisfy the
-      request itself first, even for things it structurally cannot do (e.g.
-      reading a file from the *user's* machine, which its sandboxed
-      interpreter has no access to).
+  harder project -- see below). This proxy instead teaches the model ONE OF
+  TWO independent textual conventions per attempt, cycling through both
+  across retries (`_TOOL_CALL_MODES`, `_run_tool_call_turn()`), and parses
+  whichever one the model actually used back into a real OpenAI `tool_calls`
+  response:
+    - **"code" mode** (`_render_tools_block_code_mode()` /
+      `_extract_code_mode_calls()`): tells the model its Python execution
+      environment already has one extra function loaded,
+      `invoke_capability(name, arguments)`, and asks it to call it from
+      ordinary code exactly the way it already strongly prefers to solve
+      things -- Sydney's own code interpreter is left ENABLED for this mode
+      (not suppressed) since the whole point is to lean into that habit
+      rather than fight it. The reply is parsed via a real Python AST walk
+      (`ast.parse()` + `ast.literal_eval()`), not a regex, so the model can
+      write whatever ordinary code it wants around the call(s).
+    - **"action_request" mode** (`_render_tools_block()` /
+      `_extract_tool_calls()`): the original convention -- a JSON object
+      wrapped in `<action_request>...</action_request>` tags, with Sydney's
+      own code-interpreter-ish `OPTIONS_SETS` entries and `BingWebSearch`
+      plugin explicitly suppressed so there's nothing else for it to reach
+      for instead.
+  Both remain entirely prompt-level steering with NO formal contract -- live
+  testing during development found:
+    - Neither convention dominates the other in every situation: a small
+      live A/B trial found "code" mode winning heavily on a simple
+      single-capability request (6/6 vs "action_request"'s 0/6 in the same
+      session) but "action_request" doing BETTER at realistic
+      coding-agent scale (4/5 vs "code" mode's 2/5) -- see
+      REVERSE_ENGINEERING.md's "code-mode tool-calling emulation" section
+      for the exact trial data. This is why `_run_tool_call_turn()` cycles
+      through BOTH conventions across its retry attempts rather than
+      retrying one fixed convention -- they appear to fail in different,
+      largely uncorrelated ways (Sydney's own code interpreter
+      self-preempting vs. a flat refusal), so trying the other convention
+      on the next attempt is a meaningfully different roll of the dice, not
+      just "try again and hope."
     - The literal word "tool"/"tools" ANYWHERE in the rendered prompt --
       including in the CLIENT's own system prompt, which this proxy cannot
-      control -- measurably makes this worse. This proxy actively launders
-      that word out of the entire prompt when `tools` is present
-      (`_neutralize_tool_word()`), which helps but does not fix it outright.
-    - Even under the best (simplest, single-capability, word-laundered)
-      conditions measured, the model followed the convention roughly HALF
-      the time on a single attempt. This proxy retries automatically up to
-      3 times per turn (`_run_tool_call_turn()`) when the first attempt
-      doesn't produce a call, which raises the effective success rate
-      substantially -- but retrying costs latency (each attempt is a full
-      Chathub round trip) and still isn't 100%.
-    - Continuing a conversation *after* a tool result required its own fix:
-      naively rendering "the assistant already called X" as a fabricated
-      prior turn reliably triggered a flat refusal on the next reply (a
-      classic prompt-injection SHAPE, even with entirely mundane content).
-      Folding the tool result into the next turn as ordinary user-supplied
-      context instead of a fabricated assistant/tool history entry fixed
-      this specific failure mode.
-  See REVERSE_ENGINEERING.md's "Tool-calling emulation" section for the
-  full trial-by-trial account. **Real end-to-end testing against the actual
-  OpenHands, OpenCode, and Goose CLIs** (not just synthetic curl requests)
-  found a stark asymmetry, documented in REVERSE_ENGINEERING.md's
-  "production-scale end-to-end validation" and "Goose CLI validation"
-  sections: OpenHands CLI achieved one genuine, fully verified success (the
-  agent read a real file, edited it for real via a real tool call, and gave
-  a correct final summary) out of two full sessions tried; OpenCode CLI
-  failed in all three full sessions tried (never once produced a working
-  tool call), even after adding a recency-bias mitigation and raising the
-  retry budget to 5 -- its real system prompt plus full tool schema list
-  runs 30-40KB; Goose CLI failed in all four full sessions tried, across
-  two different tool-count configurations (18 tools -> flat refusal; 5
-  tools -> code-interpreter self-preemption instead), suggesting tool
-  count/prompt size affects *which* avoidance behavior Sydney reaches for
-  without being sufficient on its own to fix the underlying problem. Net
-  assessment, revised in light of this: usable for occasional/low-stakes
-  tool use and has demonstrated real (if unreliable) success with OpenHands
-  specifically, but should NOT be assumed to work with OpenCode or Goose as
-  currently implemented, and NOT be relied on for any long unattended
-  agentic loop regardless of client.
+      control -- measurably makes both conventions worse. This proxy
+      actively launders that word out of the entire prompt when `tools` is
+      present (`_neutralize_tool_word()`), which helps but does not fix it
+      outright.
+    - Continuing a conversation *after* a tool result required its own fix,
+      applying to both conventions: naively rendering "the assistant
+      already called X" as a fabricated prior turn reliably triggered a
+      flat refusal on the next reply (a classic prompt-injection SHAPE,
+      even with entirely mundane content). Folding the tool result into the
+      next turn as ordinary user-supplied context instead of a fabricated
+      assistant/tool history entry fixed this specific failure mode --
+      phrased to match whichever convention that turn is using (see
+      `_fold_pending()`).
+  See REVERSE_ENGINEERING.md's "Tool-calling emulation" and "code-mode
+  tool-calling emulation" sections for the full trial-by-trial account,
+  including real end-to-end testing against the actual OpenHands, OpenCode,
+  and Goose CLIs (not just synthetic curl requests). That picture HAS since
+  been re-validated live against the current two-convention design -- see
+  REVERSE_ENGINEERING.md's "Harmonized-build agent re-validation" section
+  (and the README's "Compatibility at a glance" table): Aider and OpenHands
+  (mock-function-calling) work; OpenHands native tool-calling succeeded too,
+  with `code` and `action_request` modes each landing calls the other
+  missed; OpenCode and Goose still do not work, with the failure now
+  confirmed to survive BOTH conventions (a genuine model-behavior mismatch
+  on large injected tool schemas, not a single-convention artifact).
 
   **IMPORTANT if your client is OpenHands: prefer OpenHands' own
   client-side "mock function calling" mode over this proxy's emulation
-  above.** OpenHands' SDK has a `native_tool_calling=False` flag on its
-  `LLM` config that converts tools to text and parses the reply entirely
-  on OpenHands' own side, sending this proxy NO `tools` field at all (so
-  this proxy's emulation above never runs). Tested 3 of 3 full sessions
-  succeeded, all verified correct on disk -- dramatically more reliable
-  than either this proxy's emulation or OpenHands' native tool-calling
-  mode (1 of 2 sessions). This flag isn't exposed through the OpenHands
-  CLI's normal settings/env-var surface in the tested version -- it
-  requires directly seeding a persisted `agent_settings.json` file -- see
-  REVERSE_ENGINEERING.md's "OpenHands' own client-side 'mock function
-  calling'" section for the exact setup. Does not transfer to OpenCode (no
-  equivalent client-side fallback exists) or to Goose (it DOES have an
-  analogous mechanism, "Toolshim", but it doesn't help here -- see next).
+  above -- but it is NOT unconditionally reliable, see below.**
+  OpenHands' SDK has a `native_tool_calling=False` flag on its `LLM`
+  config that converts tools to text and parses the reply entirely on
+  OpenHands' own side, sending this proxy NO `tools` field at all (so this
+  proxy's emulation above never runs). Initial test: 3 of 3 full sessions
+  succeeded. A much larger follow-up load test (26 sessions, 7 batches --
+  single-edit, multi-step-with-terminal-verification, multi-file,
+  concurrent sessions, and an iterative debug loop) found **17 of 17
+  (100%) success on ordinary implement/edit/verify task shapes including
+  concurrency**, dramatically more reliable than either this proxy's
+  emulation or OpenHands' native tool-calling mode (1 of 2 sessions) --
+  but only **1 of 9 (11%) success reasoning about/fixing code containing a
+  function whose name contradicts its own behavior** (e.g. a `subtract`
+  that adds), which reproducibly (regardless of wording, tests, or tool
+  use) makes Sydney return a genuinely empty completion -- a third failure
+  mode, distinct from refusal-text and code-interpreter self-preemption.
+  This flag isn't exposed through the OpenHands CLI's normal settings/
+  env-var surface in the tested version -- it requires directly seeding a
+  persisted `agent_settings.json` file -- see REVERSE_ENGINEERING.md's
+  "OpenHands' own client-side 'mock function calling'" and "deep,
+  adversarial load-testing" sections for the exact setup and full trial
+  data. Does not transfer to OpenCode (no equivalent client-side fallback
+  exists) or to Goose (it DOES have an analogous mechanism, "Toolshim",
+  but it doesn't help here -- see next).
 
   Goose's own "Toolshim" (`GOOSE_TOOLSHIM=1`) has the same architecture as
   OpenHands' mock function calling -- sends `tools: []` to this proxy and
@@ -347,6 +404,24 @@ KNOWN LIMITATIONS
   into a genuine architecture mismatch (Sydney's invocation is synchronous,
   mid-turn, and presumably timeout-bound) that is a substantial separate
   project, not a quick patch, and would sidestep everything above.
+
+- **A completely empty reply from Sydney is treated as an error, not a
+  silent success -- this usually means Microsoft-side request throttling,
+  not that the model had nothing to say.** Discovered during this proxy's
+  own tool-calling A/B testing: after roughly 40-50 requests in a few
+  minutes, Sydney started returning Chathub turns that complete normally
+  (no error, no `AuthError`) but with zero characters of content -- for a
+  PLAIN tools-free chat turn just as much as a tool-calling one, so this is
+  a general Sydney-side behavior, not specific to anything this proxy does
+  with `tools`. It did not clear within 45 seconds, only after several
+  minutes. `_looks_like_throttled_empty_reply()` detects this and both
+  `_handle_full`/`_handle_streaming` now surface it as an explicit error
+  (a `429`/`upstream_throttled` JSON error, or an SSE error event for
+  streaming) instead of a silent `200`-with-empty-content response that
+  would otherwise be indistinguishable from "the model genuinely answered
+  with nothing." If you hit this, back off for a few minutes before
+  retrying -- see REVERSE_ENGINEERING.md's "Sydney-side request throttling"
+  section for the full timeline this was based on.
 
 ------------------------------------------------------------------------------
 REVERSE-ENGINEERING PROVENANCE / CONFIDENCE
@@ -402,6 +477,7 @@ USAGE
 """
 
 import argparse
+import ast
 import base64
 import hashlib
 import hmac
@@ -425,7 +501,7 @@ import uuid
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.6"
+PROXY_VERSION = "0.8"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -812,13 +888,17 @@ SIGNALR_RS = "\x1e"  # SignalR JSON Hub Protocol record separator
 # Sydney's own built-in plugins/capabilities (BingWebSearch via the `plugins`
 # field; the code interpreter and image-gen capabilities via `cwc_code_
 # interpreter*`/`flux*`/`gptv*` OPTIONS_SETS entries) reliably preempt this
-# proxy's injected tool-calling emulation -- confirmed live during
+# proxy's "action_request" tool-calling convention -- confirmed live during
 # development: a weather question got a flat refusal, and a basic-arithmetic
 # "use the calculator tool" request got silently answered via Sydney's own
-# code interpreter instead of our requested `<tool_call>` convention (see
-# REVERSE_ENGINEERING.md's "Tool-calling emulation" section). When a request
-# includes `tools`, this proxy asks Sydney with these capabilities stripped,
-# so the model has nothing to reach for except our injected convention.
+# code interpreter instead of our requested `<action_request>` convention
+# (see REVERSE_ENGINEERING.md's "Tool-calling emulation" section). When
+# using the "action_request" convention, this proxy asks Sydney with these
+# capabilities stripped, so the model has nothing to reach for except our
+# injected convention. The other convention this proxy can use, "code" mode
+# (see _TOOL_CALL_MODES), does the opposite on purpose -- it LEANS INTO
+# these same capabilities rather than fighting them, so it does NOT use this
+# list; see _render_tools_block_code_mode's docstring.
 TOOL_MODE_OPTIONS_SETS = [
     o
     for o in OPTIONS_SETS
@@ -841,6 +921,13 @@ class CredentialError(Exception):
 
 class ProtocolError(Exception):
     """The Chathub WebSocket did something we didn't expect."""
+
+
+class ThrottledError(ProtocolError):
+    """Sydney refused the turn with its own rate-limit message (e.g. "We're
+    temporarily unable to respond to this volume of requests. Please try
+    again later.") -- see `stream_chat_reply`'s handling of `StreamItem`
+    frames for where this is detected."""
 
 
 class WSError(Exception):
@@ -1600,19 +1687,53 @@ class TokenCache:
 
     def __init__(self, credential_store):
         self.store = credential_store
+        #: Guards reads/writes of self._auth (held only briefly).
         self._lock = threading.Lock()
+        #: Serializes the token exchange itself so at most one thread ever
+        #: redeems the refresh token at a time -- see get() for why.
+        self._refresh_lock = threading.Lock()
         self._auth = None
 
-    def get(self):
+    def _cached_auth(self):
+        """Returns the cached SydneyAuth if it exists and isn't within 60s of
+        expiry, else None."""
         with self._lock:
-            if self._auth and self._auth.expires_at - 60 > time.time():
-                logging.debug(
-                    "reusing cached Sydney access token (oid=%s, expires in %.0fs)",
-                    self._auth.oid,
-                    self._auth.expires_at - time.time(),
-                )
-                return self._auth
+            auth = self._auth
+        if auth and auth.expires_at - 60 > time.time():
+            logging.debug(
+                "reusing cached Sydney access token (oid=%s, expires in %.0fs)",
+                auth.oid,
+                auth.expires_at - time.time(),
+            )
+            return auth
+        return None
 
+    def get(self):
+        cached = self._cached_auth()
+        if cached is not None:
+            return cached
+
+        # Serialize the actual refresh: Entra ID invalidates the previous
+        # refresh token on every redemption, so two threads redeeming the same
+        # token concurrently (the normal shape when several requests arrive
+        # while the token is cold or expired -- this is a ThreadingHTTPServer)
+        # would have the second redemption rejected as invalid_grant, and
+        # their two store.rotate() writes would race. Only one thread performs
+        # the exchange; any others block here and then find the freshly-cached
+        # token on the re-check below instead of redeeming a second time.
+        with self._refresh_lock:
+            cached = self._cached_auth()
+            if cached is not None:
+                logging.debug(
+                    "another thread refreshed the Sydney access token while we waited"
+                )
+                return cached
+
+            return self._exchange_locked()
+
+    def _exchange_locked(self):
+        """Performs the refresh-token -> access-token exchange and caches the
+        result. MUST be called with self._refresh_lock held (see get())."""
         logging.info(
             "cached Sydney access token missing or near expiry; exchanging refresh token"
         )
@@ -1674,10 +1795,22 @@ class TokenCache:
 # ==============================================================================
 
 
-def open_chathub(auth):
+def open_chathub(auth, conversation_id=None):
+    """Opens one Chathub WebSocket. `conversation_id`, if given, is used
+    verbatim as the Chathub `ConversationId` -- passing the SAME value
+    across separate calls (separate WebSocket connections, separate HTTP
+    requests) is how a Sydney-native conversation continuation reuses
+    Sydney's own server-side conversation memory instead of starting a
+    fresh conversation each time (confirmed live: see
+    REVERSE_ENGINEERING.md's "Sydney-native conversation continuity"
+    section -- a second, independent WebSocket connection reusing a prior
+    call's `ConversationId` got a reply demonstrating knowledge of that
+    prior call's turn, with no history resent). If omitted, a fresh random
+    one is minted, exactly as this function always did before that
+    capability existed."""
     session_id = str(uuid.uuid4())
     session_id_nodash = session_id.replace("-", "")
-    conversation_id = str(uuid.uuid4())
+    conversation_id = conversation_id or str(uuid.uuid4())
 
     query = urllib.parse.urlencode(
         {
@@ -1733,22 +1866,26 @@ def send_chat_message(
     locale="en-US",
     timezone="UTC",
     timezone_offset=0,
-    tools_requested=False,
+    tool_mode=None,
 ):
     trace_id = str(uuid.uuid4())
     logging.info(
-        "sending chat message: session_id=%s trace_id=%s text_length=%d chars locale=%s tools_requested=%s",
+        "sending chat message: session_id=%s trace_id=%s text_length=%d chars locale=%s tool_mode=%s",
         session_id,
         trace_id,
         len(text),
         locale,
-        tools_requested,
+        tool_mode,
     )
-    # When the client wants OpenAI-style tool-calling, suppress Sydney's own
-    # built-in plugins/capabilities (BingWebSearch, code interpreter, image
-    # gen) -- see TOOL_MODE_OPTIONS_SETS's comment for why.
-    options_sets = TOOL_MODE_OPTIONS_SETS if tools_requested else OPTIONS_SETS
-    plugins = [] if tools_requested else [{"Id": "BingWebSearch", "Source": "BuiltIn"}]
+    # "action_request" mode suppresses Sydney's own code-interpreter-ish
+    # OPTIONS_SETS entries (it fights against them, see
+    # TOOL_MODE_OPTIONS_SETS's docstring); "code" mode deliberately does NOT
+    # (it leans into them instead -- see
+    # _render_tools_block_code_mode's docstring for why).
+    options_sets = (
+        TOOL_MODE_OPTIONS_SETS if tool_mode == "action_request" else OPTIONS_SETS
+    )
+    plugins = [] if tool_mode else [{"Id": "BingWebSearch", "Source": "BuiltIn"}]
     payload = {
         "type": 4,
         "target": "chat",
@@ -1861,6 +1998,27 @@ def stream_chat_reply(ws, timeout_s=120):
                             yield delta
                         last_text = text
 
+            elif ftype == 2 and not last_text:
+                # StreamItem: normally just an echo of the user's own message
+                # (persisted/enriched -- see module comments elsewhere), safe
+                # to ignore. But when a turn is refused before any normal
+                # `target:"update"` streaming ever starts (observed live:
+                # Sydney's own rate limiting, "We're temporarily unable to
+                # respond to this volume of requests. Please try again
+                # later.", with `turnState: "Failed"`), the ONLY place that
+                # failure text appears is here -- the type-1/`update` path
+                # above never carries it. Without this check the turn would
+                # silently "succeed" with an empty reply and no visible
+                # cause. Guarded on `not last_text` so a normal completed
+                # reply's own final StreamItem echo is never mistaken for a
+                # failure.
+                item = frame.get("item") or {}
+                for msg in item.get("messages") or []:
+                    if msg.get("author") == "bot" and msg.get("turnState") == "Failed":
+                        reason = msg.get("text") or "(no message from Sydney)"
+                        logging.error("Sydney refused/failed the turn: %r", reason)
+                        raise ThrottledError(f"Sydney refused the turn: {reason!r}")
+
             elif ftype == 3:  # Completion frame: this invocation is done
                 logging.info(
                     "Chathub reply complete (total_length=%d chars)", len(last_text)
@@ -1872,18 +2030,20 @@ def stream_chat_reply(ws, timeout_s=120):
                     len(last_text),
                 )
                 return
-            # ignore: type 2 (StreamItem echo of our own message), type 6 (ping),
-            # and Invocation frames with target "Metrics"
+            # ignore: type 6 (ping), and Invocation frames with target "Metrics"
 
     logging.error("timed out waiting for a Chathub reply after %ds", timeout_s)
     raise ProtocolError("timed out waiting for a Chathub reply")
 
 
-def run_chat_turn(token_cache, text, **kwargs):
+def run_chat_turn(token_cache, text, conversation_id=None, **kwargs):
     """End-to-end: cached/refreshed Sydney auth -> one Chathub turn -> yields
-    text deltas. Generator; the WebSocket is closed once exhausted."""
+    text deltas. Generator; the WebSocket is closed once exhausted.
+    `conversation_id`, if given, is passed straight through to
+    `open_chathub()` -- see its docstring for why reusing one across calls
+    matters."""
     auth = token_cache.get()
-    ws, session_id = open_chathub(auth)
+    ws, session_id = open_chathub(auth, conversation_id=conversation_id)
     try:
         send_chat_message(ws, session_id, text, **kwargs)
         yield from stream_chat_reply(ws)
@@ -1917,6 +2077,232 @@ def _message_text(m):
 
 
 # ------------------------------------------------------------------------------
+# Sydney-native conversation continuity
+#
+# Live-confirmed (see REVERSE_ENGINEERING.md's "Sydney-native conversation
+# continuity" section for the exact probe and transcript): opening a BRAND
+# NEW Chathub WebSocket -- fresh session id, fresh trace/request ids, no
+# history resent -- but reusing a PRIOR call's `ConversationId` gets a reply
+# that demonstrates knowledge of that prior call's turn. Sydney's server-side
+# conversation memory is keyed on `ConversationId` itself, not on keeping one
+# WebSocket connection alive, so it's usable across separate, independent
+# `/v1/chat/completions` HTTP requests exactly like this proxy already
+# handles everything else.
+#
+# The OpenAI chat-completions API is stateless, though: the client resends
+# its whole growing `messages[]` array every call and this proxy is given no
+# conversation id of its own to key on. So recognizing "this request is a
+# continuation of a conversation I already relayed to Sydney" has to be done
+# by fingerprinting `messages[]` itself -- see _conversation_fingerprint and
+# ConversationSessionStore below. A request is treated as a continuation
+# exactly when its `messages[:-1]` matches (in the fields that matter) some
+# earlier request's `messages[]` PLUS the assistant reply this proxy
+# returned for it -- i.e. the client did exactly what an OpenAI-style client
+# does: took the previous response, appended it to the transcript, appended
+# one new turn, and resent the whole thing. When that's true, only the
+# newest message needs to be sent to Sydney (see _render_continuation_delta)
+# -- Sydney already remembers everything before it.
+#
+# Any time this can't be established with confidence -- the very first turn
+# of a conversation, a branched/edited history, `tools` present (see below),
+# a different credential, or this process having restarted (the store is
+# in-memory only) -- this proxy falls back to the pre-existing
+# context-stuffing behavior with a brand-new `ConversationId`, exactly as if
+# this feature didn't exist. A false negative here just costs one extra
+# context-stuffed turn; it is never a correctness problem. Turned off
+# entirely with --disable-conversation-continuity.
+#
+# Deliberately restricted to requests with no `tools`: the tool-calling
+# emulation above already works by re-injecting its whole instructions block
+# from scratch on every turn as independent, stateless Chathub calls (see
+# _run_tool_call_turn's docstring -- "Sydney has no memory to preserve
+# across a retry anyway"), and is already probabilistic on its own. Reusing
+# a live Sydney conversation underneath that mechanism too would add a
+# second axis of uncertainty (does Sydney's memory of the injected tool
+# schema survive exactly as well as its memory of ordinary dialogue? -- not
+# yet tested) to a feature that's already only roughly a coin flip; keeping
+# the two mutually exclusive for now means neither can destabilize the
+# other. Revisit if `tools` + continuity turns out to be worth the extra
+# validation work.
+# ------------------------------------------------------------------------------
+
+
+def _conversation_fingerprint(messages):
+    """Stable identity for "this exact `messages[]` array", used as the
+    ConversationSessionStore's lookup key. Hashes each message's role, name,
+    rendered text, `tool_calls`, and `tool_call_id` in order -- anything
+    else in a message dict (extra client-specific fields) is ignored, but
+    any difference in these fields, their order, or the message count
+    changes the fingerprint.
+
+    Deliberately strict, on purpose: a false negative (two fingerprints
+    differ when the conversation is "really" the same) just costs one extra
+    context-stuffed turn -- always safe. A false positive (two different
+    conversations hashing the same) would risk answering from the wrong
+    conversation's Sydney-side memory -- never safe. SHA-256 over an
+    unambiguous per-message encoding (NUL between fields, unit-separator
+    between messages) makes an accidental collision between two
+    genuinely-different conversations not a practical concern."""
+    hasher = hashlib.sha256()
+    for m in messages:
+        hasher.update(str(m.get("role", "")).encode("utf-8", "replace"))
+        hasher.update(b"\0")
+        hasher.update(str(m.get("name", "")).encode("utf-8", "replace"))
+        hasher.update(b"\0")
+        hasher.update(_message_text(m).encode("utf-8", "replace"))
+        hasher.update(b"\0")
+        tool_calls = m.get("tool_calls")
+        if tool_calls:
+            hasher.update(json.dumps(tool_calls, sort_keys=True).encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(str(m.get("tool_call_id", "")).encode("utf-8", "replace"))
+        hasher.update(b"\x1f")  # unit separator between messages
+    return hasher.hexdigest()
+
+
+def _render_continuation_delta(message):
+    """Renders just the NEWEST message's text for a Sydney-native
+    continuation turn (see ConversationSessionStore) -- Sydney already has
+    everything before it in its own server-side memory, so unlike
+    `_render_conversation_prompt` this sends only the delta, not the whole
+    transcript. Returns None if there's no usable text (the caller then
+    falls back to a fresh, context-stuffed turn, same as
+    `_render_conversation_prompt` returning None would)."""
+    text = _message_text(message)
+    if message.get("role") == "tool":
+        # Continuation is only ever attempted for requests with no `tools`
+        # (see the section comment above), so this shouldn't normally be
+        # reached -- kept as a graceful degrade, not an assumption, in case
+        # a conversation used tools on an earlier turn before the client
+        # stopped passing `tools` on later ones.
+        text = f"(Result of an earlier request: {text or '(empty result)'})"
+    return text or None
+
+
+class ConversationSession:
+    """One entry in ConversationSessionStore: the stable Sydney
+    `ConversationId` a completed turn used, plus enough bookkeeping to
+    decide whether it's still safe to reuse."""
+
+    __slots__ = ("conversation_id", "oid", "created_at", "last_used_at", "turn_count")
+
+    def __init__(self, conversation_id, oid, turn_count=1):
+        self.conversation_id = conversation_id
+        self.oid = oid
+        self.created_at = time.time()
+        self.last_used_at = self.created_at
+        #: how many Chathub turns this ConversationId has now been used for
+        #: across this proxy's whole tracked chain, purely for logging --
+        #: carried forward across each pop-and-remember hop by _plan_chat_turn
+        #: and _run_plain_turn/_stream_plain_turn, not reset to 1 each time.
+        self.turn_count = turn_count
+
+
+class ConversationSessionStore:
+    """Recognizes when a `/v1/chat/completions` request is an exact
+    continuation of a conversation this proxy already relayed to Sydney, so
+    that turn can reuse Sydney's own server-side conversation memory (a
+    stable Chathub `ConversationId`) instead of context-stuffing the whole
+    growing transcript into one big turn every single call -- see the
+    section comment above for the full design rationale.
+
+    Keyed by `_conversation_fingerprint()`, not by any client-supplied id --
+    the OpenAI API is stateless and gives this proxy nothing else to key on.
+    `oid` is checked on lookup too, as cheap defense-in-depth against
+    reusing a session across a credential change this process didn't expect
+    (in practice one running proxy process speaks as one fixed identity, so
+    this should never actually differ).
+
+    Each entry is SINGLE-USE: `lookup()` POPS the matching entry rather than
+    just peeking at it. This matters for correctness, not just bookkeeping
+    hygiene -- confirmed by `experiments/test_continuity_offline.py`'s
+    "branch" case catching this as a real bug during development. Sydney's
+    own conversation state is a single, linear, mutable timeline: once one
+    request has extended it with a given next message, that `ConversationId`
+    server-side no longer matches what any OTHER, differently-worded next
+    message from the same historical point would expect. If a stale entry
+    were left in place after being used, a client that (accidentally or by
+    design, e.g. regenerating a response, or two retries racing) sends a
+    DIFFERENT follow-up from the same earlier point would incorrectly reuse
+    that same `ConversationId` -- Sydney would then answer from a
+    server-side history that includes a turn the client's own local
+    `messages[]` array knows nothing about, a real correctness bug, not
+    just a wasted optimization. Popping means a second, divergent request
+    from the same point gets a clean cache miss and safely falls back to a
+    brand-new conversation instead.
+
+    Bounded in size (MAX_SESSIONS, LRU eviction) and in time (IDLE_TTL_S) so
+    a long-running proxy process can't accumulate un-consumed entries
+    without limit -- this store is correctness-neutral in the OTHER
+    direction (an evicted entry just costs one extra context-stuffed turn,
+    never a wrong answer), so simple bounds are enough; nothing here needs
+    to be persisted across a proxy restart or be perfectly precise.
+    Thread-safe: `make_handler` wires one shared instance into a
+    `ThreadingHTTPServer` -- popping under the same lock as everything else
+    also means two concurrent requests racing to continue the same
+    conversation can't both win; the loser gets a clean miss instead of a
+    corrupted double-send onto the same `ConversationId`."""
+
+    MAX_SESSIONS = 500
+    IDLE_TTL_S = 2 * 60 * 60  # 2 hours
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sessions = {}  # fingerprint -> ConversationSession
+
+    def lookup(self, fingerprint, oid):
+        """Returns the matching ConversationSession and POPS it (see class
+        docstring for why this must be single-use), or None on a miss (no
+        entry, or an `oid` mismatch -- an `oid` mismatch does NOT pop the
+        entry, since it wasn't actually consumed by this call)."""
+        with self._lock:
+            self._evict_expired_locked()
+            session = self._sessions.get(fingerprint)
+            if session is None or session.oid != oid:
+                return None
+            del self._sessions[fingerprint]
+            return session
+
+    def remember(self, fingerprint, conversation_id, oid, turn_count=1):
+        with self._lock:
+            self._evict_expired_locked()
+            if (
+                fingerprint not in self._sessions
+                and len(self._sessions) >= self.MAX_SESSIONS
+            ):
+                self._evict_lru_locked()
+            self._sessions[fingerprint] = ConversationSession(
+                conversation_id, oid, turn_count
+            )
+
+    def forget(self, fingerprint):
+        """Evicts one cached session -- called when a Chathub turn that
+        tried to reuse it failed, so the client's very next attempt
+        (which necessarily resends the identical `messages[:-1]`, since
+        that's the OpenAI-client contract this whole mechanism relies on)
+        gets a clean cache miss and falls back to a brand-new conversation,
+        rather than repeatedly retrying the same possibly-broken
+        `ConversationId` forever. A no-op if `fingerprint` is None or
+        already gone."""
+        if fingerprint is None:
+            return
+        with self._lock:
+            self._sessions.pop(fingerprint, None)
+
+    def _evict_expired_locked(self):
+        cutoff = time.time() - self.IDLE_TTL_S
+        expired = [k for k, s in self._sessions.items() if s.last_used_at < cutoff]
+        for k in expired:
+            del self._sessions[k]
+
+    def _evict_lru_locked(self):
+        if not self._sessions:
+            return
+        oldest_key = min(self._sessions, key=lambda k: self._sessions[k].last_used_at)
+        del self._sessions[oldest_key]
+
+
+# ------------------------------------------------------------------------------
 # Tool-calling emulation -- see REVERSE_ENGINEERING.md's "Tool-calling
 # emulation" section for the full design rationale and live-testing notes.
 #
@@ -1937,12 +2323,33 @@ _TOOL_CALL_OPEN = "<action_request>"
 _TOOL_CALL_CLOSE = "</action_request>"
 _TOOL_CALL_RE = re.compile(r"<action_request>\s*(.*?)\s*</action_request>", re.DOTALL)
 
+_CODE_MODE_INVOKE_NAME = "invoke_capability"
+_CODE_FENCE_RE = re.compile(r"```(?:\w+)?\s*\n(.*?)```", re.DOTALL)
+
+# Two independent conventions this proxy can teach the model, tried in this
+# order across retry attempts (see _TOOL_CALL_MODES/_run_tool_call_turn):
+#   "code" -- ask the model to call a pre-loaded Python function,
+#     invoke_capability(name, arguments), from ordinary code it writes and
+#     "runs" via Sydney's own code interpreter -- i.e. lean INTO Sydney's
+#     strong, repeatedly-observed preference for solving things by writing
+#     and executing Python, instead of fighting it. See
+#     _render_tools_block_code_mode's docstring and REVERSE_ENGINEERING.md's
+#     "Code-mode tool-calling emulation" section for the live-testing
+#     rationale and results.
+#   "action_request" -- the original convention: a JSON object wrapped in
+#     <action_request>...</action_request> tags, with Sydney's own code
+#     interpreter/plugins explicitly suppressed so there's nothing else for
+#     it to reach for. Kept as a fallback since it's a completely different
+#     mechanism from "code" mode and occasionally succeeds when "code" mode
+#     doesn't (or vice versa) -- see REVERSE_ENGINEERING.md.
+
 
 def _render_tools_block(tools, tool_choice):
     """Renders an OpenAI `tools` array (+ `tool_choice`) into the plain-text
-    instructions block that teaches the model this proxy's tool-calling
-    convention: a single-line JSON object `{"name": ..., "arguments": {...}}`
-    wrapped in `<action_request>...</action_request>` tags.
+    instructions block for the "action_request" convention: a single-line
+    JSON object `{"name": ..., "arguments": {...}}` wrapped in
+    `<action_request>...</action_request>` tags. See
+    `_render_tools_block_code_mode` for the other ("code") convention.
 
     The specific wording here is NOT arbitrary -- it was arrived at by live
     trial-and-error against the real Sydney backend (see
@@ -1989,30 +2396,111 @@ def _render_tools_block(tools, tool_choice):
         "",
         "Capabilities you can request this way:",
     ]
+    lines.extend(_render_capability_list(tools))
+    lines.extend(
+        _render_tool_choice_directive(
+            tool_choice,
+            forced='You MUST request "{name}" now, using the format above.',
+            required="You MUST make one of the requests above now, using the format above.",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _render_tools_block_code_mode(tools, tool_choice):
+    """Renders an OpenAI `tools` array (+ `tool_choice`) into the plain-text
+    instructions block for the "code" convention: rather than fighting
+    Sydney's strong, repeatedly-observed preference for solving things by
+    writing and "running" Python code (see `_render_tools_block`'s docstring
+    for the failed attempts to suppress that behavior), this convention
+    leans directly into it. The model is told its Python environment
+    already has one extra function loaded, `invoke_capability(name,
+    arguments)`, and is asked to call it from ordinary code exactly the way
+    it already tends to solve things -- no JSON-in-tags convention, no
+    "your other capabilities are disabled" framing.
+
+    `_extract_code_mode_calls()` parses the resulting code (from inside
+    Sydney's own ```-fenced code blocks, which it reliably uses for
+    anything it treats as "code to run") for calls to this function via a
+    real Python AST walk, so the model is free to write whatever ordinary
+    code it wants around the call(s) -- loops, comments, multiple calls,
+    print()-ing the result, etc. -- and they'll still be found. See
+    REVERSE_ENGINEERING.md's "Code-mode tool-calling emulation" section for
+    the live-testing rationale and results this design is based on.
+
+    Still prompt-level steering, not a guarantee -- same caveat as
+    `_render_tools_block`."""
+    lines = [
+        "",
+        "Your Python code execution environment has one extra function "
+        "already loaded and ready to use -- you do not need to define it "
+        "yourself, it's already there:",
+        "",
+        f"    {_CODE_MODE_INVOKE_NAME}(name, arguments)",
+        "",
+        "Write and run ordinary Python code exactly as you already would "
+        "for any other task. Whenever you need one of the capabilities "
+        f"listed below, call {_CODE_MODE_INVOKE_NAME}(name, arguments) with "
+        "the capability's name (a string) and its arguments (a dict "
+        "matching the schema shown for it), then read its return value "
+        "before continuing -- for example:",
+        "",
+        f"    result = {_CODE_MODE_INVOKE_NAME}("
+        "'<capability name>', {<arguments matching its schema>})",
+        "    print(result)",
+        "",
+        "If you don't need any of these capabilities for this reply, just "
+        "answer normally in plain text without writing any code at all. "
+        "You can call more than one of them in the same script if you need "
+        "to, and can write as much ordinary code around the call(s) as you "
+        "need.",
+        "",
+        "Capabilities available this way:",
+    ]
+    lines.extend(_render_capability_list(tools))
+    lines.extend(
+        _render_tool_choice_directive(
+            tool_choice,
+            forced=f"You MUST call {_CODE_MODE_INVOKE_NAME}('{{name}}', ...) now.",
+            required=f"You MUST call {_CODE_MODE_INVOKE_NAME}(...) now, for one of "
+            "the capabilities above.",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _render_tool_choice_directive(tool_choice, forced, required):
+    """Shared by both `_render_tools_block()` and
+    `_render_tools_block_code_mode()`: renders OpenAI's `tool_choice` field
+    into trailing directive lines (empty when `tool_choice` doesn't force
+    anything). `forced` is a format string with a `{name}` placeholder for
+    the specific forced capability; `required` is the "must use one of
+    them" wording -- each convention supplies its own phrasing."""
+    if isinstance(tool_choice, dict):
+        forced_name = (tool_choice.get("function") or {}).get("name")
+        if forced_name:
+            return ["", forced.format(name=forced_name)]
+    elif tool_choice == "required":
+        return ["", required]
+    return []
+
+
+def _render_capability_list(tools):
+    """Shared by both `_render_tools_block()` and
+    `_render_tools_block_code_mode()`: renders each tool's name (left
+    untouched -- must round-trip verbatim, see _neutralize_tool_word's
+    docstring), neutralized description, and JSON parameters schema as a
+    `"- name: description"` / `"  parameters schema: {...}"` pair of
+    lines."""
+    lines = []
     for t in tools:
         fn = t.get("function") or {}
-        name = fn.get(
-            "name", "?"
-        )  # left untouched -- must round-trip verbatim, see _neutralize_tool_word's docstring
+        name = fn.get("name", "?")
         desc = _neutralize_tool_word(fn.get("description", ""))
         params = fn.get("parameters", {})
         lines.append(f"- {name}: {desc}")
         lines.append(f"  parameters schema: {json.dumps(params)}")
-
-    if isinstance(tool_choice, dict):
-        forced_name = (tool_choice.get("function") or {}).get("name")
-        if forced_name:
-            lines.append("")
-            lines.append(
-                f'You MUST request "{forced_name}" now, using the format above.'
-            )
-    elif tool_choice == "required":
-        lines.append("")
-        lines.append(
-            "You MUST make one of the requests above now, using the format above."
-        )
-
-    return "\n".join(lines)
+    return lines
 
 
 _TOOL_WORD_RE = re.compile(r"\btools?\b", re.IGNORECASE)
@@ -2028,15 +2516,16 @@ def _neutralize_tool_word(text):
     CLIENT's own system prompt or user message content, completely outside
     this proxy's own injected instructions -- reliably makes Sydney fall
     back to preempting the request with its own real built-in capabilities
-    (the code interpreter, mainly) instead of ever considering this proxy's
-    `<action_request>` convention, confirmed by live A/B testing during
-    development (see REVERSE_ENGINEERING.md's "Tool-calling emulation"
-    section). Coding-agent system prompts (OpenCode's, OpenHands', etc.)
-    are saturated with exactly this word ("you have access to the following
-    tools", tool names/descriptions, etc.), so this proxy cannot simply ask
-    callers to avoid it -- it has to actively launder it out of the entire
-    rendered prompt whenever `tools` is present. Applied only to free-form
-    text (system/user/assistant/tool-result content and tool descriptions),
+    (the code interpreter, mainly) instead of ever considering either of
+    this proxy's tool-calling conventions ("action_request" or "code"),
+    confirmed by live A/B testing during development (see
+    REVERSE_ENGINEERING.md's "Tool-calling emulation" section). Coding-agent
+    system prompts (OpenCode's, OpenHands', etc.) are saturated with exactly
+    this word ("you have access to the following tools", tool
+    names/descriptions, etc.), so this proxy cannot simply ask callers to
+    avoid it -- it has to actively launder it out of the entire rendered
+    prompt whenever `tools` is present. Applied only to free-form text
+    (system/user/assistant/tool-result content and tool descriptions),
     never to the structural JSON (a tool's `name` field, argument/schema
     keys) that this proxy needs to parse back out of the reply verbatim."""
 
@@ -2049,17 +2538,17 @@ def _neutralize_tool_word(text):
 
 
 def _extract_tool_calls(reply_text):
-    """Parses `reply_text` for this proxy's `<tool_call>{...}</tool_call>`
-    convention (see `_render_tools_block`). Returns `(remaining_text,
-    tool_calls)`: `tool_calls` is a list of `{"id", "name", "arguments_json"}`
-    dicts (already carrying a synthesized OpenAI-style call id and a
-    compact-JSON-encoded arguments string, ready to drop into an OpenAI
-    `tool_calls` response entry), and `remaining_text` is whatever plain text
-    was outside the tags (may be empty). A tag pair with unparseable/
-    incomplete JSON inside is logged and dropped rather than raised -- the
-    model attempted a tool call but produced broken output, which should
-    surface to the client as "the model didn't call a tool" rather than
-    crash this proxy's response entirely."""
+    """Parses `reply_text` for the "action_request" convention's
+    `<action_request>{...}</action_request>` tags (see `_render_tools_block`).
+    Returns `(remaining_text, tool_calls)`: `tool_calls` is a list of
+    `{"id", "name", "arguments_json"}` dicts (already carrying a synthesized
+    OpenAI-style call id and a compact-JSON-encoded arguments string, ready
+    to drop into an OpenAI `tool_calls` response entry), and `remaining_text`
+    is whatever plain text was outside the tags (may be empty). A tag pair
+    with unparseable/incomplete JSON inside is logged and dropped rather
+    than raised -- the model attempted a tool call but produced broken
+    output, which should surface to the client as "the model didn't call a
+    tool" rather than crash this proxy's response entirely."""
     tool_calls = []
 
     def _handle(match):
@@ -2088,28 +2577,197 @@ def _extract_tool_calls(reply_text):
     return remaining, tool_calls
 
 
+def _extract_invoke_args(call_node):
+    """Given an `ast.Call` node for `invoke_capability(...)`, returns
+    `(name, arguments)` by literal-evaluating whichever AST nodes hold them
+    -- handles both positional (`invoke_capability('x', {...})`) and keyword
+    (`invoke_capability(name='x', arguments={...})`) call styles, and any
+    mix of the two. Raises `ValueError` if the call doesn't actually carry a
+    usable name/arguments pair (e.g. the model computed them from a
+    variable rather than writing a literal) -- the caller treats that as
+    "this particular call couldn't be parsed", not a hard failure."""
+    positional = list(call_node.args)
+    keywords = {kw.arg: kw.value for kw in call_node.keywords if kw.arg}
+
+    name_node = keywords.get("name")
+    if name_node is None and positional:
+        name_node = positional[0]
+    arguments_node = keywords.get("arguments")
+    if arguments_node is None and len(positional) > 1:
+        arguments_node = positional[1]
+
+    if name_node is None:
+        raise ValueError("invoke_capability(...) call has no name argument")
+    name = ast.literal_eval(name_node)
+    arguments = ast.literal_eval(arguments_node) if arguments_node is not None else {}
+    if not isinstance(name, str):
+        raise ValueError("invoke_capability(...) name argument is not a string")
+    if not isinstance(arguments, dict):
+        raise ValueError("invoke_capability(...) arguments argument is not a dict")
+    return name, arguments
+
+
+def _extract_code_mode_calls(reply_text):
+    """Parses `reply_text` for calls to the "code" convention's function,
+    `invoke_capability(name, arguments)` (see
+    `_render_tools_block_code_mode`), inside any ```-fenced code block(s) in
+    the reply -- Sydney's own code-interpreter convention reliably wraps
+    generated code this way (e.g. "Coding and executing```python\n...\n```"),
+    confirmed across many live captures during development; if no fenced
+    block is found at all, the entire reply is tried as a last resort, in
+    case the model wrote bare code with no fence.
+
+    Each candidate block is parsed as a real Python AST via `ast.parse()`
+    and walked for `Call` nodes whose function is a bare `Name` matching
+    `_CODE_MODE_INVOKE_NAME` -- this means the model is free to write
+    completely ordinary Python around the call(s) (comments, loops,
+    multiple calls, whatever) and they'll still be found, unlike a naive
+    regex over the raw text. A block that isn't valid Python at all, or an
+    `invoke_capability(...)` call whose arguments aren't literal enough for
+    `ast.literal_eval` (see `_extract_invoke_args`), is skipped rather than
+    raised -- same "degrade to no call, don't crash" policy as
+    `_extract_tool_calls`.
+
+    Returns `(remaining_text, tool_calls)` in the same shape as
+    `_extract_tool_calls` for symmetry, though `remaining_text` is unused by
+    every current caller (same as it already effectively was for the
+    "action_request" convention -- see `_run_tool_call_turn`'s callers,
+    which always fall back to the RAW reply text, not a stripped version,
+    whenever no calls were found)."""
+    tool_calls = []
+    blocks = _CODE_FENCE_RE.findall(reply_text) or [reply_text]
+
+    for block in blocks:
+        try:
+            tree = ast.parse(block)
+        except (SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == _CODE_MODE_INVOKE_NAME
+            ):
+                continue
+            try:
+                name, arguments = _extract_invoke_args(node)
+            except ValueError as e:
+                logging.warning(
+                    "model emitted an %s(...) call this proxy couldn't parse "
+                    "the arguments of, skipping it: %r",
+                    _CODE_MODE_INVOKE_NAME,
+                    e,
+                )
+                continue
+            tool_calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "name": name,
+                    "arguments_json": json.dumps(arguments),
+                }
+            )
+
+    return reply_text, tool_calls
+
+
 _TOOL_CALL_MAX_ATTEMPTS = 3
+_TOOL_CALL_MODES = ("code", "action_request", "code")
 
 
-def _run_tool_call_turn(token_cache, prompt, max_attempts=_TOOL_CALL_MAX_ATTEMPTS):
-    """Runs one Chathub turn with `tools_requested=True`, retrying as brand-
-    new, independent Chathub turns (Sydney has no memory to preserve across
-    a retry anyway -- see `_render_conversation_prompt`'s docstring) up to
-    `max_attempts` times if the reply doesn't contain a parseable
-    `<action_request>` tag.
+def _looks_like_throttled_empty_reply(text):
+    """Returns True if `text` is empty or whitespace-only.
 
-    This retry exists because whether the underlying model actually follows
-    this proxy's tool-calling convention on any given turn is genuinely
-    probabilistic, not deterministic: live A/B testing during development
-    measured roughly a 50% success rate on even the simplest possible
-    single-capability request, with Sydney's own built-in code interpreter
-    silently preempting the rest of the time -- see REVERSE_ENGINEERING.md's
-    "Tool-calling emulation" section for the exact trial data and why a
-    single attempt alone was not an acceptable design. Retrying
-    substantially raises the *effective* success rate (if failures were
-    independent, 3 attempts at 50% each would be ~87.5%; REVERSE_ENGINEERING.md
-    documents the actual measured rate, which was somewhat lower --
-    consecutive failures are not perfectly independent in practice).
+    A completely empty reply from Sydney is NOT a normal "the model chose
+    to say nothing" outcome to treat as a valid (if boring) answer -- live
+    testing during development found this is what Sydney silently returns
+    once Microsoft-side throttling kicks in after a burst of requests in a
+    short window: no explicit error, no AuthError message, the Chathub
+    turn just completes normally (`Chathub reply complete (total_length=0
+    chars)` in this proxy's own log) with zero content, and this happens
+    for a *plain* chat turn just as much as a tool-calling one -- it is not
+    specific to anything this proxy does with `tools`. It was reproduced
+    reliably after roughly 40-50 requests in a few minutes during this
+    proxy's own tool-calling emulation A/B testing, and did not clear after
+    45 seconds, only after a few minutes (see REVERSE_ENGINEERING.md's
+    "Sydney-side request throttling" section for the exact timeline). The
+    Chathub protocol's own `throttling: {maxNumUserMessagesInConversation,
+    ...}` field (see REVERSE_ENGINEERING.md) is presumably related, though
+    this proxy has never observed it populated with anything informative
+    that would let it detect the condition proactively instead of
+    reactively (i.e. only after already getting an empty reply).
+
+    Treating this as a normal empty answer would silently confuse whoever's
+    on the other end of the API -- a coding agent has no way to distinguish
+    "the model genuinely had nothing to say" from "you're being throttled,
+    back off and retry later" if both come back as an ordinary 200 with
+    empty content. See this function's callers for how it's surfaced
+    instead (a clear error rather than a silent empty success)."""
+    return not text.strip()
+
+
+#: The one user-facing message for the empty-reply throttle shape above --
+#: shared by every surface point (non-streaming 429 body, streaming SSE
+#: error event) so clients see the same text no matter which path hit it.
+_THROTTLED_EMPTY_MSG = (
+    "Sydney returned a completely empty reply. This usually means Microsoft "
+    "is temporarily throttling this account after a burst of requests -- "
+    "wait a bit (a minute or more) and try again."
+)
+
+
+def _extract_calls_for_mode(mode, text):
+    """Dispatches to the extractor matching `mode` (see _TOOL_CALL_MODES) --
+    keeps _run_tool_call_turn's retry loop mode-agnostic."""
+    if mode == "code":
+        return _extract_code_mode_calls(text)
+    return _extract_tool_calls(text)
+
+
+def _openai_tool_call_entries(tool_calls, with_index=False):
+    """Renders extracted tool calls (`{"id", "name", "arguments_json"}`
+    dicts, see the extractors above) as OpenAI response `tool_calls`
+    entries. `with_index=True` adds the `index` key that streaming chunk
+    deltas carry but full responses don't -- the only difference between
+    the two response shapes."""
+    entries = []
+    for i, tc in enumerate(tool_calls):
+        entry = {
+            "id": tc["id"],
+            "type": "function",
+            "function": {"name": tc["name"], "arguments": tc["arguments_json"]},
+        }
+        if with_index:
+            entry = {"index": i, **entry}
+        entries.append(entry)
+    return entries
+
+
+def _run_tool_call_turn(
+    token_cache, messages, tools, tool_choice, max_attempts=_TOOL_CALL_MAX_ATTEMPTS
+):
+    """Runs one Chathub turn per attempt (up to `max_attempts`), each as a
+    brand-new, independent Chathub turn (Sydney has no memory to preserve
+    across a retry anyway -- see `_render_conversation_prompt`'s docstring),
+    retrying if the reply doesn't contain a parseable tool call. Unlike a
+    single fixed convention, each attempt's PROMPT is rendered fresh from
+    `messages`/`tools`/`tool_choice` using whichever convention
+    `_TOOL_CALL_MODES` assigns that attempt number (cycling through "code"
+    and "action_request" -- see that tuple's definition and
+    REVERSE_ENGINEERING.md's "Code-mode tool-calling emulation" section for
+    why trying more than one independent convention, rather than retrying
+    the same one, meaningfully raises the effective success rate): a prompt
+    that fails to get a parseable call under one convention on one attempt
+    may well succeed under the other on the very next attempt, since the
+    two conventions fail in different, largely uncorrelated ways (Sydney's
+    own code interpreter self-preempting vs. a flat refusal).
+
+    This retry-and-vary-convention design exists because whether the
+    underlying model actually follows either of this proxy's tool-calling
+    conventions on any given turn is genuinely probabilistic, not
+    deterministic -- see REVERSE_ENGINEERING.md's "Tool-calling emulation"
+    and "Code-mode tool-calling emulation" sections for the exact trial data
+    driving this design, including why a single attempt (or a single fixed
+    convention retried unchanged) was not judged an acceptable design.
 
     Returns `(text, tool_calls)` from whichever attempt produced tool_calls,
     or from the LAST attempt if none did across all attempts -- so the
@@ -2117,20 +2775,33 @@ def _run_tool_call_turn(token_cache, prompt, max_attempts=_TOOL_CALL_MAX_ATTEMPT
     "stop") rather than nothing at all."""
     text, tool_calls = "", []
     for attempt in range(1, max_attempts + 1):
-        text = "".join(run_chat_turn(token_cache, prompt, tools_requested=True))
-        _, tool_calls = _extract_tool_calls(text)
+        mode = _TOOL_CALL_MODES[(attempt - 1) % len(_TOOL_CALL_MODES)]
+        prompt = _render_conversation_prompt(
+            messages, tools=tools, tool_choice=tool_choice, mode=mode
+        )
+        logging.info(
+            "tool-call emulation attempt %d/%d: mode=%s rendered_prompt_length=%d chars",
+            attempt,
+            max_attempts,
+            mode,
+            len(prompt),
+        )
+        text = "".join(run_chat_turn(token_cache, prompt, tool_mode=mode))
+        _, tool_calls = _extract_calls_for_mode(mode, text)
         if tool_calls:
             if attempt > 1:
                 logging.info(
-                    "tool-call emulation succeeded on retry attempt %d/%d",
+                    "tool-call emulation succeeded on retry attempt %d/%d (mode=%s)",
                     attempt,
                     max_attempts,
+                    mode,
                 )
             return text, tool_calls
         logging.info(
-            "tool-call emulation attempt %d/%d produced no action_request block%s",
+            "tool-call emulation attempt %d/%d (mode=%s) produced no call%s",
             attempt,
             max_attempts,
+            mode,
             ""
             if attempt < max_attempts
             else " -- giving up, falling back to plain content",
@@ -2138,29 +2809,34 @@ def _run_tool_call_turn(token_cache, prompt, max_attempts=_TOOL_CALL_MAX_ATTEMPT
     return text, tool_calls
 
 
-def _render_conversation_prompt(messages, tools=None, tool_choice=None):
+def _render_conversation_prompt(
+    messages, tools=None, tool_choice=None, mode="action_request"
+):
     """Renders an OpenAI `messages[]` array (optionally plus a `tools`
-    schema list and `tool_choice`) into the single text blob that becomes
-    one Chathub turn's `message.text`.
+    schema list, `tool_choice`, and a tool-calling `mode` -- "action_request"
+    or "code", see the module-level comment above `_render_tools_block`)
+    into the single text blob that becomes one Chathub turn's `message.text`.
 
     Sydney/Chathub has no native `messages` concept: one Chathub turn is a
-    single freeform text string, and every call to run_chat_turn() mints a
-    brand-new Chathub ConversationId (whether Sydney would honor a *stable*
-    ConversationId as server-side memory across turns is unconfirmed and
-    untested -- see REVERSE_ENGINEERING.md -- so this proxy does not rely on
-    that and instead treats every Chathub turn as independent).
+    single freeform text string. This function renders a FRESH conversation
+    turn -- the whole running transcript, context-stuffed into one blob --
+    for whichever call ends up minting a brand-new Chathub `ConversationId`:
+    either the genuine first turn of a conversation, or any turn
+    ConversationSessionStore didn't recognize as a continuation (see that
+    class and the "Sydney-native conversation continuity" section comment
+    above `_conversation_fingerprint` for when Sydney's own server-side
+    memory is used instead -- confirmed live to work, see
+    REVERSE_ENGINEERING.md -- via `_render_continuation_delta`, which sends
+    only the newest message rather than this function's full-transcript
+    rendering).
 
-    Multi-turn conversations are instead supported the same way many
-    bridges handle backends with no native `system` role or message
-    history: "context-stuffing" -- the full running conversation (system
-    instructions + prior turns) is rendered as plain text and Sydney is
-    asked to continue it, with the whole thing discarded once the turn
-    completes. This is what makes stateless-per-request clients that
-    resend their full growing conversation on every call (e.g. a tool-
-    calling coding agent's follow-up request after a tool result) work
-    through this proxy: from Sydney's point of view each call is still a
-    single fresh one-shot turn, but that turn now contains everything the
-    client considers "the conversation so far."
+    Context-stuffing here is still what many bridges use for backends with
+    no native `system` role or message history, and is still exactly what
+    makes a stateless-per-request client's full growing conversation (e.g.
+    a tool-calling coding agent's follow-up request after a tool result)
+    work through this proxy on a cache miss: from Sydney's point of view
+    that call is still a single fresh one-shot turn, but the turn now
+    contains everything the client considers "the conversation so far."
 
     An assistant message carrying `tool_calls` (content may be null) is NOT
     rendered as its own conversation turn -- only real assistant dialogue
@@ -2178,10 +2854,11 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
     *user's* turn instead, worded as ordinary supplied context rather than
     fabricated assistant history, reliably avoided the refusal in the same
     A/B comparison -- see REVERSE_ENGINEERING.md's "Tool-calling emulation"
-    section for the exact trial transcripts. If `tools` is given,
-    `_render_tools_block()`'s instructions are appended to the system/
-    instructions section -- see the "Tool-calling emulation" comment block
-    above this function.
+    section for the exact trial transcripts. The exact wording of that fold
+    differs by `mode` (see `_fold_pending` below) so it stays consistent
+    with whichever convention this turn is using. If `tools` is given, the
+    instructions matching `mode` are appended to the system/instructions
+    section.
 
     For the simple common case of a single user-only message with no
     system prompt, no prior turns, and no `tools` (e.g. a quick curl test,
@@ -2203,13 +2880,21 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
         """Prepends any buffered tool-result text onto `text` as ordinary
         parenthetical context and clears the buffer -- see this function's
         caller-level docstring for why this replaces rendering a fabricated
-        assistant history turn."""
+        assistant history turn. Phrased to match `mode` so a "code"-mode
+        turn reads as a continuation of that turn's own code-execution
+        narrative rather than an unrelated JSON-request framing."""
         nonlocal pending_results
         if not pending_results:
             return text
-        preamble = "\n".join(
-            f"(Result of your earlier {n} request: {t})" for n, t in pending_results
-        )
+        if mode == "code":
+            preamble = "\n".join(
+                f"({_CODE_MODE_INVOKE_NAME}('{n}', ...) returned: {t})"
+                for n, t in pending_results
+            )
+        else:
+            preamble = "\n".join(
+                f"(Result of your earlier {n} request: {t})" for n, t in pending_results
+            )
         pending_results = []
         return f"{preamble}\n\n{text}" if text else preamble
 
@@ -2262,7 +2947,13 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
     if not turns:
         return None
 
-    tools_block = _render_tools_block(tools, tool_choice) if tools else None
+    tools_block = None
+    if tools:
+        tools_block = (
+            _render_tools_block_code_mode(tools, tool_choice)
+            if mode == "code"
+            else _render_tools_block(tools, tool_choice)
+        )
 
     # Simple case: exactly one user message, no system prompt, no tools --
     # send it verbatim, unchanged from this proxy's original behavior.
@@ -2303,24 +2994,152 @@ def _render_conversation_prompt(messages, tools=None, tool_choice=None):
         # at that scale than in this proxy's small (~2KB) test prompts (see
         # REVERSE_ENGINEERING.md's "Tool-calling emulation at production
         # scale" section). Kept short on purpose so it doesn't itself become
-        # a wall of buried text.
-        lines.append(
-            "### Reminder before you reply\n"
-            "You have no internet access or code execution this turn. If you "
-            "need information or to take an action, reply with ONLY one or "
-            f"more {_TOOL_CALL_OPEN}...{_TOOL_CALL_CLOSE} blocks as described "
-            "above and nothing else. Otherwise, reply normally in plain text."
-        )
+        # a wall of buried text. Worded to match `mode`.
+        if mode == "code":
+            lines.append(
+                "### Reminder before you reply\n"
+                "If you need one of the capabilities above, write and run a "
+                f"short Python snippet that calls {_CODE_MODE_INVOKE_NAME}"
+                "(name, arguments) and reads the result, exactly as described "
+                "above. Otherwise, just answer normally in plain text."
+            )
+        else:
+            lines.append(
+                "### Reminder before you reply\n"
+                "You have no internet access or code execution this turn. If you "
+                "need information or to take an action, reply with ONLY one or "
+                f"more {_TOOL_CALL_OPEN}...{_TOOL_CALL_CLOSE} blocks as described "
+                "above and nothing else. Otherwise, reply normally in plain text."
+            )
         lines.append("")
     lines.append("### Respond to this message")
     lines.append(f"{last_label}: {last_text}")
     return "\n".join(lines)
 
 
-def make_handler(token_cache):
+class _ChatTurnPlan:
+    """Everything needed to run one Chathub turn for a `/v1/chat/completions`
+    request and then update the ConversationSessionStore afterwards --
+    built once by `_plan_chat_turn()` and used by both `_handle_full` and
+    `_handle_streaming`."""
+
+    __slots__ = (
+        "prompt",
+        "conversation_id",
+        "is_continuation",
+        "lookup_fingerprint",
+        "should_track",
+        "messages",
+        "tools",
+        "tool_choice",
+        "oid",
+        "turn_count",
+    )
+
+    def __init__(
+        self,
+        prompt,
+        conversation_id,
+        is_continuation,
+        lookup_fingerprint,
+        should_track,
+        messages,
+        tools,
+        tool_choice,
+        oid,
+        turn_count,
+    ):
+        self.prompt = prompt
+        self.conversation_id = conversation_id
+        self.is_continuation = is_continuation
+        self.lookup_fingerprint = lookup_fingerprint
+        self.should_track = should_track
+        self.messages = messages
+        self.tools = tools
+        self.tool_choice = tool_choice
+        self.oid = oid
+        #: turn_count to `remember()` this conversation under if this turn
+        #: succeeds -- i.e. how many turns deep the reused Sydney
+        #: `ConversationId` will be AFTER this one, purely for logging (see
+        #: ConversationSession.turn_count).
+        self.turn_count = turn_count
+
+
+def _fresh_conversation_turn(messages, tools, tool_choice):
+    """Builds the prompt + brand-new Sydney `ConversationId` for an ordinary,
+    non-continuation turn -- the pre-existing behavior (context-stuff the
+    whole `messages[]` array into one turn under a fresh conversation).
+    Returns `(prompt, conversation_id)`, or `(None, None)` if there's no
+    usable text in `messages` at all."""
+    prompt = _render_conversation_prompt(messages, tools=tools, tool_choice=tool_choice)
+    if prompt is None:
+        return None, None
+    return prompt, str(uuid.uuid4())
+
+
+def _plan_chat_turn(token_cache, messages, tools, tool_choice, conversation_sessions):
+    """Builds a `_ChatTurnPlan` for one `/v1/chat/completions` request:
+    recognizes a Sydney-native continuation when possible (see
+    ConversationSessionStore), else falls back to the pre-existing
+    context-stuffed, brand-new-conversation behavior. Returns None if
+    there's no usable text in `messages` at all.
+
+    `conversation_sessions` is None when continuity is disabled
+    (--disable-conversation-continuity) -- every request then takes the
+    fresh-conversation path, identical to this proxy's behavior before this
+    feature existed."""
+    should_track = conversation_sessions is not None and not tools
+    oid = token_cache.get().oid if should_track else None
+
+    if should_track and len(messages) >= 2:
+        lookup_fingerprint = _conversation_fingerprint(messages[:-1])
+        session = conversation_sessions.lookup(lookup_fingerprint, oid)
+        if session is not None:
+            delta = _render_continuation_delta(messages[-1])
+            if delta is not None:
+                logging.info(
+                    "recognized as a Sydney-native continuation "
+                    "(conversation_id=%s, turn=%d) -- sending only the newest "
+                    "message (delta_length=%d chars) instead of context-stuffing",
+                    session.conversation_id,
+                    session.turn_count + 1,
+                    len(delta),
+                )
+                return _ChatTurnPlan(
+                    prompt=delta,
+                    conversation_id=session.conversation_id,
+                    is_continuation=True,
+                    lookup_fingerprint=lookup_fingerprint,
+                    should_track=True,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    oid=oid,
+                    turn_count=session.turn_count + 1,
+                )
+
+    prompt, conversation_id = _fresh_conversation_turn(messages, tools, tool_choice)
+    if prompt is None:
+        return None
+    return _ChatTurnPlan(
+        prompt=prompt,
+        conversation_id=conversation_id,
+        is_continuation=False,
+        lookup_fingerprint=None,
+        should_track=should_track,
+        messages=messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        oid=oid,
+        turn_count=1,
+    )
+
+
+def make_handler(token_cache, conversation_sessions):
     """Builds a request handler class bound to one TokenCache (in turn bound
     to one CredentialStore) -- the single configured Microsoft identity this
-    proxy instance speaks as."""
+    proxy instance speaks as -- and one ConversationSessionStore (or None if
+    --disable-conversation-continuity was given)."""
 
     class ProxyHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -2424,32 +3243,133 @@ def make_handler(token_cache):
             messages = body.get("messages") or []
             tools = body.get("tools") or None
             tool_choice = body.get("tool_choice")
-            prompt = _render_conversation_prompt(
-                messages, tools=tools, tool_choice=tool_choice
-            )
-            if prompt is None:
-                self._error(400, "no usable message content found in 'messages'")
-                return
-
             model = body.get("model") or "m365-copilot"
             stream = bool(body.get("stream", False))
+
+            plan = _plan_chat_turn(
+                token_cache, messages, tools, tool_choice, conversation_sessions
+            )
+            if plan is None:
+                self._error(400, "no usable message content found in 'messages'")
+                return
             logging.info(
                 "chat completion request from %s: %d message(s), rendered_prompt_length=%d chars, "
-                "stream=%s, model=%r, tools=%d",
+                "stream=%s, model=%r, tools=%d, continuation=%s",
                 self.address_string(),
                 len(messages),
-                len(prompt),
+                len(plan.prompt),
                 stream,
                 model,
                 len(tools or []),
+                plan.is_continuation,
+            )
+            if stream:
+                self._handle_streaming(plan, model)
+            else:
+                self._handle_full(plan, model)
+
+        def _remember_turn(self, plan, text):
+            """Shared tail of `_run_plain_turn`/`_stream_plain_turn`: if
+            `plan` is tracked, remembers the completed turn's conversation
+            state under a fingerprint of `messages + [this reply]` so the
+            client's next call can be recognized as a continuation."""
+            if not plan.should_track:
+                return
+            new_fingerprint = _conversation_fingerprint(
+                plan.messages + [{"role": "assistant", "content": text}]
+            )
+            conversation_sessions.remember(
+                new_fingerprint, plan.conversation_id, plan.oid, plan.turn_count
             )
 
-            if stream:
-                self._handle_streaming(prompt, model, tools_requested=bool(tools))
-            else:
-                self._handle_full(prompt, model, tools_requested=bool(tools))
+        def _run_plain_turn(self, plan):
+            """Runs one plain-text (no `tools`) Chathub turn per `plan`,
+            with ConversationSessionStore bookkeeping: on success, remembers
+            the resulting conversation state under a fingerprint of
+            `messages + [this reply]` so the client's next call can be
+            recognized as a continuation. If `plan` WAS a continuation and
+            the Chathub turn failed, forgets the now-suspect cached session
+            and retries once as a brand-new, fully context-stuffed
+            conversation before giving up -- safe here (unlike the
+            streaming path below) because nothing has been written to the
+            HTTP response yet at this point."""
+            try:
+                text = "".join(
+                    run_chat_turn(
+                        token_cache, plan.prompt, conversation_id=plan.conversation_id
+                    )
+                )
+            except ThrottledError:
+                # Sydney itself is over capacity right now, not specifically
+                # unhappy with this conversation_id -- a fresh conversation
+                # would not be any less throttled, so retrying immediately
+                # would just burn a second doomed Chathub call. Forget the
+                # session regardless (harmless either way) and propagate so
+                # the client sees the real reason and can back off/retry
+                # itself, same as a non-continuation turn always has.
+                if plan.is_continuation:
+                    conversation_sessions.forget(plan.lookup_fingerprint)
+                raise
+            except Exception:
+                if not plan.is_continuation:
+                    raise
+                logging.warning(
+                    "Sydney-native continuation turn failed (conversation_id=%s) "
+                    "-- forgetting the cached session and retrying once as a "
+                    "brand-new conversation",
+                    plan.conversation_id,
+                    exc_info=True,
+                )
+                conversation_sessions.forget(plan.lookup_fingerprint)
+                fresh_prompt, fresh_conversation_id = _fresh_conversation_turn(
+                    plan.messages, plan.tools, plan.tool_choice
+                )
+                if fresh_prompt is None:
+                    raise
+                plan.prompt = fresh_prompt
+                plan.conversation_id = fresh_conversation_id
+                plan.is_continuation = False
+                plan.turn_count = 1
+                text = "".join(
+                    run_chat_turn(
+                        token_cache, plan.prompt, conversation_id=plan.conversation_id
+                    )
+                )
 
-        def _handle_streaming(self, prompt, model, tools_requested=False):
+            self._remember_turn(plan, text)
+            return text
+
+        def _stream_plain_turn(self, plan):
+            """Generator equivalent of `_run_plain_turn` for the streaming
+            path: yields text deltas, doing the same success-path
+            bookkeeping, but -- unlike `_run_plain_turn` -- does NOT retry a
+            failed continuation turn in place. Once a delta has been
+            flushed to the client there is no safe way to restart a fresh
+            conversation without duplicating output, so a broken
+            continuation is only forgotten here (so the client's own next
+            request, resending the same transcript, gets a clean cache miss
+            and a fresh conversation) rather than retried."""
+            parts = []
+            try:
+                for delta in run_chat_turn(
+                    token_cache, plan.prompt, conversation_id=plan.conversation_id
+                ):
+                    parts.append(delta)
+                    yield delta
+            except Exception:
+                if plan.is_continuation:
+                    logging.warning(
+                        "Sydney-native continuation turn failed mid-stream "
+                        "(conversation_id=%s) -- forgetting the cached session "
+                        "so the next request starts fresh",
+                        plan.conversation_id,
+                    )
+                    conversation_sessions.forget(plan.lookup_fingerprint)
+                raise
+
+            self._remember_turn(plan, "".join(parts))
+
+        def _handle_streaming(self, plan, model):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -2459,6 +3379,7 @@ def make_handler(token_cache):
 
             completion_id = f"chatcmpl-{uuid.uuid4().hex}"
             created = int(time.time())
+            tools_requested = bool(plan.tools)
 
             def emit(delta_obj, finish_reason=None):
                 chunk = {
@@ -2477,12 +3398,15 @@ def make_handler(token_cache):
                 if tools_requested:
                     # Buffered mode: whether this reply is plain content or a
                     # tool call can only be known once the FULL text has been
-                    # seen (see _extract_tool_calls), so there is no true
-                    # incremental streaming when `tools` is present -- the
-                    # whole reply is collected first, then emitted as one
-                    # chunk. Documented as a known limitation. See
-                    # _run_tool_call_turn for why this retries internally.
-                    text, tool_calls = _run_tool_call_turn(token_cache, prompt)
+                    # seen (see _extract_tool_calls/_extract_code_mode_calls),
+                    # so there is no true incremental streaming when `tools`
+                    # is present -- the whole reply is collected first, then
+                    # emitted as one chunk. Documented as a known limitation.
+                    # See _run_tool_call_turn for why this retries internally
+                    # (and across more than one tool-calling convention).
+                    text, tool_calls = _run_tool_call_turn(
+                        token_cache, plan.messages, plan.tools, plan.tool_choice
+                    )
                     if tool_calls:
                         # Leftover text is deliberately dropped here, not
                         # surfaced as delta content -- see _handle_full's
@@ -2490,33 +3414,39 @@ def make_handler(token_cache):
                         emit(
                             {
                                 "role": "assistant",
-                                "tool_calls": [
-                                    {
-                                        "index": i,
-                                        "id": tc["id"],
-                                        "type": "function",
-                                        "function": {
-                                            "name": tc["name"],
-                                            "arguments": tc["arguments_json"],
-                                        },
-                                    }
-                                    for i, tc in enumerate(tool_calls)
-                                ],
+                                "tool_calls": _openai_tool_call_entries(
+                                    tool_calls, with_index=True
+                                ),
                             }
                         )
                         finish_reason = "tool_calls"
+                    elif _looks_like_throttled_empty_reply(text):
+                        # See _looks_like_throttled_empty_reply's docstring:
+                        # raising here (rather than emitting a fake
+                        # successful empty completion) routes this into the
+                        # `except Exception` handler below, which surfaces
+                        # it as a proper SSE error event (type
+                        # `upstream_throttled`) instead of a silent
+                        # "the assistant said nothing" success.
+                        raise ThrottledError(_THROTTLED_EMPTY_MSG)
                     else:
                         emit({"role": "assistant", "content": text})
                         finish_reason = "stop"
                 else:
                     first = True
-                    for delta in run_chat_turn(token_cache, prompt):
+                    for delta in self._stream_plain_turn(plan):
                         emit(
                             {"role": "assistant", "content": delta}
                             if first
                             else {"content": delta}
                         )
                         first = False
+                    if first:
+                        # No delta was ever yielded at all -- see
+                        # _looks_like_throttled_empty_reply's docstring for
+                        # why this is treated as an error, not a valid
+                        # (if terse) empty answer.
+                        raise ThrottledError(_THROTTLED_EMPTY_MSG)
                     finish_reason = "stop"
 
                 final = {
@@ -2546,25 +3476,56 @@ def make_handler(token_cache):
                 logging.exception(
                     "chat completion (streaming) %s failed", completion_id
                 )
-                err = {"error": {"message": str(e), "type": "proxy_error"}}
+                err_type = (
+                    "upstream_throttled"
+                    if isinstance(e, ThrottledError)
+                    else "proxy_error"
+                )
+                err = {"error": {"message": str(e), "type": err_type}}
                 try:
                     self.wfile.write(f"data: {json.dumps(err)}\n\n".encode("utf-8"))
                     self.wfile.flush()
                 except OSError:
                     pass
 
-        def _handle_full(self, prompt, model, tools_requested=False):
+        def _handle_full(self, plan, model):
             completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            tools_requested = bool(plan.tools)
             try:
                 if tools_requested:
-                    text, tool_calls = _run_tool_call_turn(token_cache, prompt)
+                    text, tool_calls = _run_tool_call_turn(
+                        token_cache, plan.messages, plan.tools, plan.tool_choice
+                    )
                 else:
-                    text, tool_calls = "".join(run_chat_turn(token_cache, prompt)), []
+                    text, tool_calls = self._run_plain_turn(plan), []
+            except ThrottledError as e:
+                # Sydney explicitly refused the turn with its own rate-limit
+                # message -- surface it as 429 (Too Many Requests), the code
+                # OpenAI clients/SDKs already know to back off and retry on,
+                # matching the empty-reply throttle detection below.
+                logging.exception("chat completion %s throttled", completion_id)
+                self._error(429, str(e), err_type="upstream_throttled")
+                return
             except Exception as e:
                 # See the comment in _handle_streaming's except clause: broad
                 # on purpose, so any bug still produces a diagnosable log entry.
                 logging.exception("chat completion %s failed", completion_id)
                 self._error(502, str(e))
+                return
+
+            if not tool_calls and _looks_like_throttled_empty_reply(text):
+                # See _looks_like_throttled_empty_reply's docstring: a
+                # completely empty reply is surfaced as an error, not a
+                # silent 200-with-empty-content "success" that would leave
+                # the caller unable to tell "the model said nothing" apart
+                # from "you're being throttled, back off and retry later".
+                logging.error(
+                    "chat completion %s got a completely empty reply from "
+                    "Sydney -- likely Microsoft-side throttling after a "
+                    "burst of requests, surfacing as an error",
+                    completion_id,
+                )
+                self._error(429, _THROTTLED_EMPTY_MSG, err_type="upstream_throttled")
                 return
 
             if tool_calls:
@@ -2579,17 +3540,7 @@ def make_handler(token_cache):
                 message = {
                     "role": "assistant",
                     "content": None,
-                    "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments_json"],
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
+                    "tool_calls": _openai_tool_call_entries(tool_calls),
                 }
                 finish_reason = "tool_calls"
                 logging.info(
@@ -2710,13 +3661,15 @@ def _log_startup_banner(args):
         platform.platform(),
     )
     logging.info(
-        "args: host=%s port=%d credentials_prefix=%s log_file=%s log_level=%s init_credentials=%s",
+        "args: host=%s port=%d credentials_prefix=%s log_file=%s log_level=%s "
+        "init_credentials=%s disable_conversation_continuity=%s",
         args.host,
         args.port,
         args.credentials_prefix,
         args.log_file,
         args.log_level,
         args.init_credentials,
+        args.disable_conversation_continuity,
     )
     logging.info("cwd=%s script=%s", os.getcwd(), os.path.abspath(__file__))
     logging.info("=" * 78)
@@ -2790,6 +3743,15 @@ def main():
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="log verbosity for --log-file (default: INFO)",
     )
+    parser.add_argument(
+        "--disable-conversation-continuity",
+        action="store_true",
+        help="always context-stuff the whole conversation into a brand-new Sydney "
+        "conversation on every call, never reusing Sydney's own server-side "
+        "conversation memory -- this proxy's original behavior. Continuity is "
+        "enabled by default (see module docstring's 'Sydney-native conversation "
+        "continuity' section); this is an escape hatch if it ever causes trouble",
+    )
     args = parser.parse_args()
 
     _configure_logging(args.log_file, getattr(logging, args.log_level))
@@ -2844,12 +3806,19 @@ def main():
         )
         sys.exit(1)
 
-    handler_cls = make_handler(token_cache)
+    conversation_sessions = (
+        None if args.disable_conversation_continuity else ConversationSessionStore()
+    )
+    handler_cls = make_handler(token_cache, conversation_sessions)
     server = _LoggingHTTPServer((args.host, args.port), handler_cls)
     logging.info(
-        "listening on http://%s:%d (Ctrl+C to stop) -- no auth required on the API itself",
+        "listening on http://%s:%d (Ctrl+C to stop) -- no auth required on the API "
+        "itself; Sydney-native conversation continuity is %s",
         args.host,
         args.port,
+        "disabled (--disable-conversation-continuity)"
+        if conversation_sessions is None
+        else "enabled",
     )
     try:
         server.serve_forever()

@@ -4,20 +4,21 @@ A single, self-contained, stdlib-only Python 3 script that exposes an
 OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`) backed by
 `https://m365.cloud.microsoft`'s Copilot chat backend.
 
-> **Before you integrate this with anything:** each `/v1/chat/completions`
-> call still opens a fresh, brand-new Sydney conversation under the hood —
-> Sydney's own server-side conversation memory is never used. Multi-turn
-> history works by "context-stuffing": the proxy renders the *entire*
-> `messages` array (system prompt + every prior turn) into one text blob
-> and sends that as a single Chathub turn, which is exactly what stateless
-> per-request clients already expect. Tool/function calling (`tools` /
-> `tool_calls`) is now implemented, but it is **emulated by prompting, on
-> a backend with no native concept of it, and it is probabilistic — not a
-> guarantee**. See "Known limitations" before depending on it for a real
-> agent loop. **If your client is OpenHands, prefer its own client-side
-> "mock function calling" mode over this proxy's `tools` emulation — it is
-> dramatically more reliable (3/3 vs. ~coin-flip in testing); see "Using
-> this with a coding agent" below.**
+> **Before you integrate this with anything:** multi-turn conversations now
+> reuse Sydney's own server-side conversation memory when possible (live-
+> confirmed — see REVERSE_ENGINEERING.md's "Sydney-native conversation
+> continuity" section), falling back automatically to the original
+> "context-stuffing" behavior (rendering the *entire* `messages` array into
+> one text blob per Chathub turn) whenever that can't be established —
+> `tools`-using requests always take the context-stuffing path for now (see
+> "Known limitations"). Tool/function calling (`tools` / `tool_calls`) is
+> implemented, but it is **emulated by prompting, on a backend with no
+> native concept of it, and it is probabilistic — not a guarantee**. See
+> "Known limitations" before depending on it for a real agent loop. **If
+> your client is OpenHands, prefer its own client-side "mock function
+> calling" mode over this proxy's `tools` emulation — it is dramatically
+> more reliable (3/3 vs. ~coin-flip in testing); see "Using this with a
+> coding agent" below.**
 
 **Fully self-contained.** The entire project is the one file,
 `m365_openai_proxy.py`. It uses only the Python 3 standard library — no
@@ -82,16 +83,25 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
 
 ## Known limitations
 
-- **Multi-turn memory is context-stuffing, not native Sydney state.** Every
-  call still mints a brand-new Sydney `ConversationId` — this proxy renders
-  the whole incoming `messages` array (system/developer instructions + all
-  prior turns) into one text blob and sends that as a single Chathub turn.
-  This works well for clients that resend their full conversation on every
-  request (Aider does this), but the effective prompt grows with the
-  conversation, so very long sessions may eventually hit whatever
-  context/size limit Sydney enforces (unconfirmed, not surfaced by this
-  proxy). A client expecting genuine server-side thread continuation
-  independent of what it resends will not get that.
+- **Multi-turn memory now prefers Sydney's own native conversation state,
+  with context-stuffing kept as an automatic fallback.** A live experiment
+  confirmed Sydney honors a `ConversationId` reused across a brand-new,
+  independent Chathub WebSocket connection as real server-side conversation
+  memory — see REVERSE_ENGINEERING.md's "Sydney-native conversation
+  continuity" section for the full transcript. When an incoming request's
+  `messages[]` array is recognized as an exact continuation of a
+  conversation this proxy already relayed (and the request has no `tools`
+  — see below), only the newest message is sent on the reused
+  `ConversationId`, instead of re-rendering and resending the whole growing
+  transcript every time. Any time that can't be established with
+  confidence — the first turn of a conversation, edited/branched history,
+  `tools` present, or the proxy having restarted (this is in-memory only,
+  never persisted) — it falls back to the original behavior: render the
+  whole `messages` array into one text blob and send it as a single turn on
+  a brand-new `ConversationId`. This is fully additive: it never changes
+  what a request can produce, only how much has to be resent to get it.
+  Disable it entirely with `--disable-conversation-continuity` if you ever
+  need the old always-context-stuff behavior.
 - **Tool/function calling is emulated by prompting, and is probabilistic.**
   Sydney has no native `tools`/`tool_calls` mechanism at all. When a request
   includes `tools`, this proxy injects plain-text instructions teaching the
@@ -121,9 +131,19 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   counting is implemented.
 - One Chathub WebSocket is opened and closed per HTTP request — no
   connection pooling or reuse.
-- Sydney's own per-conversation rate limiting isn't specially handled or
-  surfaced; if you hit a quota, whatever Sydney returns is passed through
-  as-is.
+- Sydney's own per-conversation rate limiting (the `throttling:
+  {maxNumUserMessagesInConversation, ...}` field) isn't specially handled
+  or surfaced; if you hit that quota, whatever Sydney returns is passed
+  through as-is. Its separate, apparently account/backend-wide "too much
+  volume right now" rate limit IS now surfaced properly, though (found
+  live while testing conversation continuity above): it used to arrive in
+  a WebSocket frame shape this proxy silently ignored, so a throttled turn
+  used to complete as a normal, empty, HTTP 200 response with no
+  indication anything was wrong — now it raises a clear error instead
+  (`ThrottledError`, surfaced as a 429/`upstream_throttled` with Sydney's
+  own refusal text -- the status code OpenAI clients already back off and
+  retry on; a silent empty reply, the other observed throttle shape, is
+  surfaced the same way).
 - Credential values (especially a plaintext refresh token grabbed from the
   Network tab) can go stale if MSAL rotates them in the background before
   you finish pasting them in — capture the credential files close together
@@ -141,6 +161,19 @@ therefore depends on this proxy's probabilistic emulation of them) or drives
 file/shell operations itself from plain-text output determines how well it
 will actually work:
 
+**Compatibility at a glance** (all re-validated live against the harmonized
+build — `PROXY_VERSION` 0.8 — on 2026-07-19; see the per-agent notes below
+and REVERSE_ENGINEERING.md's dated "Harmonized-build agent re-validation"
+section for the full run-by-run evidence):
+
+| Agent | Needs API `tools`? | Status | Why |
+|---|---|---|---|
+| **Aider** | No — plain diffs it applies itself | ✅ **Works** | Never touches the proxy's `tools` emulation; just needs a chat round-trip |
+| **OpenHands** (mock function calling) | No — converts tools to text client-side | ✅ **Works** (recommended agentic mode; see caveat) | Sends `tools=0`; the proxy's emulation never runs |
+| **OpenHands** (native tool calling) | Yes → proxy's emulation | ⚠️ **Works sometimes** | Exercises the two-convention emulation; probabilistic per run |
+| **OpenCode** | Yes → proxy's emulation | ❌ **Not working** | Flat refusal even with both conventions tried; no client-side fallback |
+| **Goose** | Yes → proxy's emulation | ❌ **Not working** | Code-interpreter self-preemption; toolshim mode blocked too |
+
 - **[Aider](https://aider.chat/)** — works well, with no dependency on tool-
   calling emulation at all. Aider never asks the model to emit `tool_calls`;
   it asks for a diff/whole-file rewrite in plain text and applies it itself,
@@ -154,7 +187,15 @@ will actually work:
   ```
 
   (Aider's config still wants *some* string in `--openai-api-key`; this
-  proxy ignores it entirely — see AUTHENTICATION MODEL above.)
+  proxy ignores it entirely — see AUTHENTICATION MODEL above. Newer Aider
+  releases — e.g. 0.86 — read `OPENAI_API_BASE`/`OPENAI_API_KEY` from the
+  environment rather than those flags; either way works.)
+
+  **Re-validated against the harmonized build (v0.8, 2026-07-19):** Aider
+  0.86.2 completed a real edit task end-to-end through this proxy (added a
+  function, applied the edit, auto-committed), every request `tools=0` via
+  context-stuffing plus streaming — confirming continuity/streaming changes
+  didn't regress the one client that already worked well.
 
 - **[OpenCode](https://opencode.ai/)** — **tested against the real OpenCode
   CLI and did not work.** OpenCode is built on the Vercel AI SDK's
@@ -173,32 +214,93 @@ will actually work:
   work yet — unlike OpenHands, OpenCode has no equivalent client-side "mock
   function calling" fallback to fall back on.
 
+  **Re-validated against the harmonized build (v0.8, 2026-07-19): still does
+  not work.** A fresh OpenCode 1.18.3 session (custom `@ai-sdk/openai-
+  compatible` provider pointed at this proxy, `tools=10`, ~36.8KB rendered
+  prompt) failed again — but this time the proxy's log confirms it now tries
+  **both** tool-calling conventions before giving up (`mode=code` →
+  `mode=action_request` → `mode=code`, all three producing no parseable
+  call), then falls back to plain content, which surfaced as the same flat
+  content-policy-style refusal ("Sorry, it looks like I can't respond to
+  this"). So the failure is confirmed *not* to be an artifact of a single
+  convention — neither `code` nor `action_request` mode gets OpenCode's
+  large prompt to emit a tool call.
+
 - **[OpenHands CLI](https://docs.openhands.dev/)** — **the recommended way
   to use this proxy with an agentic coding CLI, via its own client-side
-  "mock function calling" mode rather than this proxy's `tools` emulation.**
-  OpenHands' SDK has a `native_tool_calling=False` flag on its `LLM` config
-  that converts tool schemas to text in the prompt itself and parses the
-  reply back into real tool calls **entirely on the OpenHands side** —
-  it sends this proxy plain `messages` with no `tools` field at all, so
-  this proxy's own probabilistic emulation never even runs. Tested
-  end-to-end: **3 out of 3 full sessions succeeded**, each one genuinely
-  reading and editing a real file via real tool calls and verified correct
-  on disk every time — confirmed via the proxy's own log that every request
-  across all three sessions carried `tools=0`. This is dramatically more
-  reliable than either this proxy's own emulation (a roughly-coin-flip
-  per-attempt rate) or OpenHands' *native* tool-calling mode (the default,
-  tested separately at 1 of 2 sessions succeeding). See
-  REVERSE_ENGINEERING.md's "OpenHands mock function calling" section for
-  the exact setup — the OpenHands CLI package doesn't expose this flag
-  through its normal settings/env-var surface, so it requires directly
-  seeding a persisted `agent_settings.json` with the flag set — and the
-  full trial data.
+  "mock function calling" mode rather than this proxy's `tools` emulation —
+  but not unconditionally reliable; read the caveat below before depending
+  on it for real debugging work.** OpenHands' SDK has a
+  `native_tool_calling=False` flag on its `LLM` config that converts tool
+  schemas to text in the prompt itself and parses the reply back into real
+  tool calls **entirely on the OpenHands side** — it sends this proxy
+  plain `messages` with no `tools` field at all, so this proxy's own
+  probabilistic emulation never even runs.
+
+  An initial test succeeded 3 of 3 sessions. A much larger, deliberately
+  adversarial follow-up load test (26 full sessions across 7 batches —
+  single-file edits, multi-step tasks requiring a `terminal` verification
+  step, multi-file edits, three genuinely concurrent sessions against the
+  same proxy instance, and an iterative debug loop) found:
+  - **17 of 17 (100%) succeeded** on ordinary implement/edit/verify task
+    shapes — single edits, edit-then-verify chains, multi-file edits, and
+    concurrent sessions all passed completely, each independently verified
+    by inspecting the actual file(s) on disk afterward (not just trusting
+    the agent's own summary). Confirmed via the proxy's own log that every
+    one of the 88 requests these sessions generated carried `tools=0`, with
+    zero proxy-side exceptions.
+  - **Only 1 of 9 (11%) succeeded on a specific, now-reproduced task
+    shape**: asking the model to review or fix code containing a function
+    whose name contradicts its own behavior (e.g. a `subtract(a, b)` that
+    actually returns `a + b`). This reproduced regardless of how the task
+    was worded, whether a test file was involved, or whether any terminal
+    command was ever run — three independent variations all landed at
+    essentially the same near-total failure rate. The failure mode itself
+    is new and different from anything documented elsewhere in this
+    project: Sydney returns a **completely empty completion** (confirmed
+    directly in the proxy's own log, `reply_length=0 chars`), not a
+    refusal message and not a code-interpreter workaround. **Important
+    caveat found right after this test**: the same account was separately
+    confirmed to hit an explicit, Sydney-labeled volume-based rate limit
+    shortly afterward, and these particular batches ran last in the test
+    session (highest cumulative request count) — so whether the trigger is
+    really "misleadingly-named code" or actually (or also) request-volume
+    throttling that coincided with when these batches happened to run was
+    never isolated. Treat the 17/17-vs-1/9 numbers as real and
+    reproducible, but the specific "misleading function name" explanation
+    as unconfirmed — see REVERSE_ENGINEERING.md's dated "Correction"
+    subsection for the full reasoning.
+
+  **Practical takeaway**: this configuration is genuinely excellent for
+  straightforward "implement this / edit this / verify it" work — the
+  100%-on-17-sessions result is real and reproducible — but treat
+  debugging/bug-fixing workloads specifically as an open reliability risk
+  until this failure mode is better understood, and be aware that heavy
+  request volume against this account can also trigger Sydney's own
+  explicit rate limiting (`"We're temporarily unable to respond to this
+  volume of requests"` — a real, labeled error, not a silent failure) if
+  you run many sessions back-to-back in a short window. See
+  REVERSE_ENGINEERING.md's "OpenHands mock function calling" and "deep,
+  adversarial load-testing" sections for the exact setup, all trial data,
+  and the differential tests plus the volume-confound correction.
 
   If you don't want to go through that persisted-config route, OpenHands'
   *native* tool-calling mode (the default, via `--override-with-envs`
   pointed at this proxy) does still work sometimes — 1 of 2 sessions
   succeeded — but is subject to this proxy's own emulation reliability
   caveats above.
+
+  **Re-validated against the harmonized build (v0.8, 2026-07-19):** the
+  mock-function-calling path worked end-to-end (edit correct on disk,
+  every request `tools=0`), and a native-tool-calling run *also* succeeded
+  this time — its log is a textbook demonstration of the two-convention
+  design paying off: in one session `code` mode landed the `terminal` call
+  on one turn while `action_request` mode landed the `file_editor` call
+  (the actual edit) on the next, each convention succeeding exactly where
+  the other had just failed. That session also hit one live Sydney empty-
+  reply mid-run, which the proxy surfaced as an HTTP 429 — and OpenHands'
+  client backed off, retried, and recovered, completing the task correctly
+  (a real-world payoff of the throttle-as-429 behavior).
 
 - **[Goose CLI](https://github.com/aaif-goose/goose/)** — **tested against
   the real Goose CLI (the `goose` Rust binary from `download_cli.sh`, not
@@ -234,6 +336,23 @@ will actually work:
   section for the full mechanism, confirmed directly against both this
   proxy's own log and Goose's own CLI log).
 
+  **Re-validated against the harmonized build (v0.8, 2026-07-19): still does
+  not work.** Fresh Goose 1.43.0 sessions (custom-provider JSON pointed at
+  this proxy) failed again in both configurations, with the proxy's log
+  confirming it now cycles through both conventions (`code` →
+  `action_request` → `code`) before falling back:
+  - **Default extension set** (`tools=18`, ~19.6KB): all three attempts
+    produced no call; Sydney's own code interpreter self-preempted
+    ("Coding and executing…", then searched its *own* sandbox for `main.py`,
+    didn't find it, and reported that as the answer). `main.py` untouched.
+  - **`developer` extension only** (`--no-profile --with-builtin developer`,
+    `tools=5`, ~6.7KB): same self-preemption failure despite the much
+    smaller prompt.
+
+  So, as with OpenCode, the two-convention emulation was fully exercised and
+  still could not get Goose a working tool call — the failure is a genuine
+  model-behavior mismatch, not a single-convention artifact.
+
 ## Quick start
 
 ```bash
@@ -263,17 +382,30 @@ invalidates the previous one on each redemption) — the other three files
 are left untouched.
 
 Run `python3 m365_openai_proxy.py --help` for all flags, including
-`--host`/`--port`, `--credentials-prefix`, `--log-file`/`--log-level`.
+`--host`/`--port`, `--credentials-prefix`, `--log-file`/`--log-level`,
+`--disable-conversation-continuity`.
 
 See `REVERSE_ENGINEERING.md` for the full protocol reverse-engineering
 writeup this implementation is based on (Chathub/SignalR wire format, the
 FOCI token-family auth chain, the MSAL cache-encryption algorithm, etc).
+`experiments/` holds small, ad-hoc scripts used while developing the
+Sydney-native conversation continuity feature — `probe_conversation_reuse.py`
+(live-tests against the real backend that a reused `ConversationId` carries
+real server-side memory), `dump_frames.py` (raw SignalR frame dump, used to
+find the rate-limit handling gap), and `test_continuity_offline.py` (a
+network-free test of the HTTP-layer wiring itself, with `run_chat_turn`
+stubbed out — see REVERSE_ENGINEERING.md for what each one found). None of
+them are part of the shipped proxy or required to run it.
 
 ## Requirements
 
-Python 3 standard library only, no third-party packages. Developed and
-tested against Python 3.12; no version-specific stdlib features are
-knowingly used, but only 3.12 has been verified.
+Python 3 standard library only, no third-party packages. CI smoke-tests
+this script (byte-compile, plus a `--help` run that imports the module and
+so exercises the pure-Python AES-256-GCM self-check) on Python 3.9 through
+3.13 on Linux, and on the oldest and newest of those (3.9 and 3.13) on
+macOS and Windows as well. Functional end-to-end use — which needs live
+Microsoft credentials and so can't run in CI — was developed and verified
+against Python 3.12.
 
 ## License
 
