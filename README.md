@@ -218,6 +218,22 @@ will actually work:
   want to experiment further, but the honest current answer is the same as
   OpenCode's: it does not work yet.
 
+  Goose also has its own analogous mechanism to OpenHands' mock function
+  calling — its **"Toolshim"** (`GOOSE_TOOLSHIM=1`) — which also sends
+  `tools: []` to the provider and tries to parse tool calls straight out of
+  the plain-text reply, only falling back to a separate interpreter model
+  (Ollama, or Goose's own bundled local llama.cpp — neither can be pointed
+  at an arbitrary OpenAI-compatible URL like this proxy) if that fails.
+  **Tested with no Ollama server running at all: 0 of 3 sessions
+  succeeded, but this time with a fully confirmed root cause, not just an
+  observed failure.** Goose's own toolshim system-prompt text is hardcoded
+  into the binary and uses the word "tool" five times — exactly the
+  trigger already established to reliably derail Sydney into code-
+  interpreter self-preemption — and this proxy has no way to launder that
+  specific text (see REVERSE_ENGINEERING.md's "Goose's own 'Toolshim'"
+  section for the full mechanism, confirmed directly against both this
+  proxy's own log and Goose's own CLI log).
+
 ## Quick start
 
 ```bash

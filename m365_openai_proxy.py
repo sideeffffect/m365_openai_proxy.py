@@ -319,8 +319,25 @@ KNOWN LIMITATIONS
   CLI's normal settings/env-var surface in the tested version -- it
   requires directly seeding a persisted `agent_settings.json` file -- see
   REVERSE_ENGINEERING.md's "OpenHands' own client-side 'mock function
-  calling'" section for the exact setup. Does not transfer to OpenCode or
-  Goose, neither of which has an equivalent client-side fallback.
+  calling'" section for the exact setup. Does not transfer to OpenCode (no
+  equivalent client-side fallback exists) or to Goose (it DOES have an
+  analogous mechanism, "Toolshim", but it doesn't help here -- see next).
+
+  Goose's own "Toolshim" (`GOOSE_TOOLSHIM=1`) has the same architecture as
+  OpenHands' mock function calling -- sends `tools: []` to this proxy and
+  tries to parse tool calls straight out of the plain-text reply first,
+  only falling back to a separate interpreter model (Ollama, or Goose's
+  own bundled local llama.cpp -- neither reachable at an arbitrary OpenAI-
+  compatible URL like this proxy) if that fails -- but it did NOT help:
+  tested 0 of 3 sessions succeeded, with Ollama deliberately not running at
+  all. Root cause, confirmed via Goose's own CLI log (not just inferred):
+  Goose's toolshim system-prompt text is hardcoded into the binary and uses
+  the word "tool" five times, the same trigger already established to
+  derail Sydney into code-interpreter self-preemption -- this proxy has no
+  way to launder text a CLIENT injects into its own system prompt when
+  `tools` is empty, since `_neutralize_tool_word()` is currently gated on
+  `tools` being present. See REVERSE_ENGINEERING.md's "Goose's own
+  'Toolshim'" section for the full mechanism and log evidence.
 
   Sydney's own REAL tool-invocation mechanism (Local MCP, over the same
   Chathub connection -- `mcp_discover`/`mcp_describe`/`invoke_local_plugin`

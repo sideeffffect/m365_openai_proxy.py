@@ -89,8 +89,26 @@ sections below are where that lives.
   surface in the installed version — it requires directly seeding a
   persisted `agent_settings.json` — see the "OpenHands' own client-side
   'mock function calling'" update near the end of this document for the
-  exact setup and full trial data. Does not transfer to OpenCode or Goose,
-  neither of which has an equivalent client-side fallback.
+  exact setup and full trial data. Does not transfer to OpenCode (no
+  equivalent client-side fallback exists at all) or to Goose (it DOES have
+  an analogous mechanism, "Toolshim" — see next bullet — but it didn't
+  help here, for a fully understood reason).
+- **Goose's own "Toolshim" — has the same architecture as OpenHands' mock
+  function calling, but doesn't help here, for a specific and now fully
+  explained reason**: read directly from Goose's own Rust source
+  (`GOOSE_TOOLSHIM=1`) and confirmed live: it also sends `tools: []` to the
+  provider and tries to extract tool calls from the plain-text reply
+  directly (Ollama/local-llama.cpp interpreter only as a last-resort
+  fallback, confirmed unreachable from an arbitrary OpenAI-compatible URL
+  like this proxy). The blocker: Goose's own hardcoded toolshim system-
+  prompt text is baked into the binary and cannot be edited or laundered,
+  and it uses the literal word "tool" five times — exactly the trigger
+  already established to reliably derail Sydney into code-interpreter
+  self-preemption. Tested 0 of 3 sessions succeeded, with the causal chain
+  fully confirmed via Goose's own CLI log (an attempted, failed, gracefully
+  -caught Ollama fallback call, `Network error: Could not connect to
+  localhost:11434`) rather than just inferred — see the dated "Goose's own
+  'Toolshim'" update near the end of this document.
 - **Not actually in this repo**: none of the `.har` capture files or
   `Chathub.log.jsonl` referenced throughout this document were ever committed
   (they carry live session cookies/tokens and are `.gitignore`d) — this
@@ -1778,10 +1796,183 @@ releases may add a more direct way to set this (worth checking the CLI's
 `--help`/settings UI for a `native_tool_calling`-equivalent option before
 repeating this workaround).
 
-This finding does NOT transfer to OpenCode or Goose: neither has anything
-equivalent to OpenHands' client-side mock-function-calling fallback --
-both hard-depend on the model actually emitting native `tool_calls`, which
-is exactly the API-level feature this proxy has to emulate (imperfectly)
-in the first place.
+This finding does NOT transfer to OpenCode: it has nothing equivalent to
+OpenHands' client-side mock-function-calling fallback at all -- it
+hard-depends on the model actually emitting native `tool_calls`, which is
+exactly the API-level feature this proxy has to emulate (imperfectly) in
+the first place. Goose DOES have its own analogous mechanism (its
+"Toolshim") -- see the dated update below for why it was tried and why it
+didn't help here either, for a different and much more specific reason
+than OpenCode's.
+
+## Update: Goose's own "Toolshim" -- read the actual source, tested live, 0/3, but now fully explained (not just observed)
+
+Following the OpenHands mock-function-calling success, the user asked to
+retry Goose specifically with its own analogous mechanism -- Goose's
+"Toolshim" (`GOOSE_TOOLSHIM=1`) -- explicitly **not** against a real Ollama
+backend, but with the *primary* model still pointed at this proxy, the same
+way every other Goose trial in this document was configured. Unlike the
+earlier Goose section (which only observed outcomes), this update reverse-
+engineered the actual mechanism from Goose's own Rust source
+(`crates/goose/src/agents/reply_parts.rs` and
+`crates/goose/src/providers/toolshim.rs` in `aaif-goose/goose`) before
+testing, so the result below comes with a real causal explanation, not just
+another observed failure.
+
+### How Goose's Toolshim actually works (from source, not guesswork)
+
+`Agent::prepare_tools_and_prompt()` checks `model_config.toolshim` (set from
+the `GOOSE_TOOLSHIM` env var) and, when true, does exactly two things before
+the request ever reaches the model:
+
+1. **Appends Goose's own hardcoded instruction to the system prompt** via
+   `modify_system_prompt_for_tool_json()`:
+   > "...If you want to use a **tool**, tell the user what **tool** to use
+   > by specifying the **tool** in this JSON format\n{\n  \"name\":
+   > \"tool_name\", ...}. After you get the **tool** result back..."
+
+   This text is baked into the Goose binary -- there is no way for this
+   proxy, or the user, to edit or avoid it. It uses the literal word "tool"
+   five times in three sentences, which is exactly the trigger this
+   document already established (see "Tool-calling emulation implemented
+   and live-tested" above) reliably degrades Sydney's behavior into
+   self-preemption or refusal.
+2. **Sends `tools: []` (empty) to the provider.** Confirmed live: every
+   toolshim request in the proxy's own log showed `tools=0`. This proxy's
+   own `tools`-emulation code (`_render_tools_block`/`_extract_tool_calls`/
+   `_neutralize_tool_word`) never runs at all in this mode -- Goose's
+   toolshim is a complete alternative path, not a layer on top of this
+   proxy's emulation.
+
+After the full reply streams back, `toolshim_postprocess()` /
+`augment_message_with_selected_tool_interpreter()` tries, **in this exact
+order**:
+
+1. `parse_tokenized_tool_calls` -- looks for Goose's own private-use-Unicode
+   tokenized marker format (` functions.name:idx {json} `, using
+   invisible delimiter characters, not printable text) -- a format only
+   certain fine-tuned models emit natively; irrelevant here.
+2. `parse_inline_json_tool_calls` -- scans the ENTIRE raw reply text for any
+   `{...}` object containing both a `"name"` and an `"arguments"` key,
+   **anywhere in the text**, no wrapper tags required. If Sydney's plain-
+   text reply had happened to contain matching JSON, Goose would extract it
+   directly here, with **zero interpreter/Ollama involvement at all** --
+   this is the path that would make the user's "run it against
+   m365_openai_proxy.py, not Ollama" request literally true.
+3. **Only if both of the above find nothing** does it fall through to the
+   actual `ToolInterpreter` (Ollama's `/api/chat` structured-output
+   endpoint, or Goose's own bundled local llama.cpp inference via
+   `GOOSE_TOOLSHIM_BACKEND=local` -- neither of which can be pointed at an
+   arbitrary OpenAI-compatible URL like this proxy; this was confirmed by
+   reading `OllamaInterpreter`/`LocalInterpreter`'s implementations, not
+   assumed).
+4. If that interpreter call itself fails (e.g. no Ollama server running),
+   `toolshim_postprocess()` catches the error, logs a `WARN`, and falls
+   back to the plain-text reply with no tool calls -- **non-fatally**. This
+   was confirmed live in Goose's own CLI log (see below), not just inferred
+   from source.
+
+### Live test: 0 of 3 sessions succeeded, and the log shows exactly why
+
+Configuration: the same `~/.config/goose/custom_providers/m365_copilot.json`
+custom provider from the earlier Goose section (primary model = this
+proxy), with `GOOSE_TOOLSHIM=1` added and, deliberately, **no Ollama server
+running anywhere on the machine** -- to test the user's literal ask ("not
+against Ollama") as directly as possible.
+
+```bash
+M365_PROXY_API_KEY=sk-unused GOOSE_PROVIDER=m365_copilot GOOSE_MODEL=m365-copilot \
+  GOOSE_TOOLSHIM=1 goose run --no-session \
+  -t "Read main.py and add a subtract(a, b) function that returns a - b. Then print the final contents of main.py."
+```
+
+Three independent trials, fresh project directory each time, same task as
+every other CLI validation in this document:
+
+- **Trial 1**: Sydney's own code interpreter self-preempted again -- it ran
+  a Python snippet checking whether `main.py` existed in ITS OWN sandbox,
+  found nothing, and told the user to upload the file. `main.py` untouched.
+- **Trial 2**: same self-preemption pattern, this time via a slightly
+  different snippet (checking `os.path.exists` on a couple of candidate
+  paths). `main.py` untouched.
+- **Trial 3**: same pattern again, a third slightly different self-written
+  Python check. `main.py` untouched.
+
+**All three failures were via the same root cause, not three different
+problems**: none of Sydney's replies happened to contain the specific
+`{"name": ..., "arguments": {...}}` JSON shape `parse_inline_json_tool_calls`
+looks for (unsurprising -- Sydney was self-preempting with its own code
+interpreter instead of following Goose's JSON-format instruction at all, so
+there was never any tool-call JSON to find). Confirmed directly in Goose's
+own CLI log (`~/.local/state/goose/logs/cli/<date>/<timestamp>.log`) for
+trial 2:
+
+```json
+{"level":"WARN","fields":{"message":"Toolshim augmentation failed, skipping tool augmentation: Network error: Could not connect to localhost:11434 — check your network connection and try again."}}
+```
+
+preceded by a `"Tool interpreter payload"` INFO log line showing Goose had
+in fact built a request for the `mistral-nemo` Ollama model and attempted
+`POST http://localhost:11434/api/chat` -- exactly the fallback-to-interpreter
+step described above, firing exactly because step 2 (inline JSON scan)
+found nothing. And exactly as read from source: the connection failure was
+caught and logged as a `WARN`, not surfaced as an error to the user or a
+crash -- Goose simply returned Sydney's (self-preempted, file-not-found)
+plain-text reply as the final answer, which is what the CLI actually showed.
+
+The proxy's own log confirms `tools=0` on every one of these requests,
+confirming this proxy's own tool-calling emulation was never invoked; this
+truly is Goose's own mechanism failing on its own terms, independent of
+anything in this proxy's `tools` emulation code.
+
+### Net assessment: this is now a fully explained negative result, not an unexplained one
+
+- **The user's literal ask -- "run the interpretation against
+  m365_openai_proxy.py, not Ollama" -- is not achievable as stated**: no
+  config knob points Goose's actual interpreter step at an arbitrary
+  OpenAI-compatible URL; it is hardcoded to either Ollama's own API or
+  Goose's bundled local llama.cpp inference. The closest approximation
+  achievable is what was tested here: keep this proxy as the *primary*
+  model and let Goose's own inline-JSON scanner (step 2 above) try to
+  extract tool calls directly from Sydney's plain reply text, with the
+  interpreter only as an (Ollama-only) fallback that never needs to
+  succeed if Sydney cooperates.
+- **Sydney did not cooperate, for the same well-established reason as
+  every other Goose/OpenCode trial in this document**: Goose's own
+  hardcoded toolshim instruction text uses the word "tool" repeatedly, and
+  this proxy has no way to launder that specific text (`_neutralize_tool_
+  word()` only ever sees and modifies text THIS PROXY constructs or the
+  client's `messages`/`tools` payload -- Goose's toolshim text is injected
+  by Goose itself into the system prompt content, which this proxy DOES
+  see and DOES currently launder... but only when `tools` is present in
+  the request. Since toolshim mode sends `tools: []`, this proxy's
+  `_neutralize_tool_word()` gate (`clean = _neutralize_tool_word if tools
+  else (lambda s: s)`) never activates for these requests -- worth
+  revisiting as an actual code fix, since Goose's injected text is exactly
+  the kind of thing that gate exists to handle, and is just as reachable
+  via the system prompt regardless of whether `tools` is present.
+- This is the first Goose/OpenCode-family negative result in this document
+  backed by a full mechanistic explanation traced through the actual
+  client's source and confirmed against its own log output, rather than
+  just an observed outcome with a plausible-but-unconfirmed theory. Treat
+  it as a settled, understood limitation of the current approach (Sydney's
+  self-preemption + Goose's un-editable, "tool"-saturated toolshim prompt),
+  not an open question needing more trial-and-error.
+
+### An actual follow-up worth doing, flagged rather than done here
+
+The `_neutralize_tool_word()` gate could be changed to always launder the
+word "tool"/"tools" out of `system`/`developer` message content (not just
+when `tools` is present in the request) -- since a system prompt that
+already contains tool-calling instructions from the CLIENT's own toolshim/
+mock-function-calling logic is a real, now-confirmed case this proxy
+currently misses entirely. This was NOT implemented in this update (kept
+as documentation-only, consistent with the rest of this Goose investigation
+being observational) since it's unclear whether it would actually flip the
+outcome (Sydney may still self-preempt with its code interpreter even
+without the word "tool" present, exactly as seen in several `<action_request>`
+convention trials earlier in this document) -- it would need its own live
+A/B trial to confirm before being called a fix rather than a guess.
+
 
 
