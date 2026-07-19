@@ -107,23 +107,28 @@ metadata. Preserve this when editing.
 
 ## Versioning & releases
 
+Versions follow **[Semantic Versioning](https://semver.org/)** —
+`MAJOR.MINOR.PATCH`, always three digits (e.g. `0.8.0`, not `0.8`) — tagged
+`vMAJOR.MINOR.PATCH` (e.g. `v0.8.0`). Bump PATCH for fixes, MINOR for
+backward-compatible features, MAJOR for breaking changes.
+
 The version lives in **one canonical place — `PROXY_VERSION` in
 `m365_openai_proxy.py`** (it's what the proxy reports in its startup banner and
 its HTTP `Server:` header). Two other places must always agree with it:
 
-- **`pyproject.toml`'s `version`** — the same number, without the `v` prefix.
-- **the git tag + GitHub Release** — tag `vX.Y` for `PROXY_VERSION` `X.Y`.
+- **`pyproject.toml`'s `version`** — the same `X.Y.Z`, without the `v` prefix.
+- **the git tag + GitHub Release** — tag `vX.Y.Z` for `PROXY_VERSION` `X.Y.Z`.
 
-The scheme is `X.Y` (e.g. `0.8`), tag `vX.Y`. There is no automated/derived
-versioning (setuptools-scm/hatch-vcs and friends need a build backend, and this
-project deliberately has none — `[tool.uv] package = false`, nothing to build),
-so the sync is a manual step. **To cut a release:**
+There is no automated/derived versioning (setuptools-scm/hatch-vcs and friends
+need a build backend, and this project deliberately has none —
+`[tool.uv] package = false`, nothing to build), so the sync is a manual step.
+**To cut a release:**
 
-1. Bump `PROXY_VERSION` in `m365_openai_proxy.py`.
-2. Set `version` in `pyproject.toml` to the same number.
+1. Bump `PROXY_VERSION` in `m365_openai_proxy.py` (a full `X.Y.Z`).
+2. Set `version` in `pyproject.toml` to the same `X.Y.Z`.
 3. Run the local CI gate (see above) so the release is green.
-4. Commit, then tag: `git tag vX.Y && git push origin vX.Y`.
-5. Create the GitHub Release for `vX.Y` (`gh release create vX.Y …`).
+4. Commit, then tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+5. Create the GitHub Release for `vX.Y.Z` (`gh release create vX.Y.Z …`).
 
 If you ever bump one of these, bump all of them in the same change — a mismatch
 between the banner, `pyproject.toml`, and the tag/Release is a bug.
