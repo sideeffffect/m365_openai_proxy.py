@@ -2667,3 +2667,135 @@ explicitly here for the same reason: a plausible-looking theory that
 wasn't adequately isolated should be labeled as such, not left standing
 uncorrected once better evidence arrives.
 
+
+
+## Update: Harmonized-build agent re-validation (2026-07-19, PROXY_VERSION 0.8)
+
+All prior per-agent results in this document were gathered against earlier
+designs — most importantly, the OpenCode and Goose failures were recorded
+when the proxy emulated tool calls with the **single** `<action_request>`
+convention. The "harmonized" build (v0.8) combines that with the newer
+**code-mode** convention and cycles through both across retry attempts
+(`_TOOL_CALL_MODES = ("code", "action_request", "code")`), unifies both
+Sydney throttle shapes onto HTTP 429, and adds Sydney-native conversation
+continuity. This section re-runs every locally-installed agent CLI against
+that build, on the same canonical task used throughout this document
+("read a small file, add a function, keep the existing one"), and records
+what changed.
+
+Proxy: `m365_openai_proxy.py` 0.8 on `127.0.0.1:8000`, logging at DEBUG.
+Every result below was verified by inspecting the actual file on disk after
+the session (not just trusting the agent's own summary) and cross-checked
+against the proxy's own log for the `tools=N` count and per-attempt mode.
+
+### Aider 0.86.2 — works (unchanged, no regression)
+
+`OPENAI_API_BASE`/`OPENAI_API_KEY` env vars + `--model openai/m365-copilot`
+(the 0.86 release ignores the older `--openai-api-base`/`--openai-api-key`
+flags this document quoted earlier and reads the env vars instead). One
+headless `--message` run added a `farewell(name)` function to a real
+`util.py`, applied the edit, and auto-committed it; the resulting file ran
+correctly (`greet`/`farewell` both intact). Proxy log: every request
+`tools=0` (context-stuffing) with streaming — i.e. the continuity/streaming
+changes in this build did not regress the one client that already worked.
+
+### OpenHands 1.13.1 (mock function calling) — works (unchanged)
+
+Seeded `native_tool_calling=False` into a persisted `agent_settings.json`
+(the same technique documented above), pointed at `:8000`. The session
+read `main.py`, added `subtract(a, b)` via real client-side tool calls, and
+finished with a correct summary; the file on disk was correct
+(`subtract(5, 3) == 2`). Proxy log: every request `tools=0` (~65KB
+prompts) — OpenHands' converter never sends `tools`, so the proxy's
+emulation never ran, exactly as before.
+
+### OpenHands 1.13.1 (native tool calling) — succeeded this run; textbook two-convention payoff
+
+`--override-with-envs` with `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY`, no
+persisted `native_tool_calling` override, so OpenHands sent real `tools`
+(6 of them) and the proxy's own emulation was engaged. The task succeeded
+(`subtract` correct on disk), and the log is the clearest live evidence yet
+for *why* keeping both conventions matters:
+
+```
+tools=6 … tool-call emulation attempt 1/3: mode=code            → produced no call
+          tool-call emulation attempt 2/3: mode=action_request  → produced no call
+          tool-call emulation attempt 3/3: mode=code            → calls=terminal      (ok)
+tools=6 … tool-call emulation attempt 1/3: mode=code            → produced no call
+          tool-call emulation attempt 2/3: mode=action_request  → calls=file_editor   (ok, the actual edit)
+tools=6 … (a later turn) all three attempts produced no call    → fell back to plain content
+```
+
+`code` mode landed the `terminal` call on one turn; `action_request` mode
+landed the `file_editor` call — the edit itself — on the next, each
+succeeding exactly where the other had just failed. This is precisely the
+"two conventions fail in different, largely uncorrelated ways" hypothesis
+that motivated cycling through both, observed in a single real agent
+session rather than inferred from separate A/B trials.
+
+**Bonus, same session:** one turn got a genuinely empty reply from Sydney
+(`Chathub reply complete (total_length=0 chars)`). The harmonized build
+surfaced it as `HTTP 429 upstream_throttled` (not a silent empty `200`),
+and OpenHands' LiteLLM client backed off, retried on a fresh conversation,
+and recovered — the session still completed correctly. This is the
+throttle-as-429 unification demonstrating its value against a real client's
+retry logic, not just in a unit test.
+
+### OpenCode 1.18.3 — still does not work (now confirmed against both conventions)
+
+Custom `@ai-sdk/openai-compatible` provider (project-local `opencode.json`)
+pointed at `:8000`, `opencode run --model m365/m365-copilot`. Result: a flat
+content-policy-style refusal ("Sorry, it looks like I can't respond to
+this. Let's try a different topic"), `main.py` untouched — the same outcome
+this document recorded for the old single-convention design. What is new is
+that the proxy log confirms the harmonized build **tried both conventions**
+before giving up:
+
+```
+tools=10, rendered ~36.8KB, tool_mode=code
+  attempt 1/3 mode=code            → produced no call
+  attempt 2/3 mode=action_request  → produced no call
+  attempt 3/3 mode=code            → produced no call → fell back to plain content
+```
+
+So OpenCode's large system-prompt-plus-10-tools payload defeats *both*
+`code` and `action_request` mode, not just the single convention tested
+before. Unlike OpenHands, OpenCode has no client-side mock-function-calling
+fallback, so there is nothing to fall back to.
+
+### Goose 1.43.0 — still does not work (both extension configs, both conventions)
+
+Custom-provider JSON (`~/.config/goose/custom_providers/m365_copilot.json`)
+pointed at `:8000`, `goose run --no-session`. Two configurations, both
+failing, both fully exercising the two-convention cycle in the proxy log:
+
+- **Default extension set** — `tools=18`, ~19.6KB. All three attempts
+  (`code` → `action_request` → `code`) produced no call. Sydney's own code
+  interpreter self-preempted ("Coding and executing…"), searched its *own*
+  sandbox for `main.py`, didn't find it, and reported that as the answer.
+  `main.py` untouched.
+- **`developer` extension only** (`--no-profile --with-builtin developer`)
+  — `tools=5`, ~6.7KB. Same code-interpreter self-preemption failure
+  despite the much smaller prompt; `main.py` untouched.
+
+Consistent with the earlier finding that shrinking the tool count changes
+*which* avoidance behavior Sydney reaches for without ever making it follow
+the convention — and now confirmed that adding the second (`code`)
+convention does not rescue Goose either. Goose's Toolshim mode remains
+blocked for the separate, already-documented reason (its hardcoded
+toolshim prompt uses the word "tool" repeatedly, and it can only route the
+fallback to a local Ollama/llama.cpp interpreter, not to an arbitrary
+OpenAI-compatible URL).
+
+### Net
+
+The harmonized build changes the compatibility picture only where it
+plausibly could: the clients that never depended on the proxy's tool
+emulation (Aider, OpenHands mock-FC) keep working, and the emulation itself
+is now demonstrably stronger for the borderline case (OpenHands native
+succeeded, using both conventions). The two clients that depend entirely on
+the emulation with large tool payloads and no client-side fallback
+(OpenCode, Goose) still do not work — but the failure is now confirmed to
+survive *both* tool-calling conventions, so it is a genuine model-behavior
+mismatch (large injected tool schemas → refusal or code-interpreter
+self-preemption), not an artifact of any one convention this proxy invented.

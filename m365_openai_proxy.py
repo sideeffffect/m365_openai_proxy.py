@@ -343,12 +343,15 @@ KNOWN LIMITATIONS
   See REVERSE_ENGINEERING.md's "Tool-calling emulation" and "code-mode
   tool-calling emulation" sections for the full trial-by-trial account,
   including real end-to-end testing against the actual OpenHands, OpenCode,
-  and Goose CLIs (not just synthetic curl requests) with the PRIOR
-  ("action_request"-only) design -- see REVERSE_ENGINEERING.md for whether
-  that picture has been re-validated against the current two-convention
-  design by the time you're reading this, since that live re-validation may
-  have been blocked by the Sydney-side request throttling discovered and
-  documented below, and could still be in progress.
+  and Goose CLIs (not just synthetic curl requests). That picture HAS since
+  been re-validated live against the current two-convention design -- see
+  REVERSE_ENGINEERING.md's "Harmonized-build agent re-validation" section
+  (and the README's "Compatibility at a glance" table): Aider and OpenHands
+  (mock-function-calling) work; OpenHands native tool-calling succeeded too,
+  with `code` and `action_request` modes each landing calls the other
+  missed; OpenCode and Goose still do not work, with the failure now
+  confirmed to survive BOTH conventions (a genuine model-behavior mismatch
+  on large injected tool schemas, not a single-convention artifact).
 
   **IMPORTANT if your client is OpenHands: prefer OpenHands' own
   client-side "mock function calling" mode over this proxy's emulation

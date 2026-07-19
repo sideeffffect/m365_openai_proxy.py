@@ -161,6 +161,19 @@ therefore depends on this proxy's probabilistic emulation of them) or drives
 file/shell operations itself from plain-text output determines how well it
 will actually work:
 
+**Compatibility at a glance** (all re-validated live against the harmonized
+build — `PROXY_VERSION` 0.8 — on 2026-07-19; see the per-agent notes below
+and REVERSE_ENGINEERING.md's dated "Harmonized-build agent re-validation"
+section for the full run-by-run evidence):
+
+| Agent | Needs API `tools`? | Status | Why |
+|---|---|---|---|
+| **Aider** | No — plain diffs it applies itself | ✅ **Works** | Never touches the proxy's `tools` emulation; just needs a chat round-trip |
+| **OpenHands** (mock function calling) | No — converts tools to text client-side | ✅ **Works** (recommended agentic mode; see caveat) | Sends `tools=0`; the proxy's emulation never runs |
+| **OpenHands** (native tool calling) | Yes → proxy's emulation | ⚠️ **Works sometimes** | Exercises the two-convention emulation; probabilistic per run |
+| **OpenCode** | Yes → proxy's emulation | ❌ **Not working** | Flat refusal even with both conventions tried; no client-side fallback |
+| **Goose** | Yes → proxy's emulation | ❌ **Not working** | Code-interpreter self-preemption; toolshim mode blocked too |
+
 - **[Aider](https://aider.chat/)** — works well, with no dependency on tool-
   calling emulation at all. Aider never asks the model to emit `tool_calls`;
   it asks for a diff/whole-file rewrite in plain text and applies it itself,
@@ -174,7 +187,15 @@ will actually work:
   ```
 
   (Aider's config still wants *some* string in `--openai-api-key`; this
-  proxy ignores it entirely — see AUTHENTICATION MODEL above.)
+  proxy ignores it entirely — see AUTHENTICATION MODEL above. Newer Aider
+  releases — e.g. 0.86 — read `OPENAI_API_BASE`/`OPENAI_API_KEY` from the
+  environment rather than those flags; either way works.)
+
+  **Re-validated against the harmonized build (v0.8, 2026-07-19):** Aider
+  0.86.2 completed a real edit task end-to-end through this proxy (added a
+  function, applied the edit, auto-committed), every request `tools=0` via
+  context-stuffing plus streaming — confirming continuity/streaming changes
+  didn't regress the one client that already worked well.
 
 - **[OpenCode](https://opencode.ai/)** — **tested against the real OpenCode
   CLI and did not work.** OpenCode is built on the Vercel AI SDK's
@@ -192,6 +213,18 @@ will actually work:
   want to try it yourself, but the honest current answer is: it does not
   work yet — unlike OpenHands, OpenCode has no equivalent client-side "mock
   function calling" fallback to fall back on.
+
+  **Re-validated against the harmonized build (v0.8, 2026-07-19): still does
+  not work.** A fresh OpenCode 1.18.3 session (custom `@ai-sdk/openai-
+  compatible` provider pointed at this proxy, `tools=10`, ~36.8KB rendered
+  prompt) failed again — but this time the proxy's log confirms it now tries
+  **both** tool-calling conventions before giving up (`mode=code` →
+  `mode=action_request` → `mode=code`, all three producing no parseable
+  call), then falls back to plain content, which surfaced as the same flat
+  content-policy-style refusal ("Sorry, it looks like I can't respond to
+  this"). So the failure is confirmed *not* to be an artifact of a single
+  convention — neither `code` nor `action_request` mode gets OpenCode's
+  large prompt to emit a tool call.
 
 - **[OpenHands CLI](https://docs.openhands.dev/)** — **the recommended way
   to use this proxy with an agentic coding CLI, via its own client-side
@@ -257,6 +290,18 @@ will actually work:
   succeeded — but is subject to this proxy's own emulation reliability
   caveats above.
 
+  **Re-validated against the harmonized build (v0.8, 2026-07-19):** the
+  mock-function-calling path worked end-to-end (edit correct on disk,
+  every request `tools=0`), and a native-tool-calling run *also* succeeded
+  this time — its log is a textbook demonstration of the two-convention
+  design paying off: in one session `code` mode landed the `terminal` call
+  on one turn while `action_request` mode landed the `file_editor` call
+  (the actual edit) on the next, each convention succeeding exactly where
+  the other had just failed. That session also hit one live Sydney empty-
+  reply mid-run, which the proxy surfaced as an HTTP 429 — and OpenHands'
+  client backed off, retried, and recovered, completing the task correctly
+  (a real-world payoff of the throttle-as-429 behavior).
+
 - **[Goose CLI](https://github.com/aaif-goose/goose/)** — **tested against
   the real Goose CLI (the `goose` Rust binary from `download_cli.sh`, not
   the Electron Desktop app — the `goose` command can resolve to either
@@ -290,6 +335,23 @@ will actually work:
   specific text (see REVERSE_ENGINEERING.md's "Goose's own 'Toolshim'"
   section for the full mechanism, confirmed directly against both this
   proxy's own log and Goose's own CLI log).
+
+  **Re-validated against the harmonized build (v0.8, 2026-07-19): still does
+  not work.** Fresh Goose 1.43.0 sessions (custom-provider JSON pointed at
+  this proxy) failed again in both configurations, with the proxy's log
+  confirming it now cycles through both conventions (`code` →
+  `action_request` → `code`) before falling back:
+  - **Default extension set** (`tools=18`, ~19.6KB): all three attempts
+    produced no call; Sydney's own code interpreter self-preempted
+    ("Coding and executing…", then searched its *own* sandbox for `main.py`,
+    didn't find it, and reported that as the answer). `main.py` untouched.
+  - **`developer` extension only** (`--no-profile --with-builtin developer`,
+    `tools=5`, ~6.7KB): same self-preemption failure despite the much
+    smaller prompt.
+
+  So, as with OpenCode, the two-convention emulation was fully exercised and
+  still could not get Goose a working tool call — the failure is a genuine
+  model-behavior mismatch, not a single-convention artifact.
 
 ## Quick start
 
