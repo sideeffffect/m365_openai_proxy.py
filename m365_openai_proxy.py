@@ -815,7 +815,7 @@ SIGNALR_RS = "\x1e"  # SignalR JSON Hub Protocol record separator
 # proxy's injected tool-calling emulation -- confirmed live during
 # development: a weather question got a flat refusal, and a basic-arithmetic
 # "use the calculator tool" request got silently answered via Sydney's own
-# code interpreter instead of our requested `<tool_call>` convention (see
+# code interpreter instead of our requested `<action_request>` convention (see
 # REVERSE_ENGINEERING.md's "Tool-calling emulation" section). When a request
 # includes `tools`, this proxy asks Sydney with these capabilities stripped,
 # so the model has nothing to reach for except our injected convention.
@@ -1600,19 +1600,53 @@ class TokenCache:
 
     def __init__(self, credential_store):
         self.store = credential_store
+        #: Guards reads/writes of self._auth (held only briefly).
         self._lock = threading.Lock()
+        #: Serializes the token exchange itself so at most one thread ever
+        #: redeems the refresh token at a time -- see get() for why.
+        self._refresh_lock = threading.Lock()
         self._auth = None
 
-    def get(self):
+    def _cached_auth(self):
+        """Returns the cached SydneyAuth if it exists and isn't within 60s of
+        expiry, else None."""
         with self._lock:
-            if self._auth and self._auth.expires_at - 60 > time.time():
-                logging.debug(
-                    "reusing cached Sydney access token (oid=%s, expires in %.0fs)",
-                    self._auth.oid,
-                    self._auth.expires_at - time.time(),
-                )
-                return self._auth
+            auth = self._auth
+        if auth and auth.expires_at - 60 > time.time():
+            logging.debug(
+                "reusing cached Sydney access token (oid=%s, expires in %.0fs)",
+                auth.oid,
+                auth.expires_at - time.time(),
+            )
+            return auth
+        return None
 
+    def get(self):
+        cached = self._cached_auth()
+        if cached is not None:
+            return cached
+
+        # Serialize the actual refresh: Entra ID invalidates the previous
+        # refresh token on every redemption, so two threads redeeming the same
+        # token concurrently (the normal shape when several requests arrive
+        # while the token is cold or expired -- this is a ThreadingHTTPServer)
+        # would have the second redemption rejected as invalid_grant, and
+        # their two store.rotate() writes would race. Only one thread performs
+        # the exchange; any others block here and then find the freshly-cached
+        # token on the re-check below instead of redeeming a second time.
+        with self._refresh_lock:
+            cached = self._cached_auth()
+            if cached is not None:
+                logging.debug(
+                    "another thread refreshed the Sydney access token while we waited"
+                )
+                return cached
+
+            return self._exchange_locked()
+
+    def _exchange_locked(self):
+        """Performs the refresh-token -> access-token exchange and caches the
+        result. MUST be called with self._refresh_lock held (see get())."""
         logging.info(
             "cached Sydney access token missing or near expiry; exchanging refresh token"
         )
@@ -2049,7 +2083,7 @@ def _neutralize_tool_word(text):
 
 
 def _extract_tool_calls(reply_text):
-    """Parses `reply_text` for this proxy's `<tool_call>{...}</tool_call>`
+    """Parses `reply_text` for this proxy's `<action_request>{...}</action_request>`
     convention (see `_render_tools_block`). Returns `(remaining_text,
     tool_calls)`: `tool_calls` is a list of `{"id", "name", "arguments_json"}`
     dicts (already carrying a synthesized OpenAI-style call id and a
