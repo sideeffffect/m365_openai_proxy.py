@@ -2679,13 +2679,23 @@ def _extract_code_mode_calls(reply_text):
 #: a *following* parameter.
 _SECURITY_RISK_PARAM_RE = re.compile(
     r"\n[ \t]*<parameter=security_risk>"
-    r".*?(?=\n<parameter=|\n</function>|</parameter>)(?:</parameter>)?",
+    r".*?(?=\n<parameter=|\n</function>|</parameter>|\Z)(?:</parameter>)?",
+    re.DOTALL,
+)
+
+#: One `<function=finish>...` block -- the only kind of block
+#: `_scrub_security_risk_param` touches. A block ends at its own
+#: `</function>`, at the next block's opening tag (observed replies often
+#: leave blocks unclosed), or at end of text.
+_FINISH_CALL_RE = re.compile(
+    r"<function=finish>.*?(?:</function>|(?=\n<function=)|\Z)",
     re.DOTALL,
 )
 
 
 def _scrub_security_risk_param(text):
-    """Strips any `<parameter=security_risk>...` entry from `text`.
+    """Strips the `<parameter=security_risk>...` entry from any
+    `<function=finish>` block in `text`, leaving every other call untouched.
 
     This proxy doesn't implement or participate in OpenHands' (or any other
     coding agent's) own prompted, non-native tool-calling convention --
@@ -2703,10 +2713,21 @@ def _scrub_security_risk_param(text):
     reply. Stripping the parameter here means the client's parser never
     sees it and never has anything to reject, so the retry (and the noise)
     never happens. Purely a string-level workaround for one third-party
-    parser's behavior, not a tool-calling convention this proxy speaks."""
+    parser's behavior, not a tool-calling convention this proxy speaks.
+
+    Scoped to `finish` blocks deliberately: on every OTHER tool the
+    parameter is schema-allowed and *meaningful* -- it's the risk
+    prediction the client's LLM security analyzer consumes -- so scrubbing
+    it everywhere would silently strip real risk data from calls that were
+    never going to be rejected. Only read-only-annotated tools reject it,
+    and `finish` is the only read-only builtin observed in the wild; a
+    hypothetical third-party read-only tool would still hit the client-side
+    rejection, which only a client-side fix can fully solve."""
     if "<parameter=security_risk>" not in text:
         return text
-    return _SECURITY_RISK_PARAM_RE.sub("", text)
+    return _FINISH_CALL_RE.sub(
+        lambda m: _SECURITY_RISK_PARAM_RE.sub("", m.group(0)), text
+    )
 
 
 #: Opening tag of the client-rendered tool-call convention `_scrub_security_
@@ -2716,34 +2737,37 @@ _FUNCTION_CALL_TAG = "<function="
 
 def _plain_reply_deltas(deltas):
     """Wraps a plain-chat (no `tools`) delta generator so an ordinary prose
-    reply keeps streaming incrementally exactly as before, while a reply
-    that turns out to open with a `_FUNCTION_CALL_TAG` block is instead
-    fully buffered and run through `_scrub_security_risk_param` before being
-    emitted as one final chunk -- such a block can't be safely edited until
-    it has fully arrived, the same reason the `tools`-present path below is
-    already fully buffered rather than truly incremental. Peeks at only the
-    first `len(_FUNCTION_CALL_TAG)` characters to decide which mode applies,
-    so ordinary prose pays no more than one short buffering delay before
-    streaming resumes normally."""
+    reply keeps streaming incrementally exactly as before, while any reply
+    that turns out to contain a `_FUNCTION_CALL_TAG` block -- at the start
+    or anywhere later, e.g. after leading prose like "Coding and
+    executing<function=terminal>..." -- is instead fully buffered from that
+    point on and run through `_scrub_security_risk_param` before being
+    emitted as one final chunk. Such a block can't be safely edited until it
+    has fully arrived, the same reason the `tools`-present path below is
+    already fully buffered rather than truly incremental.
+
+    Holds back only the last `len(_FUNCTION_CALL_TAG) - 1` characters of
+    plain text at any time (just enough to catch the tag if it's split
+    across two deltas) before flushing the rest, so ordinary prose that
+    never contains the tag streams with only that much latency."""
     it = iter(deltas)
-    buffered = ""
-    for delta in it:
-        buffered += delta
-        if len(buffered) >= len(_FUNCTION_CALL_TAG):
-            break
-    else:
-        if buffered:
-            yield buffered
-        return
-
-    if not buffered.lstrip().startswith(_FUNCTION_CALL_TAG):
-        yield buffered
-        yield from it
-        return
+    pending = ""
+    hold_back = len(_FUNCTION_CALL_TAG) - 1
 
     for delta in it:
-        buffered += delta
-    yield _scrub_security_risk_param(buffered)
+        pending += delta
+        if _FUNCTION_CALL_TAG in pending:
+            for rest in it:
+                pending += rest
+            yield _scrub_security_risk_param(pending)
+            return
+        if len(pending) > hold_back:
+            flush_len = len(pending) - hold_back
+            yield pending[:flush_len]
+            pending = pending[flush_len:]
+
+    if pending:
+        yield pending
 
 
 _TOOL_CALL_MAX_ATTEMPTS = 3
