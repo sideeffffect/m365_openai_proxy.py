@@ -221,6 +221,19 @@ file after every token exchange with Entra's newly-rotated refresh token
 (see AUTHENTICATION MODEL above for why) -- the other three files are left
 untouched so you can see what was originally supplied.
 
+If both a plaintext `refresh_token` and a usable encrypted trio exist at
+once (typical once you've ever used option 2, since the rotation above then
+keeps recreating `refresh_token.conf` on every run), the proxy picks
+whichever one was written to more recently (by file mtime), not always
+`refresh_token`. This matters when a rotated `refresh_token.conf` goes
+stale or gets its underlying token superseded/expired (e.g. Entra's
+AADSTS700084 for SPA-issued refresh tokens, which are capped at a fixed
+24h lifetime no rotation can extend) and you recapture a fresh
+`encrypted_refresh_token`/`cache_encryption_key` pair to replace it: the
+newer recapture now wins automatically, instead of the stale
+`refresh_token.conf` silently continuing to be used just because it still
+exists.
+
 ------------------------------------------------------------------------------
 KNOWN LIMITATIONS
 ------------------------------------------------------------------------------
@@ -1449,7 +1462,42 @@ class CredentialStore:
             )
 
         rt = _load_credential_file(self.paths["refresh_token"])
-        if rt:
+        encrypted_raw = _load_credential_file(self.paths["encrypted_refresh_token"])
+        key_raw = _load_credential_file(self.paths["cache_encryption_key"])
+        have_encrypted = bool(encrypted_raw and key_raw)
+
+        # A plaintext refresh_token and a usable encrypted trio can both be
+        # present at once: rotate() (below) overwrites refresh_token.conf
+        # after every successful exchange, so once the encrypted path has
+        # ever been used a refresh_token.conf sticks around from then on,
+        # unconditionally. If the operator later re-captures a fresh
+        # encrypted_refresh_token/cache_encryption_key -- typically because
+        # the previously-rotated plaintext refresh_token expired or was
+        # superseded (observed live: Entra's AADSTS700084, "The refresh
+        # token was issued to a single page app ... fixed, limited lifetime
+        # of 1.00:00:00") -- that recapture must not be silently shadowed by
+        # the now-stale refresh_token.conf just because it still exists.
+        # Break the tie by recency: whichever credential's file(s) were
+        # last written to is the operator's most recent action and wins.
+        prefer_encrypted = False
+        if rt and have_encrypted:
+            rt_mtime = os.path.getmtime(self.paths["refresh_token"])
+            encrypted_mtime = max(
+                os.path.getmtime(self.paths["encrypted_refresh_token"]),
+                os.path.getmtime(self.paths["cache_encryption_key"]),
+            )
+            prefer_encrypted = encrypted_mtime > rt_mtime
+            if prefer_encrypted:
+                logging.info(
+                    "%s is older than %s/%s; the encrypted credential was "
+                    "updated more recently and takes precedence over the "
+                    "now-stale plaintext refresh_token",
+                    self.paths["refresh_token"],
+                    self.paths["encrypted_refresh_token"],
+                    self.paths["cache_encryption_key"],
+                )
+
+        if rt and not prefer_encrypted:
             logging.info(
                 "using plaintext refresh_token from %s (length=%d chars)",
                 self.paths["refresh_token"],
@@ -1457,14 +1505,13 @@ class CredentialStore:
             )
             return rt
 
-        encrypted_raw = _load_credential_file(self.paths["encrypted_refresh_token"])
-        key_raw = _load_credential_file(self.paths["cache_encryption_key"])
-
-        if encrypted_raw and key_raw:
+        if have_encrypted:
             logging.info(
-                "no usable value in %s; attempting MSAL localStorage cache decrypt "
+                "%sattempting MSAL localStorage cache decrypt "
                 "(encrypted_refresh_token + cache_encryption_key)",
-                self.paths["refresh_token"],
+                ""
+                if prefer_encrypted
+                else f"no usable value in {self.paths['refresh_token']}; ",
             )
             encrypted = _decode_json_field(
                 encrypted_raw, self.paths["encrypted_refresh_token"]
