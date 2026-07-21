@@ -145,11 +145,19 @@ def test_branch_falls_back_to_new_conversation(
     assert "DIFFERENT" in recorder.calls[0][0]
 
 
-def test_tools_present_never_continuation(recorder, fake_token_cache, run_server, post):
+def test_continuation_matches_despite_reserialized_reply(
+    recorder, fake_token_cache, run_server, post
+):
+    # The key robustness win over the original exact `messages[:-1]` matcher:
+    # a client that re-serializes the assistant reply differently than this
+    # proxy actually emitted it (exactly what OpenHands' mock-function-calling
+    # loop does when it reconstructs the assistant tool-call message) is STILL
+    # recognized as a continuation, because the fingerprint keys on the
+    # client's own resent input, never on the reply's wording.
     sessions = proxy.ConversationSessionStore()
     port = run_server(fake_token_cache, sessions)
 
-    _, body = post(
+    post(
         port,
         {
             "model": "m365-copilot",
@@ -157,34 +165,185 @@ def test_tools_present_never_continuation(recorder, fake_token_cache, run_server
         },
     )
     conversation_id_1 = recorder.calls[0][1]
-    reply1 = body["choices"][0]["message"]["content"]
 
-    # tools present: must never take the continuation path even though the
-    # history exactly extends turn 1.
     recorder.calls.clear()
+    messages_2 = [
+        {"role": "user", "content": "hello there"},
+        # Deliberately NOT equal to the "echo:hello there" reply this proxy
+        # returned -- the strict matcher would have missed on this.
+        {"role": "assistant", "content": "a totally different re-rendering"},
+        {"role": "user", "content": "second thing"},
+    ]
+    post(port, {"model": "m365-copilot", "messages": messages_2})
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0][1] == conversation_id_1  # reused despite mismatch
+    assert recorder.calls[0][0] == "second thing"  # only the new user msg sent
+
+
+def test_aggressive_multi_message_delta(recorder, fake_token_cache, run_server, post):
+    # Aggressive reuse folds MORE than one appended message into a single
+    # delta: here the client adds an assistant reply plus TWO new user turns
+    # in one round. The leading assistant is dropped (Sydney already produced
+    # it) and both new user turns are folded together.
+    sessions = proxy.ConversationSessionStore()
+    port = run_server(fake_token_cache, sessions)
+
     post(
+        port,
+        {"model": "m365-copilot", "messages": [{"role": "user", "content": "seed"}]},
+    )
+    conversation_id_1 = recorder.calls[0][1]
+
+    recorder.calls.clear()
+    messages_2 = [
+        {"role": "user", "content": "seed"},
+        {"role": "assistant", "content": "echo:seed"},
+        {"role": "user", "content": "first new"},
+        {"role": "user", "content": "second new"},
+    ]
+    post(port, {"model": "m365-copilot", "messages": messages_2})
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0][1] == conversation_id_1
+    delta = recorder.calls[0][0]
+    assert "first new" in delta and "second new" in delta
+
+
+#: A reply in the proxy's "code" tool-calling convention -- a fenced Python
+#: block calling invoke_capability(name, arguments) -- which
+#: `_extract_code_mode_calls` parses into a real tool call. Drives the
+#: tools-path continuation tests to a call-producing (success) turn.
+CODE_MODE_CALL_REPLY = (
+    "Coding and executing\n"
+    "```python\n"
+    "invoke_capability('terminal', {'command': 'ls'})\n"
+    "```\n"
+)
+
+#: A minimal `tools` schema whose function name ("get_weather") is a handy
+#: marker for "the full schema was re-rendered into this prompt".
+WEATHER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "gets the weather",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+]
+
+
+@pytest.fixture
+def code_call_recorder(monkeypatch):
+    """Like `recorder`, but its stub yields a parseable "code"-mode tool call
+    (see CODE_MODE_CALL_REPLY) so the tools path reaches its call-producing
+    branch. Records every call as `(text, conversation_id)` and honors
+    `.fail_ids` (raise for a given conversation_id) exactly like `recorder`."""
+
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+            self.fail_ids = set()
+
+    rec = Recorder()
+
+    def fake_run_chat_turn(token_cache, text, conversation_id=None, **kwargs):
+        rec.calls.append((text, conversation_id))
+        if conversation_id in rec.fail_ids:
+            raise proxy.ProtocolError("simulated Chathub failure")
+        yield CODE_MODE_CALL_REPLY
+
+    monkeypatch.setattr(proxy, "run_chat_turn", fake_run_chat_turn)
+    return rec
+
+
+def test_tools_request_reuses_conversation(
+    code_call_recorder, fake_token_cache, run_server, post
+):
+    # Lifted native-tools exclusion: a tools request that extends a prior
+    # tools turn is now recognized as a continuation and reuses the same
+    # Sydney conversation, sending only a delta (NO schema re-injected)
+    # instead of context-stuffing the whole transcript + tool schema again.
+    rec = code_call_recorder
+    sessions = proxy.ConversationSessionStore()
+    port = run_server(fake_token_cache, sessions)
+
+    status, body = post(
         port,
         {
             "model": "m365-copilot",
-            "messages": [
-                {"role": "user", "content": "hello there"},
-                {"role": "assistant", "content": reply1},
-                {"role": "user", "content": "and now the second thing"},
-            ],
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_weather",
-                        "description": "gets the weather",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                }
-            ],
+            "messages": [{"role": "user", "content": "list the files"}],
+            "tools": WEATHER_TOOLS,
         },
     )
-    assert recorder.calls[0][1] != conversation_id_1
-    assert "hello there" in recorder.calls[0][0]
+    assert status == 200
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    tool_call = body["choices"][0]["message"]["tool_calls"][0]
+    conversation_id_1 = rec.calls[-1][1]
+
+    # Client appends the assistant tool-call message + the tool result, then
+    # asks again -- exactly the OpenAI tool-loop shape.
+    rec.calls.clear()
+    messages_2 = [
+        {"role": "user", "content": "list the files"},
+        {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+        {"role": "tool", "tool_call_id": tool_call["id"], "content": "a.txt\nb.txt"},
+    ]
+    status, body = post(
+        port,
+        {"model": "m365-copilot", "messages": messages_2, "tools": WEATHER_TOOLS},
+    )
+    assert status == 200
+    # Exactly one Chathub turn (the continuation delta), on the reused id.
+    assert len(rec.calls) == 1
+    assert rec.calls[0][1] == conversation_id_1
+    # The delta carries the folded tool result but NOT the re-injected schema.
+    delta = rec.calls[0][0]
+    assert "a.txt" in delta
+    assert "get_weather" not in delta
+
+
+def test_tools_continuation_falls_back_to_fresh_on_failure(
+    code_call_recorder, fake_token_cache, run_server, post
+):
+    # If the continuation turn on the reused conversation fails, the tools
+    # path falls back to a fresh, schema-reinjected turn under a brand-new
+    # conversation -- never losing the answer a fresh turn would produce.
+    rec = code_call_recorder
+    sessions = proxy.ConversationSessionStore()
+    port = run_server(fake_token_cache, sessions)
+
+    _, body = post(
+        port,
+        {
+            "model": "m365-copilot",
+            "messages": [{"role": "user", "content": "list the files"}],
+            "tools": WEATHER_TOOLS,
+        },
+    )
+    tool_call = body["choices"][0]["message"]["tool_calls"][0]
+    conversation_id_1 = rec.calls[-1][1]
+
+    # Make the reused conversation fail on its next use.
+    rec.calls.clear()
+    rec.fail_ids.add(conversation_id_1)
+    messages_2 = [
+        {"role": "user", "content": "list the files"},
+        {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+        {"role": "tool", "tool_call_id": tool_call["id"], "content": "a.txt"},
+    ]
+    status, body = post(
+        port,
+        {"model": "m365-copilot", "messages": messages_2, "tools": WEATHER_TOOLS},
+    )
+    assert status == 200
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    # First call = the failed continuation on the reused id; then a fresh,
+    # schema-reinjected turn under a new id.
+    assert rec.calls[0][1] == conversation_id_1
+    assert rec.calls[-1][1] != conversation_id_1
+    # The fresh fallback re-rendered the whole request, schema included.
+    assert "get_weather" in rec.calls[-1][0]
 
 
 def test_failure_recovery_retries_as_fresh(

@@ -251,21 +251,29 @@ KNOWN LIMITATIONS
   `make_handler`) tracks, per proxy process, a best-effort mapping from "the
   exact `messages` array a client has seen so far" to the Sydney
   `ConversationId` that already holds that history server-side. When an
-  incoming request's `messages` array exactly extends a previously-seen one
-  (the common case for essentially every OpenAI-style client, since they
-  all resend their full growing history) AND the request has no `tools`,
-  this proxy sends ONLY the newest message as the next Chathub turn on that
-  reused `ConversationId`, instead of re-rendering and re-sending the
-  entire conversation every time.
+  incoming request's `messages` array extends a previously-seen one (the
+  common case for essentially every OpenAI-style client, since they all
+  resend their full growing history), this proxy sends ONLY the new
+  message(s) as the next Chathub turn on that reused `ConversationId`,
+  instead of re-rendering and re-sending the entire conversation every time.
+  Matching is by LONGEST already-seen prefix, so a client that appends more
+  than one message per round -- or re-serializes the previous assistant reply
+  differently than this proxy emitted it (exactly what a tool-calling agent
+  does when it reconstructs the assistant `tool_calls` message and adds a
+  separate execution-result message) -- is still recognized, which the
+  original strict `messages[:-1]` matcher could not do. Requests WITH `tools`
+  are eligible too: the tool-calling emulation reuses Sydney's conversation
+  for a single delta turn and automatically falls back to a fresh,
+  schema-reinjected turn if that doesn't land (see the section comment above
+  `_conversation_fingerprint`).
 
   This is fully additive and safe-by-construction: it is never used to
   produce output that couldn't have been produced before it existed.
-  Anything that doesn't cleanly match a tracked session -- the first turn
-  of a conversation, edited/reordered history, a request that includes
-  `tools` (deliberately excluded -- see the section comment above
-  `_conversation_fingerprint`), a different credential, or a session this
-  process has never seen (including after a restart -- the store is
-  in-memory only, never persisted) -- simply falls back to this proxy's
+  Anything that doesn't match a tracked session -- the first turn of a
+  conversation, a genuinely branched/edited history, a different credential,
+  or a session this process has never seen (including after a restart -- the
+  store is in-memory only, never persisted) -- simply falls back to this
+  proxy's
   original, always-correct behavior: render the *entire* incoming
   `messages` array into one text blob and send it as a single turn on a
   brand-new `ConversationId`, exactly as if this feature didn't exist. A
@@ -514,7 +522,7 @@ import uuid
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.8.0"
+PROXY_VERSION = "0.9.0"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -2140,47 +2148,60 @@ def _message_text(m):
 # its whole growing `messages[]` array every call and this proxy is given no
 # conversation id of its own to key on. So recognizing "this request is a
 # continuation of a conversation I already relayed to Sydney" has to be done
-# by fingerprinting `messages[]` itself -- see _conversation_fingerprint and
-# ConversationSessionStore below. A request is treated as a continuation
-# exactly when its `messages[:-1]` matches (in the fields that matter) some
-# earlier request's `messages[]` PLUS the assistant reply this proxy
-# returned for it -- i.e. the client did exactly what an OpenAI-style client
-# does: took the previous response, appended it to the transcript, appended
-# one new turn, and resent the whole thing. When that's true, only the
-# newest message needs to be sent to Sydney (see _render_continuation_delta)
-# -- Sydney already remembers everything before it.
+# by fingerprinting `messages[]` itself -- see _conversation_fingerprint,
+# _match_continuation, and ConversationSessionStore below. A request is
+# treated as a continuation when some LONGEST prefix of its `messages[]`
+# byte-matches (in the fields that matter) the exact `messages[]` array a
+# previous request sent -- i.e. the client took the previous response,
+# appended its own rendering of it plus one or more new turns, and resent the
+# whole thing. When that's true, only the new message(s) past that prefix
+# need to be sent to Sydney (see _render_continuation_delta) -- Sydney
+# already remembers everything before them. The matched prefix's trailing
+# assistant turn (the client's copy of the reply Sydney already produced into
+# that conversation) is dropped from the delta; only the tool results / new
+# user turns the client genuinely added are sent.
 #
-# Any time this can't be established with confidence -- the very first turn
-# of a conversation, a branched/edited history, `tools` present (see below),
-# a different credential, or this process having restarted (the store is
-# in-memory only) -- this proxy falls back to the pre-existing
-# context-stuffing behavior with a brand-new `ConversationId`, exactly as if
-# this feature didn't exist. A false negative here just costs one extra
-# context-stuffed turn; it is never a correctness problem. Turned off
-# entirely with --disable-conversation-continuity.
+# Keying on the client's resent INPUT -- not on `messages[] + [our reply]`,
+# as an earlier design did -- is what makes this robust to a client that
+# re-serializes the assistant turn differently than this proxy emitted it (a
+# tool-calling agent reconstructing the `tool_calls` message, say): the
+# fingerprint never depends on the reply's wording, and "longest prefix"
+# tolerates any number of appended messages per round, not just one.
 #
-# Deliberately restricted to requests with no `tools`: the tool-calling
-# emulation above already works by re-injecting its whole instructions block
-# from scratch on every turn as independent, stateless Chathub calls (see
-# _run_tool_call_turn's docstring -- "Sydney has no memory to preserve
-# across a retry anyway"), and is already probabilistic on its own. Reusing
-# a live Sydney conversation underneath that mechanism too would add a
-# second axis of uncertainty (does Sydney's memory of the injected tool
-# schema survive exactly as well as its memory of ordinary dialogue? -- not
-# yet tested) to a feature that's already only roughly a coin flip; keeping
-# the two mutually exclusive for now means neither can destabilize the
-# other. Revisit if `tools` + continuity turns out to be worth the extra
-# validation work.
+# Any time a continuation can't be established -- the very first turn of a
+# conversation, a genuinely branched/edited history, a different credential,
+# or this process having restarted (the store is in-memory only) -- this
+# proxy falls back to the pre-existing context-stuffing behavior with a
+# brand-new `ConversationId`, exactly as if this feature didn't exist. A
+# false negative here just costs one extra context-stuffed turn; it is never
+# a correctness problem. Turned off entirely with
+# --disable-conversation-continuity.
+#
+# Requests WITH `tools` are handled too (the exclusion an earlier design kept
+# has been lifted). The tool-calling emulation is probabilistic and normally
+# re-injects its whole instructions block on every turn as an independent,
+# stateless Chathub call; a continuation instead reuses the live Sydney
+# conversation for a SINGLE delta turn with NO schema re-injected -- betting
+# that Sydney still remembers the schema it was taught on the conversation's
+# first turn (_render_continuation_delta sends only a compact convention
+# reminder). If that bet doesn't pay off -- the delta turn produces no
+# parseable call, or the Chathub turn errors -- _run_tool_call_turn falls
+# back to a fresh, fully schema-reinjected, multi-attempt turn under a
+# brand-new conversation. So a tools continuation can only ever save a
+# round-trip, never change or lose the answer the fresh path would produce;
+# the matched session is popped before the attempt, so a failed continuation
+# leaves nothing stale behind.
 # ------------------------------------------------------------------------------
 
 
 def _conversation_fingerprint(messages):
     """Stable identity for "this exact `messages[]` array", used as the
-    ConversationSessionStore's lookup key. Hashes each message's role, name,
-    rendered text, `tool_calls`, and `tool_call_id` in order -- anything
-    else in a message dict (extra client-specific fields) is ignored, but
-    any difference in these fields, their order, or the message count
-    changes the fingerprint.
+    ConversationSessionStore's key (both to `remember` a turn and, via every
+    prefix, to look one up -- see `_prefix_fingerprints`/`_match_continuation`).
+    Hashes each message's role, name, rendered text, `tool_calls`, and
+    `tool_call_id` in order -- anything else in a message dict (extra
+    client-specific fields) is ignored, but any difference in these fields,
+    their order, or the message count changes the fingerprint.
 
     Deliberately strict, on purpose: a false negative (two fingerprints
     differ when the conversation is "really" the same) just costs one extra
@@ -2192,38 +2213,182 @@ def _conversation_fingerprint(messages):
     genuinely-different conversations not a practical concern."""
     hasher = hashlib.sha256()
     for m in messages:
-        hasher.update(str(m.get("role", "")).encode("utf-8", "replace"))
-        hasher.update(b"\0")
-        hasher.update(str(m.get("name", "")).encode("utf-8", "replace"))
-        hasher.update(b"\0")
-        hasher.update(_message_text(m).encode("utf-8", "replace"))
-        hasher.update(b"\0")
-        tool_calls = m.get("tool_calls")
-        if tool_calls:
-            hasher.update(json.dumps(tool_calls, sort_keys=True).encode("utf-8"))
-        hasher.update(b"\0")
-        hasher.update(str(m.get("tool_call_id", "")).encode("utf-8", "replace"))
-        hasher.update(b"\x1f")  # unit separator between messages
+        _update_message_hash(hasher, m)
     return hasher.hexdigest()
 
 
-def _render_continuation_delta(message):
-    """Renders just the NEWEST message's text for a Sydney-native
-    continuation turn (see ConversationSessionStore) -- Sydney already has
-    everything before it in its own server-side memory, so unlike
-    `_render_conversation_prompt` this sends only the delta, not the whole
-    transcript. Returns None if there's no usable text (the caller then
-    falls back to a fresh, context-stuffed turn, same as
-    `_render_conversation_prompt` returning None would)."""
-    text = _message_text(message)
-    if message.get("role") == "tool":
-        # Continuation is only ever attempted for requests with no `tools`
-        # (see the section comment above), so this shouldn't normally be
-        # reached -- kept as a graceful degrade, not an assumption, in case
-        # a conversation used tools on an earlier turn before the client
-        # stopped passing `tools` on later ones.
-        text = f"(Result of an earlier request: {text or '(empty result)'})"
-    return text or None
+def _update_message_hash(hasher, m):
+    """Folds one message into `hasher` using the exact per-message encoding
+    `_conversation_fingerprint` relies on (NUL between fields, unit-separator
+    after the message). Factored out so `_prefix_fingerprints` can compute
+    every prefix's fingerprint in a single pass while staying byte-for-byte
+    identical to `_conversation_fingerprint(messages[:k])` -- the two MUST
+    agree for prefix matching (see `_match_continuation`) to be sound."""
+    hasher.update(str(m.get("role", "")).encode("utf-8", "replace"))
+    hasher.update(b"\0")
+    hasher.update(str(m.get("name", "")).encode("utf-8", "replace"))
+    hasher.update(b"\0")
+    hasher.update(_message_text(m).encode("utf-8", "replace"))
+    hasher.update(b"\0")
+    tool_calls = m.get("tool_calls")
+    if tool_calls:
+        hasher.update(json.dumps(tool_calls, sort_keys=True).encode("utf-8"))
+    hasher.update(b"\0")
+    hasher.update(str(m.get("tool_call_id", "")).encode("utf-8", "replace"))
+    hasher.update(b"\x1f")  # unit separator between messages
+
+
+def _prefix_fingerprints(messages):
+    """Returns a list `fps` of length `len(messages) + 1` where
+    `fps[k] == _conversation_fingerprint(messages[:k])` for every k. Computed
+    in ONE pass by snapshotting the running hash after each message
+    (`hashlib` objects support `.copy()`), so matching every prefix of an
+    incoming request costs O(total bytes), not O(n * total bytes) -- see
+    `_match_continuation`, which needs every prefix's fingerprint to find the
+    longest already-seen one."""
+    hasher = hashlib.sha256()
+    fps = [hasher.copy().hexdigest()]  # k == 0: the empty prefix
+    for m in messages:
+        _update_message_hash(hasher, m)
+        fps.append(hasher.copy().hexdigest())
+    return fps
+
+
+def _match_continuation(store, messages, oid):
+    """Aggressive continuation matcher: find the LONGEST prefix of `messages`
+    that maps to a live Sydney conversation in `store`, POP it (single-use,
+    for branch safety -- see ConversationSessionStore), and return
+    `(session, matched_fingerprint, delta_messages)`; or None on no match.
+
+    "Longest first" means the smallest possible delta -- Sydney already holds
+    the most in its own server-side memory. `delta_messages` is everything
+    after the matched prefix with any LEADING `assistant`-role messages
+    removed: those are the client's own re-rendering of the reply Sydney
+    already produced into that conversation, so re-sending them would either
+    be redundant or (worse) trip the fabricated-prior-turn refusal shape (see
+    `_render_conversation_prompt`'s docstring). Everything after those -- the
+    tool results and/or new user turns the client actually added -- is the
+    genuine delta.
+
+    Unlike the original exact `messages[:-1]` matcher, this tolerates a client
+    that appends MORE than one message per round and/or re-serializes the
+    assistant turn differently than this proxy emitted it (exactly what
+    OpenHands' mock-function-calling loop does -- it reconstructs the
+    assistant `tool_calls` message and injects a separate execution-result
+    message each round), which the strict matcher could never recognize as a
+    continuation.
+
+    Returns None (falling back to a fresh, fully context-stuffed turn -- always
+    safe) if no prefix matches, or if the only thing after the matched prefix
+    is the assistant reply itself with nothing genuinely new to send."""
+    fps = _prefix_fingerprints(messages)
+    # Try the longest prefix first (smallest delta). A prefix must leave at
+    # least one message as the delta, so k tops out at len(messages) - 1.
+    for k in range(len(messages) - 1, 0, -1):
+        session = store.lookup(fps[k], oid)  # POPS only on an actual match
+        if session is None:
+            continue
+        remaining = messages[k:]
+        i = 0
+        while i < len(remaining) and remaining[i].get("role") == "assistant":
+            i += 1
+        delta_messages = remaining[i:]
+        if not delta_messages:
+            # Matched, but the client added nothing past our own reply -- the
+            # entry is already popped, so this cleanly falls back to a fresh
+            # turn (never a wrong answer, just one context-stuffed turn).
+            return None
+        return session, fps[k], delta_messages
+    return None
+
+
+def _render_continuation_delta(
+    delta_messages, tools=None, tool_choice=None, mode="action_request"
+):
+    """Renders ONLY the new messages (`_match_continuation`'s `delta_messages`)
+    as the next turn on a reused Sydney `ConversationId`. Sydney already holds
+    everything before them in its own server-side memory, so -- unlike
+    `_render_conversation_prompt` -- this sends just the delta: no transcript,
+    and when `tools` are present NO full schema re-injection either, only a
+    compact reminder of the calling convention (the bet the whole
+    tools-continuation path makes is that Sydney remembers the schema it was
+    taught on the conversation's first turn; if that bet ever fails the caller
+    falls back to a fresh, schema-reinjected turn -- see `_run_tool_call_turn`).
+
+    Tool-result (`role: "tool"`) messages are folded into ordinary
+    parenthetical context worded to match `mode`, exactly as
+    `_render_conversation_prompt._fold_pending` does, so a continuation reads
+    the same way a fresh turn's tail would and avoids the fabricated-history
+    refusal shape. `tool_choice` is accepted for signature parity with the
+    fresh renderer; the convention reminder is fixed wording and doesn't vary
+    with it. Returns None if there's no usable text at all (the caller then
+    falls back to a fresh, context-stuffed turn)."""
+    clean = _neutralize_tool_word if tools else (lambda s: s)
+    tool_call_names = {}
+    pending_results = []
+    chunks = []
+
+    def fold(text):
+        if not pending_results:
+            return text
+        if mode == "code":
+            preamble = "\n".join(
+                f"({_CODE_MODE_INVOKE_NAME}('{n}', ...) returned: {t})"
+                for n, t in pending_results
+            )
+        else:
+            preamble = "\n".join(
+                f"(Result of your earlier {n} request: {t})" for n, t in pending_results
+            )
+        pending_results.clear()
+        return f"{preamble}\n\n{text}" if text else preamble
+
+    for m in delta_messages:
+        role = m.get("role")
+        text = clean(_message_text(m))
+        if role == "assistant":
+            # A trailing assistant turn inside the delta is unusual (leading
+            # ones are dropped by _match_continuation), but keep any genuine
+            # text and harvest tool-call names for folding a following result.
+            for tc in m.get("tool_calls") or []:
+                tool_call_names[tc.get("id")] = (tc.get("function") or {}).get(
+                    "name", "?"
+                )
+            if text:
+                chunks.append(text)
+            continue
+        if role == "tool":
+            name = tool_call_names.get(m.get("tool_call_id"), "unknown_request")
+            pending_results.append((name, text or "(empty result)"))
+            continue
+        # user / system / anything else: fold any buffered tool result onto it
+        text = fold(text)
+        if text:
+            chunks.append(text)
+
+    if pending_results:
+        chunks.append(fold("Please continue."))
+
+    body = "\n\n".join(c for c in chunks if c)
+    if not body:
+        return None
+    if not tools:
+        return body
+    if mode == "code":
+        reminder = (
+            "If you need one of the capabilities described earlier in this "
+            f"conversation, write and run a short Python snippet that calls "
+            f"{_CODE_MODE_INVOKE_NAME}(name, arguments) and reads the result, "
+            "exactly as before. Otherwise, just answer normally in plain text."
+        )
+    else:
+        reminder = (
+            "If you need to take an action, reply with ONLY one or more "
+            f"{_TOOL_CALL_OPEN}...{_TOOL_CALL_CLOSE} blocks as described earlier "
+            "in this conversation and nothing else. Otherwise, reply normally "
+            "in plain text."
+        )
+    return f"{body}\n\n{reminder}"
 
 
 class ConversationSession:
@@ -2325,8 +2490,8 @@ class ConversationSessionStore:
     def forget(self, fingerprint):
         """Evicts one cached session -- called when a Chathub turn that
         tried to reuse it failed, so the client's very next attempt
-        (which necessarily resends the identical `messages[:-1]`, since
-        that's the OpenAI-client contract this whole mechanism relies on)
+        (which necessarily resends the identical prefix, since that's the
+        OpenAI-client contract this whole mechanism relies on)
         gets a clean cache miss and falls back to a brand-new conversation,
         rather than repeatedly retrying the same possibly-broken
         `ConversationId` forever. A no-op if `fingerprint` is None or
@@ -2789,9 +2954,7 @@ def _openai_tool_call_entries(tool_calls, with_index=False):
     return entries
 
 
-def _run_tool_call_turn(
-    token_cache, messages, tools, tool_choice, max_attempts=_TOOL_CALL_MAX_ATTEMPTS
-):
+def _run_tool_call_turn(token_cache, plan, max_attempts=_TOOL_CALL_MAX_ATTEMPTS):
     """Runs one Chathub turn per attempt (up to `max_attempts`), each as a
     brand-new, independent Chathub turn (Sydney has no memory to preserve
     across a retry anyway -- see `_render_conversation_prompt`'s docstring),
@@ -2816,16 +2979,75 @@ def _run_tool_call_turn(
     driving this design, including why a single attempt (or a single fixed
     convention retried unchanged) was not judged an acceptable design.
 
-    Returns `(text, tool_calls)` from whichever attempt produced tool_calls,
-    or from the LAST attempt if none did across all attempts -- so the
-    caller still has a plain-text reply to fall back to (finish_reason
-    "stop") rather than nothing at all."""
+    Returns `(text, tool_calls, conversation_id, turn_count)`: the reply text,
+    the parsed tool calls (empty if none landed), the Sydney `ConversationId`
+    the returned reply actually lives on, and how many turns deep that
+    conversation now is -- so the caller can remember it for
+    ConversationSessionStore continuity. Falls back to the LAST attempt's
+    plain text (finish_reason "stop") if no attempt produced a call, rather
+    than nothing at all.
+
+    When `plan` is a continuation (see `_match_continuation`) this first tries
+    a SINGLE delta turn on the reused conversation with NO schema re-injected
+    -- relying on Sydney's own memory of the schema from the conversation's
+    first turn (`_render_continuation_delta` sends only a compact reminder of
+    the convention). If that yields a parseable call it's returned at once; if
+    it produces no parseable call, or the Chathub turn errors, this falls back
+    to the ordinary fresh path below: a brand-new, fully-rendered
+    (schema-reinjected) turn under a fresh conversation, tried across
+    multiple attempts/conventions. So a tools continuation can only save a
+    round-trip, never lose an answer the fresh path would have produced -- the
+    matched session was already popped by `_match_continuation`, so a failed
+    continuation leaves nothing stale behind."""
+    if plan.is_continuation:
+        mode = _TOOL_CALL_MODES[0]  # "code" -- matches _plan_chat_turn's render
+        logging.info(
+            "tool-call continuation on reused conversation_id=%s (turn=%d): "
+            "sending delta (delta_length=%d chars), no schema re-injected",
+            plan.conversation_id,
+            plan.turn_count,
+            len(plan.prompt),
+        )
+        try:
+            text = "".join(
+                run_chat_turn(
+                    token_cache,
+                    plan.prompt,
+                    conversation_id=plan.conversation_id,
+                    tool_mode=mode,
+                )
+            )
+            _, tool_calls = _extract_calls_for_mode(mode, text)
+            if tool_calls:
+                logging.info(
+                    "tool-call continuation succeeded on conversation_id=%s",
+                    plan.conversation_id,
+                )
+                return text, tool_calls, plan.conversation_id, plan.turn_count
+            logging.info(
+                "tool-call continuation on conversation_id=%s produced no "
+                "parseable call -- falling back to a fresh, schema-reinjected turn",
+                plan.conversation_id,
+            )
+        except Exception:
+            logging.warning(
+                "tool-call continuation turn failed (conversation_id=%s) -- "
+                "falling back to a fresh, schema-reinjected turn",
+                plan.conversation_id,
+                exc_info=True,
+            )
+
     text, tool_calls = "", []
+    conversation_id = None
     for attempt in range(1, max_attempts + 1):
         mode = _TOOL_CALL_MODES[(attempt - 1) % len(_TOOL_CALL_MODES)]
         prompt = _render_conversation_prompt(
-            messages, tools=tools, tool_choice=tool_choice, mode=mode
+            plan.messages, tools=plan.tools, tool_choice=plan.tool_choice, mode=mode
         )
+        # Each attempt is a brand-new, independent Chathub conversation (Sydney
+        # has no memory to preserve across a retry) -- an explicit fresh id per
+        # attempt so the SUCCESSFUL one can be remembered for later continuation.
+        conversation_id = str(uuid.uuid4())
         logging.info(
             "tool-call emulation attempt %d/%d: mode=%s rendered_prompt_length=%d chars",
             attempt,
@@ -2833,7 +3055,11 @@ def _run_tool_call_turn(
             mode,
             len(prompt),
         )
-        text = "".join(run_chat_turn(token_cache, prompt, tool_mode=mode))
+        text = "".join(
+            run_chat_turn(
+                token_cache, prompt, conversation_id=conversation_id, tool_mode=mode
+            )
+        )
         _, tool_calls = _extract_calls_for_mode(mode, text)
         if tool_calls:
             if attempt > 1:
@@ -2843,7 +3069,7 @@ def _run_tool_call_turn(
                     max_attempts,
                     mode,
                 )
-            return text, tool_calls
+            return text, tool_calls, conversation_id, 1
         logging.info(
             "tool-call emulation attempt %d/%d (mode=%s) produced no call%s",
             attempt,
@@ -2853,7 +3079,7 @@ def _run_tool_call_turn(
             if attempt < max_attempts
             else " -- giving up, falling back to plain content",
         )
-    return text, tool_calls
+    return text, tool_calls, conversation_id, 1
 
 
 def _render_conversation_prompt(
@@ -2874,8 +3100,8 @@ def _render_conversation_prompt(
     above `_conversation_fingerprint` for when Sydney's own server-side
     memory is used instead -- confirmed live to work, see
     REVERSE_ENGINEERING.md -- via `_render_continuation_delta`, which sends
-    only the newest message rather than this function's full-transcript
-    rendering).
+    only the new message(s) past the matched prefix rather than this
+    function's full-transcript rendering).
 
     Context-stuffing here is still what many bridges use for backends with
     no native `system` role or message history, and is still exactly what
@@ -3081,6 +3307,7 @@ class _ChatTurnPlan:
         "tool_choice",
         "oid",
         "turn_count",
+        "delta_messages",
     )
 
     def __init__(
@@ -3095,6 +3322,7 @@ class _ChatTurnPlan:
         tool_choice,
         oid,
         turn_count,
+        delta_messages=None,
     ):
         self.prompt = prompt
         self.conversation_id = conversation_id
@@ -3105,6 +3333,11 @@ class _ChatTurnPlan:
         self.tools = tools
         self.tool_choice = tool_choice
         self.oid = oid
+        #: The new-messages slice (leading assistant turns already removed)
+        #: this continuation will send as its delta, or None for a fresh turn.
+        #: Kept so the tools path can re-render the delta per convention `mode`
+        #: without recomputing the prefix match. See `_match_continuation`.
+        self.delta_messages = delta_messages
         #: turn_count to `remember()` this conversation under if this turn
         #: succeeds -- i.e. how many turns deep the reused Sydney
         #: `ConversationId` will be AFTER this one, purely for logging (see
@@ -3134,23 +3367,38 @@ def _plan_chat_turn(token_cache, messages, tools, tool_choice, conversation_sess
     `conversation_sessions` is None when continuity is disabled
     (--disable-conversation-continuity) -- every request then takes the
     fresh-conversation path, identical to this proxy's behavior before this
-    feature existed."""
-    should_track = conversation_sessions is not None and not tools
+    feature existed.
+
+    Continuation is attempted for requests WITH `tools` too (see the section
+    comment above `_conversation_fingerprint`): the tools path reuses Sydney's
+    conversation for a single delta turn and falls back to a fresh,
+    schema-reinjected turn if that doesn't land -- so lifting the old
+    tools-exclusion can only ever save round-trips, never change what a
+    request can produce."""
+    should_track = conversation_sessions is not None
     oid = token_cache.get().oid if should_track else None
 
     if should_track and len(messages) >= 2:
-        lookup_fingerprint = _conversation_fingerprint(messages[:-1])
-        session = conversation_sessions.lookup(lookup_fingerprint, oid)
-        if session is not None:
-            delta = _render_continuation_delta(messages[-1])
+        match = _match_continuation(conversation_sessions, messages, oid)
+        if match is not None:
+            session, lookup_fingerprint, delta_messages = match
+            # Tools continuations render/parse in "code" mode (the first entry
+            # of _TOOL_CALL_MODES); plain chat needs no convention wording.
+            mode = _TOOL_CALL_MODES[0] if tools else "action_request"
+            delta = _render_continuation_delta(
+                delta_messages, tools=tools, tool_choice=tool_choice, mode=mode
+            )
             if delta is not None:
                 logging.info(
                     "recognized as a Sydney-native continuation "
-                    "(conversation_id=%s, turn=%d) -- sending only the newest "
-                    "message (delta_length=%d chars) instead of context-stuffing",
+                    "(conversation_id=%s, turn=%d) -- sending only the %d new "
+                    "message(s) (delta_length=%d chars, tools=%d) instead of "
+                    "context-stuffing",
                     session.conversation_id,
                     session.turn_count + 1,
+                    len(delta_messages),
                     len(delta),
+                    len(tools or []),
                 )
                 return _ChatTurnPlan(
                     prompt=delta,
@@ -3163,6 +3411,7 @@ def _plan_chat_turn(token_cache, messages, tools, tool_choice, conversation_sess
                     tool_choice=tool_choice,
                     oid=oid,
                     turn_count=session.turn_count + 1,
+                    delta_messages=delta_messages,
                 )
 
     prompt, conversation_id = _fresh_conversation_turn(messages, tools, tool_choice)
@@ -3315,16 +3564,23 @@ def make_handler(token_cache, conversation_sessions):
             else:
                 self._handle_full(plan, model)
 
-        def _remember_turn(self, plan, text):
-            """Shared tail of `_run_plain_turn`/`_stream_plain_turn`: if
-            `plan` is tracked, remembers the completed turn's conversation
-            state under a fingerprint of `messages + [this reply]` so the
-            client's next call can be recognized as a continuation."""
+        def _remember_turn(self, plan):
+            """Shared tail of the plain and tool-call turn runners: if `plan`
+            is tracked, remembers the completed turn's Sydney conversation
+            under a fingerprint of the exact `messages[]` array the client
+            sent THIS turn, so the client's next call -- which resends this
+            array verbatim as a prefix and appends its own rendering of the
+            reply plus new input -- is recognized as a continuation by
+            `_match_continuation`.
+
+            Keying on the client's INPUT (not `messages + [our reply]`, as an
+            earlier design did) is what lets prefix matching tolerate the
+            client re-serializing the assistant turn differently than this
+            proxy emitted it: the fingerprint never depends on the reply's
+            wording at all, only on what the client itself resends."""
             if not plan.should_track:
                 return
-            new_fingerprint = _conversation_fingerprint(
-                plan.messages + [{"role": "assistant", "content": text}]
-            )
+            new_fingerprint = _conversation_fingerprint(plan.messages)
             conversation_sessions.remember(
                 new_fingerprint, plan.conversation_id, plan.oid, plan.turn_count
             )
@@ -3383,7 +3639,7 @@ def make_handler(token_cache, conversation_sessions):
                     )
                 )
 
-            self._remember_turn(plan, text)
+            self._remember_turn(plan)
             return text
 
         def _stream_plain_turn(self, plan):
@@ -3414,7 +3670,7 @@ def make_handler(token_cache, conversation_sessions):
                     conversation_sessions.forget(plan.lookup_fingerprint)
                 raise
 
-            self._remember_turn(plan, "".join(parts))
+            self._remember_turn(plan)
 
         def _handle_streaming(self, plan, model):
             self.send_response(200)
@@ -3451,9 +3707,15 @@ def make_handler(token_cache, conversation_sessions):
                     # emitted as one chunk. Documented as a known limitation.
                     # See _run_tool_call_turn for why this retries internally
                     # (and across more than one tool-calling convention).
-                    text, tool_calls = _run_tool_call_turn(
-                        token_cache, plan.messages, plan.tools, plan.tool_choice
+                    text, tool_calls, conv_id, turn_count = _run_tool_call_turn(
+                        token_cache, plan
                     )
+                    # Reflect whichever conversation actually produced this
+                    # reply (reused on a continuation, fresh otherwise) back
+                    # onto the plan so _remember_turn tracks the right id.
+                    plan.conversation_id = conv_id
+                    plan.turn_count = turn_count
+                    self._remember_turn(plan)
                     if tool_calls:
                         # Leftover text is deliberately dropped here, not
                         # surfaced as delta content -- see _handle_full's
@@ -3540,9 +3802,15 @@ def make_handler(token_cache, conversation_sessions):
             tools_requested = bool(plan.tools)
             try:
                 if tools_requested:
-                    text, tool_calls = _run_tool_call_turn(
-                        token_cache, plan.messages, plan.tools, plan.tool_choice
+                    text, tool_calls, conv_id, turn_count = _run_tool_call_turn(
+                        token_cache, plan
                     )
+                    # Reflect whichever conversation actually produced this
+                    # reply (reused on a continuation, fresh otherwise) back
+                    # onto the plan so _remember_turn tracks the right id.
+                    plan.conversation_id = conv_id
+                    plan.turn_count = turn_count
+                    self._remember_turn(plan)
                 else:
                     text, tool_calls = self._run_plain_turn(plan), []
             except ThrottledError as e:

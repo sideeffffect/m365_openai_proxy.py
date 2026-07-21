@@ -89,19 +89,28 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   independent Chathub WebSocket connection as real server-side conversation
   memory — see REVERSE_ENGINEERING.md's "Sydney-native conversation
   continuity" section for the full transcript. When an incoming request's
-  `messages[]` array is recognized as an exact continuation of a
-  conversation this proxy already relayed (and the request has no `tools`
-  — see below), only the newest message is sent on the reused
+  `messages[]` array is recognized as a continuation of a conversation this
+  proxy already relayed — its longest already-seen prefix matches an earlier
+  request — only the new message(s) past that prefix are sent on the reused
   `ConversationId`, instead of re-rendering and resending the whole growing
-  transcript every time. Any time that can't be established with
-  confidence — the first turn of a conversation, edited/branched history,
-  `tools` present, or the proxy having restarted (this is in-memory only,
-  never persisted) — it falls back to the original behavior: render the
-  whole `messages` array into one text blob and send it as a single turn on
-  a brand-new `ConversationId`. This is fully additive: it never changes
-  what a request can produce, only how much has to be resent to get it.
-  Disable it entirely with `--disable-conversation-continuity` if you ever
-  need the old always-context-stuff behavior.
+  transcript every time. Matching by longest prefix (rather than an exact
+  all-but-last append) means it keeps working even when the client appends
+  more than one message per round or re-serializes the previous assistant
+  reply differently than the proxy emitted it — the common shape for a
+  tool-calling agent loop (e.g. OpenHands' mock-function-calling mode, which
+  otherwise re-sent its entire multi-KB system prompt on every single
+  command). Requests **with** `tools` are covered too: the tool-calling
+  emulation reuses Sydney's conversation for a single delta turn and falls
+  back automatically to a fresh, schema-reinjected turn if that doesn't land.
+  Any time a continuation can't be established — the first turn of a
+  conversation, a genuinely branched/edited history, or the proxy having
+  restarted (this is in-memory only, never persisted) — it falls back to the
+  original behavior: render the whole `messages` array into one text blob and
+  send it as a single turn on a brand-new `ConversationId`. This is fully
+  additive: it never changes what a request can produce, only how much has to
+  be resent to get it. Disable it entirely with
+  `--disable-conversation-continuity` if you ever need the old
+  always-context-stuff behavior.
 - **Tool/function calling is emulated by prompting, and is probabilistic.**
   Sydney has no native `tools`/`tool_calls` mechanism at all. When a request
   includes `tools`, this proxy injects plain-text instructions teaching the
