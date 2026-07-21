@@ -4,7 +4,7 @@ name = "m365-openai-proxy"
 # source, reported in the startup banner + HTTP Server header) and with the
 # git tag / GitHub Release for the same version (SemVer `X.Y.Z`, tag `vX.Y.Z`).
 # See AGENTS.md "Versioning & releases" for the release checklist.
-version = "0.8.0"
+version = "0.9.0"
 description = "An OpenAI-compatible proxy for Microsoft 365 Copilot, shipped as a single stdlib-only Python file."
 readme = "README.md"
 requires-python = ">=3.11"
