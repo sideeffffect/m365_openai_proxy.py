@@ -522,7 +522,7 @@ import uuid
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.10.0"
+PROXY_VERSION = "0.10.1"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -903,6 +903,61 @@ ALLOWED_MESSAGE_TYPES = [
     "ReferencesListComplete",
     "SwitchRespondingEndpoint",
 ]
+
+#: `messageType` values on a bot `messages[]` entry that mean "this entry IS
+#: (part of) the answer the caller asked for", and whose `text` therefore
+#: belongs in the reply -- see `stream_chat_reply`.
+#:
+#: The prose answer entry carries NO `messageType` key at all (observed live;
+#: it is identified instead by `contentOrigin:"DeepLeo"` + `adaptiveCards`),
+#: hence the `None`. `"Chat"` is accepted defensively (it is the name the
+#: protocol uses for an ordinary chat message -- it is what the client itself
+#: stamps on the outgoing user message -- so an answer arriving explicitly
+#: typed that way must not be dropped). `"Disengaged"` carries Sydney's own
+#: canned "I'd rather not continue this conversation" refusal text, which is
+#: meant to be shown to the user, so it counts as answer content too.
+#:
+#: `"GeneratedCode"` is here for a LOAD-BEARING reason, verified live with
+#: `scripts/probe_generated_code_messages.py`: in "code" tool-calling mode the
+#: fenced ```python block containing the `invoke_capability(...)` call -- the
+#: entire thing `_extract_code_mode_calls` parses a tool call out of -- arrives
+#: as a `messageType:"GeneratedCode"` entry and NOT in the prose answer entry
+#: (which, in that same turn, holds only Sydney's prose). Treating it as chrome
+#: silently breaks all code-mode tool calling. See REVERSE_ENGINEERING.md's
+#: "Telling the answer apart from Sydney's own UI chrome".
+ANSWER_MESSAGE_TYPES = frozenset({None, "Chat", "Disengaged", "GeneratedCode"})
+
+#: Bot `messages[]` entries with one of these `messageType`s are Sydney's own
+#: transient UI chrome -- progress/status placeholders ("Gathering details...",
+#: "Working on it...", "Looking into it...", and "Coding and executing", which
+#: is a `Progress` entry sitting right next to the `GeneratedCode` entry that
+#: is genuine content), internal search bookkeeping, follow-up suggestions,
+#: citation-list end markers, and so on. They stream on the SAME
+#: `target:"update"` channel as the answer and must never reach the caller:
+#: yielding them prepends status noise to the assistant's content (and
+#: previously did -- see `stream_chat_reply`).
+#:
+#: This set exists only to keep the log quiet about the ones we EXPECT to see:
+#: anything that is neither here nor in `ANSWER_MESSAGE_TYPES` is skipped too,
+#: but logged as a warning, since a genuine answer wrongly skipped would
+#: otherwise look like an unexplained empty reply.
+TRANSIENT_MESSAGE_TYPES = frozenset(
+    {
+        "Progress",
+        "InternalLoaderMessage",
+        "InternalSearchQuery",
+        "InternalSearchResult",
+        "ReferencesListComplete",
+        "Suggestion",
+        "RenderCardRequest",
+        "AdsQuery",
+        "SemanticSerp",
+        "SearchQuery",
+        "MemoryUpdate",
+        "EndOfRequest",
+        "DeveloperLogs",
+    }
+)
 
 SIGNALR_RS = "\x1e"  # SignalR JSON Hub Protocol record separator
 
@@ -2009,9 +2064,28 @@ def stream_chat_reply(ws, timeout_s=120):
     """Yield text deltas as the bot's reply streams in. Reassembles deltas by
     diffing successive full-text snapshots (`messages[].text`) rather than
     trying to interpret the `writeAtCursor` partial-append fields directly --
-    simpler, and self-correcting if a snapshot ever doesn't extend cleanly."""
+    simpler, and self-correcting if a snapshot ever doesn't extend cleanly.
+
+    Only entries that are actually part of the ANSWER are yielded. Sydney
+    interleaves its own transient status placeholders ("Gathering details...",
+    "Working on it...", "Coding and executing") into the very same
+    `target:"update"` frames, distinguished ONLY by carrying a `messageType`
+    (`Progress`, `InternalLoaderMessage`, ...) where the real answer entry
+    carries none -- so they must be filtered by type, not by text. See
+    `ANSWER_MESSAGE_TYPES`/`TRANSIENT_MESSAGE_TYPES`.
+
+    Snapshots are diffed PER `messageId`, because those interleaved entries are
+    separate messages with their own ids: a single shared "last text" makes a
+    switch between two messages look like a snapshot that doesn't extend the
+    previous one, which the diff can only resolve by re-yielding the whole
+    text."""
     deadline = time.time() + timeout_s
-    last_text = ""
+    # Latest full-text snapshot of each answer message, keyed by `messageId`.
+    snapshots = {}
+    # Total answer text yielded so far -- the "did any answer text arrive?"
+    # signal (and the logged length). Deliberately NOT a length of any one
+    # message: see the type-2 branch below.
+    yielded_len = 0
     buf = SignalRBuffer()
     logging.debug("waiting for Chathub reply (timeout=%ds)", timeout_s)
 
@@ -2041,9 +2115,28 @@ def stream_chat_reply(ws, timeout_s=120):
                             )
                         if msg.get("author") != "bot":
                             continue
+                        msg_type = msg.get("messageType")
+                        if msg_type not in ANSWER_MESSAGE_TYPES:
+                            # Sydney's own status/progress chrome, not answer
+                            # text. Log lengths only, never the text itself:
+                            # these are non-secret, but the logging convention
+                            # here is metadata-only for message payloads.
+                            log = (
+                                logging.debug
+                                if msg_type in TRANSIENT_MESSAGE_TYPES
+                                else logging.warning
+                            )
+                            log(
+                                "ignoring non-answer bot message: "
+                                "messageType=%r text_length=%d",
+                                msg_type,
+                                len(msg.get("text") or ""),
+                            )
+                            continue
                         text = msg.get("text")
                         if text is None:
                             continue
+                        last_text = snapshots.get(msg.get("messageId"), "")
                         delta = (
                             text[len(last_text) :]
                             if text.startswith(last_text)
@@ -2051,9 +2144,10 @@ def stream_chat_reply(ws, timeout_s=120):
                         )
                         if delta:
                             yield delta
-                        last_text = text
+                            yielded_len += len(delta)
+                        snapshots[msg.get("messageId")] = text
 
-            elif ftype == 2 and not last_text:
+            elif ftype == 2 and not yielded_len:
                 # StreamItem: normally just an echo of the user's own message
                 # (persisted/enriched -- see module comments elsewhere), safe
                 # to ignore. But when a turn is refused before any normal
@@ -2064,9 +2158,12 @@ def stream_chat_reply(ws, timeout_s=120):
                 # failure text appears is here -- the type-1/`update` path
                 # above never carries it. Without this check the turn would
                 # silently "succeed" with an empty reply and no visible
-                # cause. Guarded on `not last_text` so a normal completed
+                # cause. Guarded on `not yielded_len` so a normal completed
                 # reply's own final StreamItem echo is never mistaken for a
-                # failure.
+                # failure -- and, since progress placeholders no longer count
+                # as answer text, a turn that emitted only a "Gathering
+                # details..." placeholder before failing is now correctly
+                # reported as the failure it is instead of being masked by it.
                 item = frame.get("item") or {}
                 for msg in item.get("messages") or []:
                     if msg.get("author") == "bot" and msg.get("turnState") == "Failed":
@@ -2076,13 +2173,13 @@ def stream_chat_reply(ws, timeout_s=120):
 
             elif ftype == 3:  # Completion frame: this invocation is done
                 logging.info(
-                    "Chathub reply complete (total_length=%d chars)", len(last_text)
+                    "Chathub reply complete (total_length=%d chars)", yielded_len
                 )
                 return
             elif ftype == 7:  # hub closed
                 logging.info(
                     "Chathub hub closed the connection (total_length so far=%d chars)",
-                    len(last_text),
+                    yielded_len,
                 )
                 return
             # ignore: type 6 (ping), and Invocation frames with target "Metrics"
