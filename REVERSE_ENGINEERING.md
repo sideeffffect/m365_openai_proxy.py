@@ -534,6 +534,76 @@ seen: `1`=Invocation, `2`=StreamItem, `3`=Completion, `4`=StreamInvocation, `6`=
 | 19 | S→C | 1 | `target:"Metrics"` | final perf metrics: `RequestSent`→`FirstTokenReceived`→`LastTokenReceived` timestamps, token/char counts, inter-token timing stats |
 | 20 | S→C | 7 (Close) | `allowReconnect:true` | hub closes the connection after the turn |
 
+### Telling the answer apart from Sydney's own UI chrome (`messageType`)
+
+Not every `author:"bot"` entry in a `target:"update"` frame's `messages[]` is
+part of the answer. Sydney interleaves its own transient UI chrome into the
+*same* frames — and the **only** wire-level discriminator is `messageType`:
+
+| entry | `messageType` | other markers | is it content? |
+| --- | --- | --- | --- |
+| the prose reply | **absent — no such key** | `contentOrigin:"DeepLeo"`, `responseIdentifier:"Default"`, `adaptiveCards[]`, own stable `messageId` | **yes** |
+| code Sydney wrote | `"GeneratedCode"` | no `contentType`; `text` is a fenced ```` ```python ```` block | **yes — load-bearing, see below** |
+| code Sydney ran | `"GeneratedCode"` | `text` is a JSON blob: `{"executedCode":…,"status":…,"stderr":…,"outputFiles":[]}` | (arrives as content; junk in practice) |
+| status placeholder | `"Progress"` | `contentType:"EarlyProgress"` / `"Code"` / `"SearchResults"`, `isPersisted:false`, `addToChainOfThought:false`, `toolResultPublishPreference:"Never"` | no |
+| loader placeholder | `"InternalLoaderMessage"` | | no |
+| citations finished | `"ReferencesListComplete"` | usually no `text` at all | no |
+| follow-up prompts | `"Suggestion"` | `author:"user"`, nested under the answer's `suggestedResponses[]` | no |
+
+The placeholders carry ordinary-looking `text` — observed live: `"Gathering
+details…"`, `"Working on it…"`, `"Making it happen…"`, `"Coding and
+executing"` — and the **first** one typically arrives *before* the first
+answer token (frame 1 in the table above, ahead of frame 6). So a client that
+treats every bot `text` as reply text emits the placeholder as the opening of
+the assistant's message. That is exactly the bug fixed in v0.10.1: plain
+replies came back as `"Making it happen…pong"`, and the first streamed chunk
+was `"Working on it…"`. It had been *visible* in this document since the
+tool-calling work (the leaked `"Coding and executing"` prefix noted in the
+"Tool-calling emulation" section below) but was only ever worked around
+downstream, on the tool-call path, by discarding leftover text — so the plain
+chat path leaked it verbatim to the caller.
+
+**`GeneratedCode` is content, not chrome — this one is a trap.** It is tempting
+to classify it with the rest of the code-interpreter noise, and doing so
+silently breaks *all* code-mode tool calling. Dumped live with
+`scripts/probe_generated_code_messages.py` (one code-mode turn, one
+`get_weather` capability), the entries arrive in this order:
+
+| # | `messageType` | `contentType` | `text` |
+| --- | --- | --- | --- |
+| 1 | `Progress` | `EarlyProgress` | `"Looking into it…"` |
+| 2 | `Progress` | `Code` | `"Coding and executing"` |
+| 3 | **`GeneratedCode`** | — | ` ```python\nresult = invoke_capability('get_weather', {'city': 'Prague'})\nprint(result)\n``` ` |
+| 4 | `GeneratedCode` | — | `{"executedCode":…,"status":"Failed","stderr":"NameError: name 'invoke_capability' is not defined…"}` |
+| 5 | `Progress` | `SearchResults` | `"OK, I'll search for 'Prague current weather'…"` |
+| 6… | *absent* | — | the prose answer, streamed as growing snapshots |
+
+Entry 3 — the `invoke_capability(...)` call that `_extract_code_mode_calls()`
+exists to parse — is in a `GeneratedCode` entry, and the prose answer (entry 6)
+contains *only prose*. So the tool-call convention rides entirely on
+`GeneratedCode` reaching the reply text; entry 2 (`"Coding and executing"`) is
+the adjacent `Progress` entry that used to be glued onto it, which is why that
+prefix shows up throughout the tool-calling notes below. Entry 4 is the same
+type carrying the *execution result* instead (Sydney runs the code in its own
+sandbox, where `invoke_capability` is of course undefined — the `NameError`
+self-preempt described later); it is junk, but it is not distinguishable by
+type, only by sniffing the text, so the proxy keeps it and the tool-call path
+discards leftover text instead.
+
+Two more consequences worth noting for any reimplementation:
+
+- **Filter by `messageType`, never by text.** The placeholder strings are
+  model-generated and unbounded; there is no stable list to string-match. The
+  proxy accepts an entry as content only when `messageType` is absent (or
+  `"Chat"`/`"Disengaged"`/`"GeneratedCode"` — see `ANSWER_MESSAGE_TYPES`) and
+  skips everything else, warning in the log about types it does not recognize
+  so a wrongly-skipped answer is diagnosable rather than silently empty.
+- **Diff snapshots per `messageId`.** The chrome entries are separate messages
+  with their own ids, so a single shared "text so far" cursor breaks the
+  snapshot diff: when the stream switches between two messages the new
+  snapshot doesn't extend the previous text, and the whole message gets
+  re-emitted (duplicating it in the reply).
+
 ### The client→server `chat` invocation payload (frame 3), fully
 
 ```jsonc
@@ -1430,7 +1500,10 @@ already know is by requesting it from me using the exact format below...
 </request_info>"*. This worked -- Sydney reproduced the tag and JSON exactly
 (with a leaked `"Coding and executing"` prefix before it, an internal
 progress-message artifact that turned out to reliably precede tool-call
-replies even when the final answer correctly follows the convention).
+replies even when the final answer correctly follows the convention -- it is
+a `messageType:"Progress"` entry, and as of v0.10.1 it is filtered out at the
+wire level rather than tolerated downstream; see "Telling the answer apart
+from Sydney's own UI chrome" above).
 
 Isolating the variable further: re-adding the word "tool" ANYWHERE in the
 prompt -- even just the user saying *"Please use your tools to read the
