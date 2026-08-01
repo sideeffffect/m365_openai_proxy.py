@@ -26,6 +26,9 @@ jobs:
         with:
           enable-cache: true
 
+      # ruff infers its target-version from `requires-python` in
+      # pyproject.toml, so widening the supported range automatically stops it
+      # suggesting syntax the oldest supported interpreter cannot parse.
       - name: ruff check
         run: uv run ruff check .
 
@@ -51,13 +54,52 @@ jobs:
       - name: bandit
         run: uv run bandit -c pyproject.toml m365_openai_proxy.py
 
+  floor:
+    name: Interpreter floor (vermin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      # STATIC counterpart to the compatibility matrix below: vermin walks the
+      # AST and reports the minimum interpreter the code actually requires, so
+      # a version-gated stdlib API is caught here in seconds on a modern
+      # interpreter, without needing a runner for every old Python.
+      #
+      # This is the check that would have caught the bug this job exists for:
+      # `hashlib.sha1(..., usedforsecurity=False)` is Python 3.9+, and it broke
+      # every chat turn on 3.7/3.8 while byte-compilation, `--help` and the
+      # whole test suite stayed green. vermin names the offending API directly:
+      #   'hashlib.sha1(usedforsecurity)' requires !2, 3.9
+      #
+      # The target is read out of the proxy itself (MIN_PYTHON) so this can
+      # never silently drift from the floor the code claims to support.
+      - name: Read the declared floor from the proxy
+        id: floor
+        run: |
+          echo "min=$(python -c 'import m365_openai_proxy as p; print("%d.%d" % p.MIN_PYTHON)')" >> "$GITHUB_OUTPUT"
+
+      - name: vermin
+        run: |
+          uv run vermin --no-parse-comments --violations \
+            --target=${{ steps.floor.outputs.min }}- m365_openai_proxy.py
+
   test:
     name: Tests (pytest, Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # Starts at 3.8, not at the 3.7 floor: uv cannot install a 3.7 at all,
+        # and current pytest releases require 3.10+ (uv's universal resolver
+        # picks an older pytest per interpreter, but it cannot conjure an
+        # interpreter). Python 3.7 is covered instead by the compatibility job
+        # below, which runs tests/selfcheck.py on a bare interpreter.
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
 
@@ -78,7 +120,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Supported Python range on Linux, the cheapest/fastest runner.
+          # Full supported range on Linux, the cheapest/fastest runner.
+          # actions/setup-python does not publish 3.7/3.8 for ubuntu-24.04
+          # (which `ubuntu-latest` now resolves to), so the oldest three run
+          # on 22.04.
+          - { os: ubuntu-22.04, python-version: "3.7" }
+          - { os: ubuntu-22.04, python-version: "3.8" }
+          - { os: ubuntu-22.04, python-version: "3.9" }
+          - { os: ubuntu-latest, python-version: "3.10" }
           - { os: ubuntu-latest, python-version: "3.11" }
           - { os: ubuntu-latest, python-version: "3.12" }
           - { os: ubuntu-latest, python-version: "3.13" }
@@ -87,9 +136,17 @@ jobs:
           # newest supported interpreters on macOS and Windows too. This job
           # deliberately uses a bare interpreter (no uv, no pip install) to
           # prove the proxy runs with nothing installed.
-          - { os: macos-latest, python-version: "3.11" }
+          #
+          # macOS starts at 3.8, not at the 3.7 floor: actions/setup-python
+          # publishes 3.7 for darwin/x64 ONLY (3.8 is the first version with
+          # an arm64 build), so a macOS 3.7 job requires an Intel runner --
+          # and those are being retired. `macos-13` now sits queued until it
+          # is cancelled rather than ever running, so pinning it would mean a
+          # permanently red check. Windows and Linux still cover the real 3.7
+          # floor below/above.
+          - { os: macos-latest, python-version: "3.8" }
           - { os: macos-latest, python-version: "3.13" }
-          - { os: windows-latest, python-version: "3.11" }
+          - { os: windows-latest, python-version: "3.7" }
           - { os: windows-latest, python-version: "3.13" }
     steps:
       - uses: actions/checkout@v7
@@ -107,3 +164,12 @@ jobs:
       # self-check assertion) and validates argument parsing.
       - name: Run --help
         run: python m365_openai_proxy.py --help
+
+      # py_compile and --help are far too shallow on their own: both stayed
+      # green on 3.7 while a Python-3.9-only kwarg in the WebSocket handshake
+      # broke every chat turn. selfcheck.py executes the real code paths --
+      # handshake accept value, frame round-trips, SignalR framing, AES-GCM,
+      # HKDF -- using nothing but the standard library, so it runs on every
+      # interpreter in this matrix including the ones pytest cannot reach.
+      - name: Stdlib-only self-check
+        run: python tests/selfcheck.py

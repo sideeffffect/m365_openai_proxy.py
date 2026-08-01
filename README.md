@@ -441,13 +441,25 @@ uv run bandit -c pyproject.toml m365_openai_proxy.py
 ## Requirements
 
 **Running the proxy** needs only a Python 3 interpreter — standard library
-only, no third-party packages, nothing to install. CI smoke-tests the script
-(byte-compile, plus a `--help` run that imports the module and so exercises
-the pure-Python AES-256-GCM self-check) on Python 3.11 through 3.13 on Linux,
-and on the oldest and newest of those (3.11 and 3.13) on macOS and Windows as
-well, and runs the `pytest` suite on 3.11–3.13. Functional end-to-end use —
-which needs live Microsoft credentials and so can't run in CI — was developed
-and verified against Python 3.12.
+only, no third-party packages, nothing to install.
+
+The supported range is **Python 3.7 through 3.13**. On anything older the
+script exits immediately with a one-line message telling you to use a newer
+interpreter (below 3.6 it cannot even be parsed, so that message is a
+`SyntaxError` from the interpreter itself). 3.7 is the floor because the proxy
+serves its API from `http.server.ThreadingHTTPServer`, which was added in 3.7.
+
+CI checks that range four ways:
+
+| Check | Interpreters | What it proves |
+| --- | --- | --- |
+| `py_compile` + `--help` | 3.7–3.13 on Linux; 3.7 + 3.13 on Windows; 3.8 + 3.13 on macOS | The file parses and imports (running the pure-Python AES-256-GCM self-check) on a **bare** interpreter — no uv, no `pip install` |
+| [`tests/selfcheck.py`](tests/selfcheck.py) | same as above | Real code paths — handshake accept value, frame round-trips, SignalR framing, AES-GCM, HKDF — execute correctly, using nothing but the stdlib |
+| `pytest` | 3.8–3.13 | The full offline suite. Starts at 3.8 because uv cannot install a 3.7, and current pytest needs 3.10+ |
+| `vermin` | static | The code's *actual* minimum interpreter still matches the declared floor, catching a too-new stdlib API without needing a runner for every version |
+
+Functional end-to-end use — which needs live Microsoft credentials and so
+can't run in CI — was developed and verified against Python 3.12.
 
 ## License
 

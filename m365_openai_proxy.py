@@ -10,6 +10,10 @@ that itself in pure Python -- see the "Pure-Python AES-256-GCM" section
 below). Drop this one file onto any machine with a Python 3 interpreter and
 run it; nothing else needs to be installed.
 
+Supported interpreters: Python 3.7 through 3.13 (see `MIN_PYTHON` below,
+which is checked at startup). The 3.7 floor comes from
+`http.server.ThreadingHTTPServer`, added in that version.
+
 ------------------------------------------------------------------------------
 AUTHENTICATION MODEL -- READ THIS FIRST
 ------------------------------------------------------------------------------
@@ -520,9 +524,38 @@ import urllib.parse
 import urllib.request
 import uuid
 
+# The oldest interpreter this proxy supports; see README "Requirements". Kept
+# as the single source of truth for the floor -- CI's `vermin --target` gate
+# and the compatibility matrix are pinned to the same number.
+#
+# Checked here, immediately after the imports and before anything else runs,
+# so a too-old interpreter gets one plain sentence instead of an obscure
+# failure much later. That is not hypothetical: a Python-3.9-only kwarg on a
+# `hashlib.sha1()` call inside the WebSocket handshake once let startup,
+# authentication, `--help` and the entire test suite all succeed on 3.7, then
+# failed *every chat turn* with `TypeError: openssl_sha1() takes no keyword
+# arguments`. This is the console-output exception noted in the logging
+# rules: the proxy genuinely cannot continue, and cannot even log.
+#
+# Note this can only help interpreters new enough to *parse* this file --
+# f-strings mean Python 3.6+. Anything older fails with a SyntaxError before
+# a single line of it executes, which no in-file guard can intercept.
+MIN_PYTHON = (3, 7)
+if sys.version_info < MIN_PYTHON:  # pragma: no cover - depends on interpreter
+    sys.exit(
+        "m365_openai_proxy needs Python {}.{} or newer, but this is Python {}.\n"
+        "Re-run it with a newer interpreter, for example:\n"
+        "    python3.11 {}".format(
+            MIN_PYTHON[0],
+            MIN_PYTHON[1],
+            platform.python_version(),
+            sys.argv[0] if sys.argv and sys.argv[0] else "m365_openai_proxy.py",
+        )
+    )
+
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.10.1"
+PROXY_VERSION = "0.11.0"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -1016,10 +1049,33 @@ class WSError(Exception):
 # not require compression, so we simply never offer the extension).
 # ==============================================================================
 
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def websocket_accept_value(key):
+    """RFC 6455 `Sec-WebSocket-Accept` for a given `Sec-WebSocket-Key`.
+
+    Kept as a module-level function, rather than inlined into the handshake,
+    so the offline suite can exercise it directly against RFC 6455's published
+    example vector on every interpreter the proxy supports. Inlined, it was
+    reachable only by opening a real TLS connection, so nothing in CI ran it
+    -- which is exactly how a Python-3.9-only spelling of the `hashlib.sha1()`
+    call below once shipped and broke every chat turn on 3.7/3.8 while
+    `py_compile`, `--help` and the whole test suite stayed green.
+
+    SHA-1 is mandated by RFC 6455 and is not a security control here: the
+    result is a fixed, public transformation of a nonce we just sent in
+    cleartext, used only to prove the peer really spoke WebSocket rather than
+    being some other server (or a cache) that happened to answer. bandit's
+    preferred way to say that -- passing `usedforsecurity=False` -- exists
+    only on Python 3.9+ and raises TypeError below it, so this says it in a
+    `# nosec` comment instead and keeps the call itself portable.
+    """
+    digest = hashlib.sha1((key + WS_GUID).encode()).digest()  # nosec B324
+    return base64.b64encode(digest).decode()
+
 
 class WebSocketClient:
-    _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
     OPCODE_CONTINUATION = 0x0
     OPCODE_TEXT = 0x1
     OPCODE_BINARY = 0x2
@@ -1063,10 +1119,7 @@ class WebSocketClient:
         status, resp_headers, leftover = self._read_handshake_response()
         if status != 101:
             raise WSError(f"WebSocket handshake failed: HTTP {status}")
-        expected_accept = base64.b64encode(
-            hashlib.sha1((key + self._GUID).encode(), usedforsecurity=False).digest()
-        ).decode()
-        if resp_headers.get("sec-websocket-accept") != expected_accept:
+        if resp_headers.get("sec-websocket-accept") != websocket_accept_value(key):
             raise WSError(
                 "Sec-WebSocket-Accept did not match -- handshake not trustworthy"
             )
