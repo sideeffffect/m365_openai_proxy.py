@@ -488,9 +488,9 @@ USAGE
     # above), then fill in one of the two options they describe:
     python3 m365_openai_proxy.py --init-credentials
 
-    python3 m365_openai_proxy.py --port 8000
+    python3 m365_openai_proxy.py --port 8001
 
-    curl http://127.0.0.1:8000/v1/chat/completions \\
+    curl http://127.0.0.1:8001/v1/chat/completions \\
       -H "Content-Type: application/json" \\
       -d '{"model": "m365-copilot", "messages": [{"role": "user", "content": "hello"}]}'
 
@@ -522,7 +522,7 @@ import uuid
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.9.0"
+PROXY_VERSION = "0.10.0"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -4035,7 +4035,7 @@ def main():
         help="bind address (default: 127.0.0.1 -- there is no per-request auth, keep this local unless you have your own reason not to)",
     )
     parser.add_argument(
-        "--port", type=int, default=8000, help="bind port (default: 8000)"
+        "--port", type=int, default=8001, help="bind port (default: 8001)"
     )
     parser.add_argument(
         "--credentials-prefix",

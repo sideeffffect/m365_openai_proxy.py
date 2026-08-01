@@ -204,7 +204,7 @@ section for the full run-by-run evidence):
   OpenAI-compatible model config, e.g.:
 
   ```bash
-  aider --openai-api-base http://127.0.0.1:8000/v1 --openai-api-key sk-unused \
+  aider --openai-api-base http://127.0.0.1:8001/v1 --openai-api-key sk-unused \
     --model openai/m365-copilot
   ```
 
@@ -390,10 +390,10 @@ python3 m365_openai_proxy.py --init-credentials
 
 # 3. Run it (validates the credential against Entra ID on startup, and
 #    starts logging to m365_openai_proxy.log):
-python3 m365_openai_proxy.py --port 8000
+python3 m365_openai_proxy.py --port 8001
 
 # 4. Talk to it like any OpenAI-compatible endpoint -- no auth header:
-curl http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:8001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "m365-copilot", "messages": [{"role": "user", "content": "hello"}]}'
 ```
