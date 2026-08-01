@@ -136,7 +136,15 @@ jobs:
           # newest supported interpreters on macOS and Windows too. This job
           # deliberately uses a bare interpreter (no uv, no pip install) to
           # prove the proxy runs with nothing installed.
-          - { os: macos-13, python-version: "3.7" }
+          #
+          # macOS starts at 3.8, not at the 3.7 floor: actions/setup-python
+          # publishes 3.7 for darwin/x64 ONLY (3.8 is the first version with
+          # an arm64 build), so a macOS 3.7 job requires an Intel runner --
+          # and those are being retired. `macos-13` now sits queued until it
+          # is cancelled rather than ever running, so pinning it would mean a
+          # permanently red check. Windows and Linux still cover the real 3.7
+          # floor below/above.
+          - { os: macos-latest, python-version: "3.8" }
           - { os: macos-latest, python-version: "3.13" }
           - { os: windows-latest, python-version: "3.7" }
           - { os: windows-latest, python-version: "3.13" }

@@ -87,9 +87,11 @@ tooling is a workshop and can use any tool in the shed.**
    interpreter. 3.7 is covered by the smoke test below.)
 6. **Smoke test** — byte-compile, a `--help` run (which imports the module and
    so exercises the pure-Python AES self-check), and **`tests/selfcheck.py`**
-   on **Python 3.7–3.13** on Linux, plus 3.7 + 3.13 on macOS and Windows. This
-   job uses a bare interpreter (no uv, no `pip install`) to prove the proxy
-   runs with nothing installed.
+   on **Python 3.7–3.13** on Linux, plus 3.7 + 3.13 on Windows and 3.8 + 3.13
+   on macOS. This job uses a bare interpreter (no uv, no `pip install`) to
+   prove the proxy runs with nothing installed. (macOS starts at 3.8 because
+   `actions/setup-python` has no arm64 build below it, and the Intel runners
+   that could provide 3.7 are being retired — see the workflow's comment.)
 
    `tests/selfcheck.py` is the part that actually exercises code. It is
    stdlib-only *by necessity* — it is the only thing that can run on the

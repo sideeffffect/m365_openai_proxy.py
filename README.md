@@ -453,7 +453,7 @@ CI checks that range four ways:
 
 | Check | Interpreters | What it proves |
 | --- | --- | --- |
-| `py_compile` + `--help` | 3.7–3.13, plus macOS/Windows at both ends | The file parses and imports (running the pure-Python AES-256-GCM self-check) on a **bare** interpreter — no uv, no `pip install` |
+| `py_compile` + `--help` | 3.7–3.13 on Linux; 3.7 + 3.13 on Windows; 3.8 + 3.13 on macOS | The file parses and imports (running the pure-Python AES-256-GCM self-check) on a **bare** interpreter — no uv, no `pip install` |
 | [`tests/selfcheck.py`](tests/selfcheck.py) | same as above | Real code paths — handshake accept value, frame round-trips, SignalR framing, AES-GCM, HKDF — execute correctly, using nothing but the stdlib |
 | `pytest` | 3.8–3.13 | The full offline suite. Starts at 3.8 because uv cannot install a 3.7, and current pytest needs 3.10+ |
 | `vermin` | static | The code's *actual* minimum interpreter still matches the declared floor, catching a too-new stdlib API without needing a runner for every version |
