@@ -4,10 +4,10 @@ name = "m365-openai-proxy"
 # source, reported in the startup banner + HTTP Server header) and with the
 # git tag / GitHub Release for the same version (SemVer `X.Y.Z`, tag `vX.Y.Z`).
 # See AGENTS.md "Versioning & releases" for the release checklist.
-version = "0.10.1"
+version = "0.11.0"
 description = "An OpenAI-compatible proxy for Microsoft 365 Copilot, shipped as a single stdlib-only Python file."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.7"
 # The shipped proxy (m365_openai_proxy.py) has NO runtime dependencies, by
 # design -- it is pure Python standard library so it can be dropped onto any
 # machine with a Python 3 interpreter and run with nothing to install. Keep
@@ -17,12 +17,22 @@ dependencies = []
 [dependency-groups]
 # Developer-only tooling, managed by uv (`uv sync`). NONE of this is required
 # to run the proxy -- it is the "workshop" around the stdlib-only deliverable:
-# the test suite, the linter/formatter, and the security scanner CI runs.
-# Exact versions are pinned in uv.lock (`uv sync` / `uv run`).
+# the test suite, the linter/formatter, the security scanner, and the
+# interpreter-floor checker CI runs. Exact versions are pinned in uv.lock
+# (`uv sync` / `uv run`).
+#
+# The proxy itself supports Python 3.7+ (see `requires-python`), but this
+# tooling does NOT have to run everywhere the proxy does -- it only ever runs
+# on CI's modern interpreters. Where a tool's own floor is higher than the
+# proxy's, it carries an environment marker so `uv lock` stays solvable across
+# the whole supported range. `pytest` deliberately has no upper pin: uv's
+# universal resolver picks the newest release that works on each interpreter
+# the test matrix runs it on (8.x on modern, 7.4.x on 3.7).
 dev = [
-    "pytest>=8",
+    "pytest>=7.4",
     "ruff>=0.14",
-    "bandit>=1.9",
+    "bandit>=1.9; python_version >= '3.10'",
+    "vermin>=1.6",
 ]
 
 [tool.uv]

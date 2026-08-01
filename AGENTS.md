@@ -26,8 +26,19 @@ Concretely, inside `m365_openai_proxy.py`:
 - If a feature genuinely cannot be done in stdlib, that is a signal the feature
   does not belong *in the proxy* — see the next section.
 - Keep it a single file. Do not split the proxy into a package/modules.
-- The supported interpreter range is **Python 3.11–3.13** (see CI). Don't use
-  syntax/stdlib newer than 3.11 supports.
+- The supported interpreter range is **Python 3.7–3.13** (see CI). Don't use
+  syntax or stdlib APIs newer than **3.7** supports — including *keyword
+  arguments* added in later versions, which are the easy ones to miss. The
+  floor lives in one place, `MIN_PYTHON` in `m365_openai_proxy.py`; CI's
+  `vermin` gate reads it from there, so bump that constant and the gate
+  follows.
+- This has bitten the project before, and cheaply: `hashlib.sha1(...,
+  usedforsecurity=False)` (a 3.9+ kwarg, added only to silence bandit B324)
+  broke *every chat turn* on 3.7/3.8 with `TypeError: openssl_sha1() takes no
+  keyword arguments` — while `py_compile`, `--help` and the entire test suite
+  stayed green on those versions, because nothing in CI executed the line. If
+  a linter wants you to pass a newer-Python-only argument, suppress the
+  warning with `# nosec`/`# noqa` and a comment instead of raising the floor.
 
 If you are ever tempted to add a dependency to the proxy: **don't.** Either
 implement it in stdlib, or move it out of the proxy (below).
@@ -66,12 +77,26 @@ tooling is a workshop and can use any tool in the shed.**
    (config + skip rationale live in `pyproject.toml`'s `[tool.bandit]`; suppress
    any true positive inline with `# nosec BXXX: <reason>`, not by widening the
    global skips).
-4. **Tests** — `uv run pytest` on **Python 3.11–3.13**.
-5. **Smoke test** — byte-compile + a `--help` run (which imports the module and
-   so exercises the pure-Python AES self-check) on **Python 3.11–3.13** on
-   Linux, and 3.11 + 3.13 on macOS and Windows. This job uses a bare
-   interpreter (no uv, no `pip install`) to prove the proxy runs with nothing
-   installed.
+4. **Interpreter floor** — `uv run vermin --violations --target=<MIN_PYTHON>-`,
+   a *static* check that the code's real minimum interpreter still matches the
+   declared floor. Catches a too-new stdlib API in seconds on a modern
+   interpreter, without a runner per version.
+5. **Tests** — `uv run pytest` on **Python 3.8–3.13**. (Not 3.7: uv cannot
+   install a 3.7 interpreter, and current pytest requires 3.10+ — uv's
+   resolver picks an older pytest per version, but can't conjure the
+   interpreter. 3.7 is covered by the smoke test below.)
+6. **Smoke test** — byte-compile, a `--help` run (which imports the module and
+   so exercises the pure-Python AES self-check), and **`tests/selfcheck.py`**
+   on **Python 3.7–3.13** on Linux, plus 3.7 + 3.13 on macOS and Windows. This
+   job uses a bare interpreter (no uv, no `pip install`) to prove the proxy
+   runs with nothing installed.
+
+   `tests/selfcheck.py` is the part that actually exercises code. It is
+   stdlib-only *by necessity* — it is the only thing that can run on the
+   oldest interpreters — and it exists because `py_compile` + `--help` alone
+   proved far too shallow (see the `usedforsecurity` incident above). Add a
+   check there whenever you touch a code path whose behavior could plausibly
+   differ across interpreter versions.
 
 Run the same locally before pushing (this order — format, then lint, then
 compile, then tests):
@@ -80,9 +105,23 @@ compile, then tests):
 uv run ruff format .
 uv run ruff check .
 uv run bandit -c pyproject.toml m365_openai_proxy.py
+uv run vermin --no-parse-comments --violations \
+  --target="$(python3 -c 'import m365_openai_proxy as p; print("%d.%d" % p.MIN_PYTHON)')-" \
+  m365_openai_proxy.py                              # interpreter-floor gate
 python3 -m py_compile m365_openai_proxy.py
 python3 m365_openai_proxy.py --help >/dev/null      # imports module + AES self-check
+python3 tests/selfcheck.py                          # stdlib-only, runs on 3.7+
 uv run pytest                                       # offline (no-network) suite
+```
+
+To reproduce an old-interpreter failure locally without installing one, the
+smoke steps need nothing but the interpreter itself:
+
+```bash
+docker run --rm -v "$PWD:/w" -w /w python:3.7-slim \
+  sh -c 'python -m py_compile m365_openai_proxy.py &&
+         python m365_openai_proxy.py --help >/dev/null &&
+         python tests/selfcheck.py'
 ```
 
 `CodeQL` also runs (`.github/workflows/codeql.yml`).
@@ -143,7 +182,10 @@ between the banner, `pyproject.toml`, and the tag/Release is a bug.
   Local MCP tool-calling bridge findings, etc.). Keep new protocol findings
   here.
 - `tests/` — the offline (network-free) `pytest` suite (may use any deps);
-  `conftest.py` holds the shared fixtures.
+  `conftest.py` holds the shared fixtures. The one exception is
+  `tests/selfcheck.py`, which is **stdlib-only on purpose**: CI runs it with a
+  bare interpreter across the whole supported range, including versions where
+  pytest cannot be installed at all. Keep it dependency-free.
 - `scripts/` — developer-only live probes needing real credentials/network
   (may use any deps); **not** run in CI.
 - `README.md` — user-facing usage and the compatibility/limitations picture.
