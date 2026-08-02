@@ -160,15 +160,18 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   ordinary text. Only inline `data:` URIs are accepted (a remote `http(s)://`
   image URL is skipped, to avoid server-side request forgery); `tools` +
   images in one request isn't supported. Image *generation*, by contrast,
-  fails on purpose: it genuinely works on Sydney's side — it runs its
-  `image_gen` tool and produces a PNG — but streams no answer text, and the
-  resulting file lives behind a Microsoft endpoint that returns HTTP 401 to
-  this proxy (it needs the browser's Office cookie session, which the proxy
-  deliberately doesn't have). Such a request comes back as HTTP 502
-  `unsupported_upstream_content` with an explanation. Previously it was
-  reported as HTTP 429 "you're being throttled, wait and retry" — which was
-  wrong, and sent well-behaved clients into a retry loop that could never
-  succeed.
+  isn't supported: it genuinely works on Sydney's side — it runs its
+  `image_gen` tool and produces a PNG — but streams no answer text, so such a
+  request comes back as HTTP 502 `unsupported_upstream_content` with an
+  explanation. (Previously it was reported as HTTP 429 "you're being
+  throttled, wait and retry" — which was wrong, and sent well-behaved clients
+  into a retry loop that could never succeed.) The generated file *is*
+  fetchable — that took a second Microsoft-minted token and is written up in
+  REVERSE_ENGINEERING.md — but returning it isn't implemented, because a
+  chat-completions response can only carry text: the options would be a link
+  you can't authenticate to, or megabytes of inline base64. If image output
+  is ever added, the `/mcp` endpoint (which has real image content blocks) is
+  where it belongs.
 - **No access to your mail, files, calendar or directory.** Probed live
   (2026-08-02) and refused in all four cases, consistent with the
   `TenantDataAccess` / `PersonalDataAccess` allowances Sydney reports as `0`.

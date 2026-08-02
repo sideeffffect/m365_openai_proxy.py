@@ -3224,15 +3224,27 @@ nothing — the identical request fails identically forever, so a
 well-behaved client that honors 429 by backing off and retrying loops
 indefinitely.
 
-**Can the image be delivered instead?** No — and this was tested, not
-assumed. The `ImageReferenceUrls` link
+**Can the image be delivered instead?** The first answer here was *no, it
+needs the browser's Office (OHP) cookie session* — and that was **WRONG**.
+It has since been disproven live — see the "Fetching a generated image"
+section below, which fetches the PNG successfully with a bearer token and no
+cookie at all.
+
+What was actually observed at the time: the `ImageReferenceUrls` link
 (`designerapp.officeapps.live.com/designerapp/document.ashx?...`) returns
 **HTTP 401 both anonymously and with this proxy's own Sydney bearer token**.
-Fetching it needs the browser's Office (OHP) cookie session, which this proxy
-deliberately does not have — see the "Consolidated: the authentication
-situation" section above, where the cookie path and the bearer path are
-established as genuinely separate. Delivering generated images would mean
-implementing OHP cookie auth, which is a different project.
+That much is true and reproducible. The error was the inference drawn from
+it — "401 for our bearer token, therefore it must want cookies". In fact it
+wants a *different bearer token*: one minted from the very same FOCI refresh
+token for the `designerappservice.officeapps.live.com` resource, plus a
+`filetoken` header. Worth recording as a methodology lesson: two failing auth
+attempts do not enumerate the auth space, and the "Consolidated: the
+authentication situation" section's cookie-vs-bearer split made the wrong
+answer feel well-founded.
+
+Delivering the image is therefore **possible but not implemented** — see
+"Fetching a generated image" for exactly what it would take, and why the
+reporting fix below is still the right behavior in a text-only API.
 
 The fix is therefore accurate reporting, not delivery: `stream_chat_reply`
 now notices generated non-text content and raises `UnsupportedContentError`,
@@ -3290,6 +3302,14 @@ Two non-obvious things cost real debugging time and are load-bearing:
   recognized the payload as an image. Conveniently, the OpenAI `image_url`
   value is already exactly this data URI, so it's forwarded verbatim.
 
+  How this was pinned down, since it is not guessable and the HAR shows the
+  field only as an opaque blob: **arithmetic on the capture**. The browser's
+  `FileBase64` field was 716,422 chars while the server echoed back
+  `fileSize: 716400` — a difference of exactly 22, which is precisely
+  `len("data:image/png;base64,")`. That ruled out both bare base64 and raw
+  bytes before a single request was sent. (Note the echoed `fileSize` is the
+  *base64* length minus the prefix, not the decoded byte count.)
+
 **2. Reference the upload from the ordinary `chat` turn.** The turn is
 unchanged except that the user `message` carries a `messageAnnotations` entry
 naming the `docId`:
@@ -3320,3 +3340,188 @@ footgun the proxy avoids. Images are attached to the **latest user turn**;
 `tools` + images is not supported in one request (the emulated tool-calling
 path runs its own turns) and logs a warning. See `upload_image_to_sydney`,
 `_extract_message_images`, and `tests/test_vision_input.py`.
+
+## Update: Fetching a generated image — SOLVED, and it needs no cookie (2026-08-02)
+
+This section supersedes the "Can the image be delivered instead?" claim above.
+Image **output** — downloading the PNG Sydney's `image_gen` produces — is a
+solved problem on the wire. It is simply **not implemented** in the proxy,
+which is a scope decision, not a blocker.
+
+It was solved by reverse-engineering the `26-08-02 15-06-28` HAR and then
+verified end-to-end live against a real account. This section records the
+mechanism in full, including the controls, because the throwaway probe that
+proved it (`scripts/probe_image_io.py`) has been deleted — everything it knew
+is written down here.
+
+### Where the image lives
+
+A completed image turn's `contentGenerationProgressList` entry carries
+`status: 2` and an `ImageReferenceUrls[0]` of this shape (~490 chars):
+
+```
+https://designerapp.officeapps.live.com/designerapp/document.ashx
+  ?path=%2F<guid>%2FDallEGeneratedImages%2Fdalle-<guid><digits>.png
+  &dcHint=WestEurope            # or FranceCentral, etc. -- the storage region
+  &speCId=<guid>
+  &speType=Image
+  &speIdx=0
+  &fileToken=<base64 JSON>      # NOTE: must be MOVED to a header, see below
+```
+
+`fileToken` base64-decodes to a small JSON object:
+
+```json
+{"TokenPrefix": "AAD-<guid>",
+ "UserObjectId": "<oid>",
+ "ClientName": "CopilotSydney"}
+```
+
+The `AAD-` prefix is the tell that got this solved: it says the endpoint
+expects an **AAD bearer token**, not a cookie session. The CORS preflight
+says the same thing outright —
+`access-control-allow-headers: authorization,filetoken`.
+
+### The token: one more FOCI resource
+
+The browser mints a *separate* access token for this host, from the **same
+FOCI refresh token** that mints the Sydney/Chathub one. Extend the resource
+list in the "one refresh token, redeemed across 3 client_ids and 10
+resources" section above with:
+
+```
+POST login.microsoftonline.com/{tenant}/oauth2/v2.0/token
+    ?brk_client_id=4765445b-32c6-49b0-83e6-1d93765276ca
+    &brk_redirect_uri=https://m365.cloud.microsoft/spalanding
+    &client_id=c0ab8ce9-e9a0-42e7-b064-33d422df41f1
+  grant_type=refresh_token
+  client_id=c0ab8ce9-e9a0-42e7-b064-33d422df41f1
+  redirect_uri=brk-multihub://outlook.office.com
+  scope=https://designerappservice.officeapps.live.com/.default openid profile offline_access
+```
+
+**Every parameter except `scope` is byte-identical to the Sydney token
+request this proxy already makes** (`exchange_refresh_token`) — same
+`client_id`, same `brk_client_id`/`brk_redirect_uri`, same `redirect_uri`,
+same MSAL telemetry fields. Implementing image fetch is therefore a
+one-parameter change to that function, not new auth machinery.
+
+Response (live): `expires_in` 4091, `refresh_token_expires_in` 86300, and
+
+```
+scope: https://designerappservice.officeapps.live.com/designerappservice.all
+       https://designerappservice.officeapps.live.com/.default
+access_token: 2556 chars, FIVE dot-separated parts
+```
+
+Five parts means it is a **JWE (encrypted), not a JWT** — the JOSE header
+decodes to `{"alg":"RSA-OAEP","enc":"A128CBC-HS256","zip":"DEF", ...}`, so
+the audience is not inspectable client-side. Do not try to parse its claims;
+`jwt_claims()` will fail on it.
+
+⚠️ **Each redemption ROTATES the shared refresh token.** Anything minting this
+token must persist the rotation (`CredentialStore.rotate()`) exactly as the
+proxy does at runtime, and must never run concurrently with another
+redemption of the same credential — otherwise the credential is destroyed and
+has to be re-captured from the browser.
+
+### The fetch, and the controls that pin it down
+
+Strip `fileToken` out of the query string and send it as a `filetoken`
+**header**; send the access token as `Authorization`. Live results, one real
+generated image (`scripts/probe_image_io.py image_out`, since deleted):
+
+| attempt | result |
+|---|---|
+| bare `Authorization: <jwe>` + `filetoken:` header | **HTTP 200, `image/png`, 2,693,151 bytes, valid PNG signature** |
+| `Authorization: Bearer <jwe>` (control) | **200** — the `Bearer ` prefix is *optional*; the HAR's cookie-less bare value is not load-bearing |
+| `filetoken` header omitted (control) | **HTTP 400** — the header IS required |
+
+Both controls matter. The first kills the theory that the browser's unusual
+bare-`Authorization` spelling was significant; the second proves the
+`filetoken` header is not redundant with the token.
+
+### Why this still isn't implemented
+
+Two reasons, both design rather than protocol:
+
+1. **The OpenAI chat-completions API has nowhere to put an image.** A
+   response can only carry text, so the options are a markdown link (to a URL
+   the client cannot authenticate to) or inlining ~2.7 MB of base64 into
+   `content`. Neither is good. MCP, by contrast, has first-class image
+   content blocks — if image output is ever shipped, `/mcp` is its natural
+   home, not `/v1`.
+2. **It costs a second token audience and a rotation** on a credential whose
+   refresh token is already the single point of failure for the whole proxy.
+
+So an image-only turn is still surfaced as HTTP 502
+`unsupported_upstream_content` (see `UnsupportedContentError`). What must be
+corrected is the *reason* given: it is "this text-only API cannot return an
+image", **not** "the image is unreachable".
+
+## Update: Vision input — the negative results and method behind it
+
+The "Vision input" section above documents the mechanism that works. This
+records what was ruled out on the way there, so nobody re-derives it — this
+too lived only in the deleted probe.
+
+### Guess-proof test methodology
+
+Asking "what colour is this?" is a weak test: a model can guess a colour and
+be right by luck. The probe generated PNGs with a **pure-stdlib writer** (a
+5x7 bitmap font rasterized into a `zlib`-compressed IDAT — no Pillow, so it
+runs anywhere the proxy does) rendering a **random 4-digit number**, then
+asked Sydney to read it back and string-matched the exact digits. A model
+cannot guess 4 digits at 1-in-10,000, so a hit is proof it genuinely
+processed the pixels.
+
+Two traps that this found, both worth remembering:
+
+- **A 4-digit number on white looks exactly like a CAPTCHA.** One run got
+  *"Sorry, I can't help solve or transcribe a CAPTCHA"* — which is a content
+  refusal, i.e. the mechanism **worked** and the test read as a failure.
+  Later runs used solid colour bands / solid-colour PNGs to remove the
+  confound.
+- The `fileName` in the annotation metadata is free-form: an arbitrary name
+  works exactly as well as the server-generated one, confirmed by running
+  both.
+
+### `conversationId` alone is NOT enough (and nine shapes that don't work)
+
+Uploading an image bound to a `conversationId` and then chatting on that same
+`ConversationId` gets a flat **`NO IMAGE`**. The binding is not implicit; the
+chat invocation must carry an explicit reference.
+
+Before the real answer was recovered from a Chrome WebSocket capture, nine
+candidate payload shapes were swept live by injecting extra fields into the
+proxy's own serialized `chat` frame. **All nine missed** (each got
+`NO IMAGE`):
+
+`message.imageUrl` = docId · `message.imageUrl` = a Bing blob URL ·
+`message.imageUrl` + `message.originalImageUrl` · `message.fileInfo` ·
+`message.attachedFileInfo` · `arg.fileInfo` · `message.attachments[]` ·
+`message.imageUrl` + the `cwcgptvsan` optionsSet · `message.documentReferences[]`
+
+The answer — `message.messageAnnotations[]` with
+`messageAnnotationType: "ImageFile"` — is in the "Vision input" section. The
+lesson: guessing field names against this protocol has a poor hit rate, and
+the `docId` appears in **no** subsequent HTTP request, so only a WebSocket
+capture could settle it. **Firefox HAR exports do not record WebSocket
+payloads; Chrome DevTools exports do** (`_webSocketMessages`) — that
+difference is what unblocked it.
+
+### Reproducing any of this
+
+No dedicated probe script is kept anymore; both halves are reproducible from
+the shipped code plus a few lines:
+
+- **image in** — just use the proxy: send an OpenAI `image_url` content part
+  with a `data:` URI (see the "Vision input" section and
+  `tests/test_vision_input.py`).
+- **image out** — ask the proxy for an image (it will 502), pull the
+  `ImageReferenceUrls` value out of `m365_openai_proxy.log` at DEBUG, then
+  mint the designer token by calling `exchange_refresh_token()` with
+  `SYDNEY_SCOPE` temporarily swapped for the designer scope above, and GET
+  the URL with `fileToken` moved into a `filetoken` header.
+- **raw frames** — `scripts/dump_frames.py` still dumps every SignalR frame
+  of one turn, which is what most of this document was built from.

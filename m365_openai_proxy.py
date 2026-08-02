@@ -322,17 +322,21 @@ KNOWN LIMITATIONS
   Only inline `data:` URIs are accepted (a remote `http(s)://` image URL is
   skipped, to avoid server-side request forgery), and `tools` + images in one
   request is not supported.
-  Image GENERATION, by contrast, fails by design: Sydney's image generation
-  works -- it really invokes its `image_gen` tool and really produces a file
-  -- but it streams no answer text at all, and the resulting
-  `ImageReferenceUrls` link is served by `designerapp.officeapps.live.com`,
-  which returns HTTP 401 both anonymously and with this proxy's own Sydney
-  bearer token (live-tested 2026-08-02). Fetching it needs the browser's
-  Office cookie session, which this proxy deliberately does not have. Such a
-  turn is surfaced as HTTP 502 `unsupported_upstream_content` with an
+  Image GENERATION, by contrast, is NOT SUPPORTED by this text-only API.
+  Sydney's image generation works -- it really invokes its `image_gen` tool
+  and really produces a PNG -- but it streams no answer text at all, so such
+  a turn is surfaced as HTTP 502 `unsupported_upstream_content` with an
   explanation (see `UnsupportedContentError`) -- previously it was misreported
   as HTTP 429 "you are being throttled, wait and retry", which was wrong in
   every part and sent clients into a retry loop that could never succeed.
+  Note the file itself is REACHABLE (an earlier revision of this docstring
+  wrongly said it needed the browser's Office cookie session; that was
+  disproven live -- it needs a second FOCI-minted token for the
+  `designerappservice.officeapps.live.com` resource plus a `filetoken`
+  header, and the full recipe is in REVERSE_ENGINEERING.md's "Fetching a
+  generated image"). It is unimplemented rather than impossible, because
+  chat-completions has nowhere to put a 2.7 MB PNG; MCP's image content
+  blocks would be the natural home if it is ever added.
 - `usage` (prompt/completion/total tokens) in every response is hardcoded
   to zero -- this proxy does no token counting at all.
 - Sydney's `throttling` block also carries a `metering` sub-object listing
@@ -1170,13 +1174,22 @@ class UnsupportedContentError(ProtocolError):
     again". That advice was wrong in every part: nothing was throttled, and
     waiting changes nothing -- the same request fails identically forever.
 
-    The image itself is genuinely out of reach for this proxy, not merely
-    unimplemented: the `ImageReferenceUrls` link points at
-    `designerapp.officeapps.live.com`, which was live-tested (2026-08-02) to
-    return HTTP 401 both anonymously AND with this proxy's own Sydney bearer
-    token. Fetching it needs the browser's Office (OHP) cookie session, which
-    this proxy deliberately does not have -- see the module docstring's
-    AUTHENTICATION MODEL section."""
+    The image itself is UNIMPLEMENTED, not unreachable. (An earlier revision
+    of this docstring claimed the latter -- that fetching it needed the
+    browser's Office (OHP) cookie session -- inferred from the
+    `ImageReferenceUrls` link returning HTTP 401 both anonymously and with
+    this proxy's own Sydney bearer token. The 401s are real; the inference was
+    wrong, and was disproven live: the link wants a DIFFERENT bearer token,
+    minted from the same FOCI refresh token for the
+    `designerappservice.officeapps.live.com` resource, plus the URL's
+    `fileToken` query param moved into a `filetoken` header. That fetch
+    returns a valid 2.7 MB PNG. See REVERSE_ENGINEERING.md's "Fetching a
+    generated image" for the full recipe and its controls.)
+
+    It stays unimplemented because chat-completions can only return text: the
+    choices would be a markdown link the caller cannot authenticate to, or
+    megabytes of inline base64. MCP has first-class image content blocks and
+    would be the natural home for image output if it is ever added."""
 
 
 class WSError(Exception):
