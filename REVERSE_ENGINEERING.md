@@ -1941,10 +1941,14 @@ the full `LLM` object, `native_tool_calling` included) as JSON at
 persisted agent already exists on disk, `AgentStore.get_agent()`'s flow is:
 
 ```python
-agent = self.load_from_disk()               # returns the persisted Agent as-is
+agent = self.load_from_disk()  # returns the persisted Agent as-is
 if env_overrides_enabled:
-    agent = self._ensure_agent(agent, overrides)   # agent is not None -> returned unchanged
-    agent = self._apply_env_overrides(agent, overrides)  # model_copy(update={api_key, base_url, model})
+    agent = self._ensure_agent(
+        agent, overrides
+    )  # agent is not None -> returned unchanged
+    agent = self._apply_env_overrides(
+        agent, overrides
+    )  # model_copy(update={api_key, base_url, model})
 ```
 
 `_apply_env_overrides()` -> `apply_llm_overrides()` uses
@@ -1963,7 +1967,10 @@ the correct Pydantic schema rather than hand-writing JSON):
 
 ```python
 import os
-os.environ["OPENHANDS_PERSISTENCE_DIR"] = "/tmp/openhands-mockfc-persist"  # isolated test dir
+
+os.environ["OPENHANDS_PERSISTENCE_DIR"] = (
+    "/tmp/openhands-mockfc-persist"  # isolated test dir
+)
 
 from openhands.sdk.llm import LLM
 from openhands_cli.utils import get_default_cli_agent
@@ -1974,10 +1981,12 @@ llm = LLM(
     api_key="sk-unused",
     base_url="http://127.0.0.1:8123/v1",
     usage_id="agent",
-    native_tool_calling=False,   # <-- the whole trick
+    native_tool_calling=False,  # <-- the whole trick
 )
-agent = get_default_cli_agent(llm)   # same helper the CLI itself uses for its default agent
-AgentStore().save(agent)             # writes <persistence_dir>/agent_settings.json
+agent = get_default_cli_agent(
+    llm
+)  # same helper the CLI itself uses for its default agent
+AgentStore().save(agent)  # writes <persistence_dir>/agent_settings.json
 ```
 
 Then simply:

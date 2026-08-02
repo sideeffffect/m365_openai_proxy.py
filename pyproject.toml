@@ -41,6 +41,29 @@ dev = [
 # manages the dev tooling and never tries to build/install m365_openai_proxy.
 package = false
 
+[tool.ruff]
+# Ruff 0.16 expanded its default rule selection from 59 rules to 413, so the
+# defaults are now taken as-is (no `select` here) -- that is deliberate, and
+# new rules arriving in future ruff releases are welcome. Only rules that
+# conflict with a *deliberate* design decision in this repo are turned off
+# below, and only globally when the alternative would be hundreds of inline
+# suppressions. Everything else is suppressed inline with `# noqa: XXX -
+# <reason>` at the one site it applies to, the same policy `[tool.bandit]`
+# uses for `# nosec` (see AGENTS.md).
+[tool.ruff.lint]
+ignore = [
+    # LOG015 (root_logger_call): the proxy deliberately logs through the root
+    # logger. It is a single self-contained script, not a library, so there is
+    # no package namespace worth carving up: `setup_logging()` configures the
+    # root logger directly with one FileHandler (see `logging.getLogger()` /
+    # `root.addHandler(...)` in m365_openai_proxy.py) and every call site is a
+    # plain `logging.info(...)`. Introducing a module-level `logger =
+    # logging.getLogger(__name__)` would churn ~77 call sites in the shipped
+    # file to produce identical output. If the proxy ever becomes importable
+    # as a library, revisit this.
+    "LOG015",
+]
+
 [tool.pytest.ini_options]
 # Put the repo root on sys.path so the offline tests can
 # `import m365_openai_proxy` directly (the proxy lives at the repo root as a

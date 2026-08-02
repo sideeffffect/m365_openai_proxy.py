@@ -14,7 +14,7 @@ import selfcheck
 def test_every_selfcheck_passes():
     failures = selfcheck.run()
     assert not failures, "; ".join(
-        "%s: %s: %s" % (name, type(exc).__name__, exc) for name, exc in failures
+        f"{name}: {type(exc).__name__}: {exc}" for name, exc in failures
     )
 
 

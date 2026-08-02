@@ -1490,7 +1490,7 @@ def _looks_url_encoded_json(value):
     URL-decoded and sometimes still encoded (this is exactly the shape the
     msal.cache.encryption cookie can take), so a pasted value can arrive in
     either form depending on how the operator copied it."""
-    return value.startswith("%7B") or value.startswith("%7b")
+    return value.startswith(("%7B", "%7b"))
 
 
 def _decode_json_field(value, field_label):
@@ -1834,7 +1834,7 @@ def exchange_refresh_token(refresh_token, oid=None, tid=None):
 
 
 class SydneyAuth:
-    __slots__ = ("access_token", "oid", "tid", "expires_at")
+    __slots__ = ("access_token", "expires_at", "oid", "tid")
 
     def __init__(self, access_token, oid, tid, expires_at):
         self.access_token = access_token
@@ -2546,7 +2546,7 @@ class ConversationSession:
     `ConversationId` a completed turn used, plus enough bookkeeping to
     decide whether it's still safe to reuse."""
 
-    __slots__ = ("conversation_id", "oid", "created_at", "last_used_at", "turn_count")
+    __slots__ = ("conversation_id", "created_at", "last_used_at", "oid", "turn_count")
 
     def __init__(self, conversation_id, oid, turn_count=1):
         self.conversation_id = conversation_id
@@ -2737,24 +2737,28 @@ def _render_tools_block(tools, tool_choice):
     REVERSE_ENGINEERING.md documents this as probabilistic, not certain."""
     lines = [
         "",
-        "IMPORTANT: for this reply, you have no internet access, no code "
-        "interpreter, and no ability to execute code or search the web -- "
-        "any apparent ability to do so is disabled for this conversation. "
-        "The ONLY way to get information or perform actions you don't "
-        "already have is to request it from the user with the exact format "
-        "below, and nothing else in your reply (no markdown code fences, no "
-        "explanation before or after it) -- arguments must be one line of "
-        "valid JSON matching the schema given for that capability:",
+        (
+            "IMPORTANT: for this reply, you have no internet access, no code "
+            "interpreter, and no ability to execute code or search the web -- "
+            "any apparent ability to do so is disabled for this conversation. "
+            "The ONLY way to get information or perform actions you don't "
+            "already have is to request it from the user with the exact format "
+            "below, and nothing else in your reply (no markdown code fences, no "
+            "explanation before or after it) -- arguments must be one line of "
+            "valid JSON matching the schema given for that capability:"
+        ),
         "",
         _TOOL_CALL_OPEN,
         '{"name": "<capability name>", "arguments": {<arguments as JSON>}}',
         _TOOL_CALL_CLOSE,
         "",
-        "If you don't need to request anything, just reply normally in "
-        "plain text -- do not use the tags above unless you are actually "
-        "making a request. You may make more than one request by using "
-        f"multiple {_TOOL_CALL_OPEN}...{_TOOL_CALL_CLOSE} blocks in the same "
-        "reply.",
+        (
+            "If you don't need to request anything, just reply normally in "
+            "plain text -- do not use the tags above unless you are actually "
+            "making a request. You may make more than one request by using "
+            f"multiple {_TOOL_CALL_OPEN}...{_TOOL_CALL_CLOSE} blocks in the same "
+            "reply."
+        ),
         "",
         "Capabilities you can request this way:",
     ]
@@ -2794,28 +2798,36 @@ def _render_tools_block_code_mode(tools, tool_choice):
     `_render_tools_block`."""
     lines = [
         "",
-        "Your Python code execution environment has one extra function "
-        "already loaded and ready to use -- you do not need to define it "
-        "yourself, it's already there:",
+        (
+            "Your Python code execution environment has one extra function "
+            "already loaded and ready to use -- you do not need to define it "
+            "yourself, it's already there:"
+        ),
         "",
         f"    {_CODE_MODE_INVOKE_NAME}(name, arguments)",
         "",
-        "Write and run ordinary Python code exactly as you already would "
-        "for any other task. Whenever you need one of the capabilities "
-        f"listed below, call {_CODE_MODE_INVOKE_NAME}(name, arguments) with "
-        "the capability's name (a string) and its arguments (a dict "
-        "matching the schema shown for it), then read its return value "
-        "before continuing -- for example:",
+        (
+            "Write and run ordinary Python code exactly as you already would "
+            "for any other task. Whenever you need one of the capabilities "
+            f"listed below, call {_CODE_MODE_INVOKE_NAME}(name, arguments) with "
+            "the capability's name (a string) and its arguments (a dict "
+            "matching the schema shown for it), then read its return value "
+            "before continuing -- for example:"
+        ),
         "",
-        f"    result = {_CODE_MODE_INVOKE_NAME}("
-        "'<capability name>', {<arguments matching its schema>})",
+        (
+            f"    result = {_CODE_MODE_INVOKE_NAME}("
+            "'<capability name>', {<arguments matching its schema>})"
+        ),
         "    print(result)",
         "",
-        "If you don't need any of these capabilities for this reply, just "
-        "answer normally in plain text without writing any code at all. "
-        "You can call more than one of them in the same script if you need "
-        "to, and can write as much ordinary code around the call(s) as you "
-        "need.",
+        (
+            "If you don't need any of these capabilities for this reply, just "
+            "answer normally in plain text without writing any code at all. "
+            "You can call more than one of them in the same script if you need "
+            "to, and can write as much ordinary code around the call(s) as you "
+            "need."
+        ),
         "",
         "Capabilities available this way:",
     ]
@@ -2962,10 +2974,18 @@ def _extract_invoke_args(call_node):
         raise ValueError("invoke_capability(...) call has no name argument")
     name = ast.literal_eval(name_node)
     arguments = ast.literal_eval(arguments_node) if arguments_node is not None else {}
+    # ValueError, not TypeError (TRY004): every failure mode of parsing an
+    # LLM-authored invoke_capability(...) call is reported to the caller as a
+    # ValueError, and callers catch exactly that. A malformed argument is bad
+    # *data*, not a type error in our own code.
     if not isinstance(name, str):
-        raise ValueError("invoke_capability(...) name argument is not a string")
+        raise ValueError(  # noqa: TRY004 - see comment above
+            "invoke_capability(...) name argument is not a string"
+        )
     if not isinstance(arguments, dict):
-        raise ValueError("invoke_capability(...) arguments argument is not a dict")
+        raise ValueError(  # noqa: TRY004 - see comment above
+            "invoke_capability(...) arguments argument is not a dict"
+        )
     return name, arguments
 
 
@@ -3447,17 +3467,17 @@ class _ChatTurnPlan:
     `_handle_streaming`."""
 
     __slots__ = (
-        "prompt",
         "conversation_id",
+        "delta_messages",
         "is_continuation",
         "lookup_fingerprint",
-        "should_track",
         "messages",
-        "tools",
-        "tool_choice",
         "oid",
+        "prompt",
+        "should_track",
+        "tool_choice",
+        "tools",
         "turn_count",
-        "delta_messages",
     )
 
     def __init__(
@@ -3626,7 +3646,7 @@ def make_handler(token_cache, conversation_sessions):
                 # it.
                 try:
                     self._error(500, "internal error")
-                except Exception:  # nosec B110
+                except Exception:  # nosec B110  # noqa: BLE001,S110 - see comment above
                     pass
 
         def _do_GET(self):
@@ -3664,7 +3684,7 @@ def make_handler(token_cache, conversation_sessions):
                 # See do_GET's comment above, same reasoning.
                 try:
                     self._error(500, "internal error")
-                except Exception:  # nosec B110
+                except Exception:  # nosec B110  # noqa: BLE001,S110 - see comment above
                     pass
 
         def _do_POST(self):
@@ -3844,7 +3864,7 @@ def make_handler(token_cache, conversation_sessions):
                         {"index": 0, "delta": delta_obj, "finish_reason": finish_reason}
                     ],
                 }
-                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.flush()
 
             try:
@@ -3917,7 +3937,7 @@ def make_handler(token_cache, conversation_sessions):
                         {"index": 0, "delta": {}, "finish_reason": finish_reason}
                     ],
                 }
-                self.wfile.write(f"data: {json.dumps(final)}\n\n".encode("utf-8"))
+                self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 logging.info(
@@ -3942,7 +3962,7 @@ def make_handler(token_cache, conversation_sessions):
                 )
                 err = {"error": {"message": str(e), "type": err_type}}
                 try:
-                    self.wfile.write(f"data: {json.dumps(err)}\n\n".encode("utf-8"))
+                    self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
                     self.wfile.flush()
                 except OSError:
                     pass

@@ -46,7 +46,7 @@ import uuid
 sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..", "..", "python-copilot-m365")
 )
-import m365_openai_proxy as proxy  # noqa: E402
+import m365_openai_proxy as proxy
 
 CREDENTIALS_PREFIX = os.path.join(
     os.path.dirname(__file__), "..", "..", "python-copilot-m365", "m365_openai_proxy"
@@ -330,9 +330,7 @@ def main():
                         f"   (target={target!r} inv={inv_id!r} "
                         f"{json.dumps(frame.get('arguments'))[:300]})"
                     )
-                elif ftype == 3 and chat_sent:
-                    raise SystemExit(0)
-                elif ftype == 7:
+                elif (ftype == 3 and chat_sent) or ftype == 7:
                     raise SystemExit(0)
     except SystemExit:
         pass
