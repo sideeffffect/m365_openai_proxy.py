@@ -32,7 +32,7 @@ sys.path.insert(
     os.path.join(os.path.dirname(__file__), "..", "..", "python-copilot-m365"),
 )
 
-import m365_openai_proxy as proxy  # noqa: E402
+import m365_openai_proxy as proxy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 

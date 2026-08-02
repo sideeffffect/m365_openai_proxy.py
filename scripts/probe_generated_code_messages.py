@@ -17,7 +17,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import m365_openai_proxy as proxy  # noqa: E402
+import m365_openai_proxy as proxy
 
 logging.basicConfig(level=logging.WARNING)
 

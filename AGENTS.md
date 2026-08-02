@@ -71,7 +71,11 @@ tooling is a workshop and can use any tool in the shed.**
 
 `.github/workflows/ci.yml` runs, on every PR (dev tooling via **uv**):
 
-1. **Lint** — `uv run ruff check .`
+1. **Lint** — `uv run ruff check .` (ruff's own defaults, which since 0.16 are
+   a broad 400+ rule set; only rules that clash with a deliberate design
+   decision are disabled, in `pyproject.toml`'s `[tool.ruff.lint] ignore`.
+   Suppress a one-off true positive inline with `# noqa: XXX - <reason>`,
+   not by widening that global list — same policy as bandit below.)
 2. **Format** — `uv run ruff format --check .`
 3. **Security** — `uv run bandit -c pyproject.toml m365_openai_proxy.py`
    (config + skip rationale live in `pyproject.toml`'s `[tool.bandit]`; suppress
@@ -193,7 +197,7 @@ between the banner, `pyproject.toml`, and the tag/Release is a bug.
 - `README.md` — user-facing usage and the compatibility/limitations picture.
 - `pyproject.toml` — project metadata (its `version` mirrors the proxy's
   `PROXY_VERSION` and the git tag/Release — see "Versioning & releases"), the
-  uv-managed `[dependency-groups] dev` tooling, and the `pytest` + `bandit`
-  config. There is no build system; the product is a single script, so
+  uv-managed `[dependency-groups] dev` tooling, and the `pytest` + `bandit` +
+  `ruff` config. There is no build system; the product is a single script, so
   `[tool.uv] package = false`.
 - `uv.lock` — the pinned dev-tooling lockfile (committed).

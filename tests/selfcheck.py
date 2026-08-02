@@ -33,7 +33,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import m365_openai_proxy as proxy  # noqa: E402
+import m365_openai_proxy as proxy
 
 CHECKS = []
 
@@ -89,14 +89,14 @@ def websocket_frames_round_trip():
         fin, opcode, got = ws._read_frame()
         assert fin is True, size
         assert opcode == proxy.WebSocketClient.OPCODE_BINARY, size
-        assert got == payload, "payload mismatch at size %d" % size
+        assert got == payload, f"payload mismatch at size {size}"
 
 
 @check
 def websocket_text_message_round_trips_unicode():
     ws = _detached_ws_client()
     ws.send_text('{"protocol":"json","v":1} ünïcødé ✓')
-    fin, opcode, payload = ws._read_frame()
+    _fin, opcode, payload = ws._read_frame()
     assert opcode == proxy.WebSocketClient.OPCODE_TEXT
     assert payload.decode("utf-8") == '{"protocol":"json","v":1} ünïcødé ✓'
 
@@ -135,7 +135,7 @@ def aes256_gcm_rejects_a_tampered_tag():
     key, iv = b"\x00" * 32, b"\x00" * 12
     try:
         proxy.aes256_gcm_decrypt(key, iv, b"\x00" * 32)
-    except Exception:
+    except Exception:  # noqa: BLE001 - any rejection is a pass; the point is it raises
         return
     raise AssertionError("tampered ciphertext was accepted")
 
@@ -172,8 +172,8 @@ def proxy_reports_a_three_part_semver():
 @check
 def declared_floor_matches_this_interpreter():
     assert sys.version_info >= proxy.MIN_PYTHON, (
-        "selfcheck is running on %s, below the proxy's declared floor %s"
-        % (sys.version.split()[0], proxy.MIN_PYTHON)
+        f"selfcheck is running on {sys.version.split()[0]}, "
+        f"below the proxy's declared floor {proxy.MIN_PYTHON}"
     )
 
 
@@ -192,11 +192,9 @@ def main():
     version = sys.version.split()[0]
     failures = run()
     for name, exc in failures:
-        sys.stderr.write("FAIL  %s: %s: %s\n" % (name, type(exc).__name__, exc))
+        sys.stderr.write(f"FAIL  {name}: {type(exc).__name__}: {exc}\n")
     passed = len(CHECKS) - len(failures)
-    sys.stderr.write(
-        "selfcheck: %d/%d passed on Python %s\n" % (passed, len(CHECKS), version)
-    )
+    sys.stderr.write(f"selfcheck: {passed}/{len(CHECKS)} passed on Python {version}\n")
     return 1 if failures else 0
 
 
