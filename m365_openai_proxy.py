@@ -303,18 +303,29 @@ KNOWN LIMITATIONS
   this one proxy PROCESS (in memory, not persisted) -- restarting the proxy
   always starts cold, with every conversation falling back to fresh
   context-stuffing until it's seen once more.
-- **This API is TEXT-ONLY, and a request that makes Copilot generate an
-  image fails by design.** Sydney's image generation works -- it really
-  invokes its `image_gen` tool and really produces a file -- but it streams
-  no answer text at all, and the resulting `ImageReferenceUrls` link is
-  served by `designerapp.officeapps.live.com`, which returns HTTP 401 both
-  anonymously and with this proxy's own Sydney bearer token (live-tested
-  2026-08-02). Fetching it needs the browser's Office cookie session, which
-  this proxy deliberately does not have. Such a turn is surfaced as HTTP 502
-  `unsupported_upstream_content` with an explanation (see
-  `UnsupportedContentError`) -- previously it was misreported as HTTP 429
-  "you are being throttled, wait and retry", which was wrong in every part
-  and sent clients into a retry loop that could never succeed.
+- **Image INPUT (understanding) works; image OUTPUT (generation) does not.**
+  Send an image with the OpenAI vision shape -- a `user` message whose
+  `content` is a parts array carrying an `image_url` part with an inline
+  `data:image/...;base64,...` URI -- and Sydney's GPT-V reads it and answers
+  as ordinary text (live-verified 2026-08-02: solid red/green/blue PNGs each
+  described correctly). Under the hood the image is POSTed to substrate's
+  `UploadFile` endpoint and referenced from the chat turn's user message as an
+  `ImageFile` `messageAnnotations` entry -- see `upload_image_to_sydney`,
+  `_extract_message_images`, and REVERSE_ENGINEERING.md's "Vision input".
+  Only inline `data:` URIs are accepted (a remote `http(s)://` image URL is
+  skipped, to avoid server-side request forgery), and `tools` + images in one
+  request is not supported.
+  Image GENERATION, by contrast, fails by design: Sydney's image generation
+  works -- it really invokes its `image_gen` tool and really produces a file
+  -- but it streams no answer text at all, and the resulting
+  `ImageReferenceUrls` link is served by `designerapp.officeapps.live.com`,
+  which returns HTTP 401 both anonymously and with this proxy's own Sydney
+  bearer token (live-tested 2026-08-02). Fetching it needs the browser's
+  Office cookie session, which this proxy deliberately does not have. Such a
+  turn is surfaced as HTTP 502 `unsupported_upstream_content` with an
+  explanation (see `UnsupportedContentError`) -- previously it was misreported
+  as HTTP 429 "you are being throttled, wait and retry", which was wrong in
+  every part and sent clients into a retry loop that could never succeed.
 - `usage` (prompt/completion/total tokens) in every response is hardcoded
   to zero -- this proxy does no token counting at all.
 - Sydney's `throttling` block also carries a `metering` sub-object listing
@@ -1065,6 +1076,53 @@ TOOL_MODE_OPTIONS_SETS = [
     for o in OPTIONS_SETS
     if not any(kw in o for kw in ("code_interpreter", "flux", "gptv"))
 ]
+
+# ------------------------------------------------------------------------------
+# Vision input (image understanding / GPT-V)
+#
+# Sydney accepts an image the user asks about ("what is on this image?") in two
+# steps, reverse-engineered from a real browser session (see
+# REVERSE_ENGINEERING.md's "Vision input" section):
+#
+#   1. The raw image is POSTed, base64-encoded, to substrate's `UploadFile`
+#      endpoint (same host and same bearer token this proxy already mints for
+#      the Chathub WebSocket). The response returns a `docId`.
+#   2. The ordinary `chat` turn then carries that `docId` in
+#      `message.messageAnnotations` as an `ImageFile` annotation; the gptv
+#      `optionsSets` that make Sydney actually look at it are already in
+#      OPTIONS_SETS (`cwcfluxgptv`, `gptvnorm2048`,
+#      `flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch`), so nothing else
+#      about the chat invocation changes.
+#
+# The reply is ordinary streamed text, so it flows back through
+# `stream_chat_reply` unchanged.
+UPLOAD_FILE_URL = "https://substrate.office.com/m365Copilot/UploadFile"
+
+#: The `optionsSets` the browser sends as multipart form parts on the
+#: `UploadFile` POST itself (distinct from the chat turn's OPTIONS_SETS).
+UPLOAD_IMAGE_OPTIONS_SETS = [
+    "cwcgptvsan",
+    "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
+    "gptvnorm2048",
+]
+
+#: Defensive caps on vision input, applied before anything is uploaded. Sydney
+#: enforces its own limits server-side; these just stop a malformed or hostile
+#: request from making this proxy buffer or forward something absurd.
+MAX_INPUT_IMAGES = 8
+MAX_INPUT_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB per image, pre-base64
+
+#: Recognized raster image MIME types -> the `fileType` Sydney's annotation
+#: metadata wants (its extension, no dot). Anything else is rejected rather
+#: than guessed at.
+_IMAGE_MIME_TO_FILETYPE = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/bmp": "bmp",
+}
 
 
 # ==============================================================================
@@ -2097,6 +2155,122 @@ def open_chathub(auth, conversation_id=None):
     return ws, session_id
 
 
+def _multipart_body(fields):
+    """Encodes `fields` (a list of (name, value) pairs, value being either a
+    str for a plain form field or a (filename, bytes, content_type) tuple for
+    a file part) as a `multipart/form-data` body. Returns `(content_type,
+    body_bytes)`. Pure stdlib -- there is no `multipart` encoder in the
+    standard library, so this hand-rolls the wire format the same way the rest
+    of this file hand-rolls WebSocket/SignalR framing."""
+    boundary = "----m365proxyformboundary" + uuid.uuid4().hex
+    crlf = b"\r\n"
+    out = []
+    for name, value in fields:
+        out.append(b"--" + boundary.encode())
+        if isinstance(value, tuple):
+            filename, data, content_type = value
+            disp = f'form-data; name="{name}"; filename="{filename}"'
+            out.append(b"Content-Disposition: " + disp.encode())
+            out.append(b"Content-Type: " + content_type.encode())
+            out.append(b"")
+            out.append(data if isinstance(data, bytes) else str(data).encode())
+        else:
+            out.append((f'Content-Disposition: form-data; name="{name}"').encode())
+            out.append(b"")
+            out.append(value if isinstance(value, bytes) else str(value).encode())
+    out.append(b"--" + boundary.encode() + b"--")
+    out.append(b"")
+    body = crlf.join(out)
+    return "multipart/form-data; boundary=" + boundary, body
+
+
+def upload_image_to_sydney(auth, conversation_id, image):
+    """Uploads one image to substrate's `UploadFile` endpoint and returns the
+    `ImageFile` message annotation that a `chat` turn attaches to reference it
+    (see the "Vision input" constants block above).
+
+    `image` is a dict with `data` (raw bytes), `filename`, and `file_type`
+    (the extension with no dot, e.g. "png"). The bearer token is the same
+    Sydney/Chathub access token this proxy already mints -- `UploadFile` lives
+    on the same `substrate.office.com` host, so no separate audience is
+    needed. Raises `ProtocolError` on any non-success response."""
+    # `FileBase64` is a plain multipart FORM FIELD whose value is the entire
+    # `data:<mime>;base64,<...>` data URI STRING -- not raw bytes, not bare
+    # base64 (confirmed byte-for-byte from a live browser capture). Sending
+    # anything else makes the server's image sanitizer reject the POST with
+    # `{"fileSanitizer":"None","result":{"value":"InvalidRequest"}}`. The
+    # OpenAI caller already hands us exactly this data URI, so it's forwarded
+    # verbatim.
+    fields = [("scenario", "UploadImage"), ("conversationId", conversation_id)]
+    fields.append(("FileBase64", image["data_uri"]))
+    for opt in UPLOAD_IMAGE_OPTIONS_SETS:
+        fields.append(("optionsSets", opt))
+    content_type, body = _multipart_body(fields)
+
+    logging.info(
+        "uploading input image to Sydney: filename=%s file_type=%s bytes=%d "
+        "conversation_id=%s",
+        image["filename"],
+        image["file_type"],
+        len(image["data"]),
+        conversation_id,
+    )
+    req = urllib.request.Request(
+        UPLOAD_FILE_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": content_type,
+            "Authorization": "Bearer " + auth.access_token,
+            "User-Agent": USER_AGENT,
+            "Origin": "https://m365.cloud.microsoft",
+            "Referer": "https://m365.cloud.microsoft/",
+            "Accept": "*/*",
+            # These three are load-bearing: without X-Variants the server
+            # feature-gates image upload off and rejects the POST with an empty
+            # 403 (observed live). X-AnchorMailbox / X-Scenario match the exact
+            # browser request shape.
+            "X-AnchorMailbox": f"Oid:{auth.oid}@{auth.tid}",
+            "X-Scenario": "OfficeWebIncludedCopilot",
+            "X-Variants": "feature.EnableImageSupportInUploadFile",
+        },
+    )
+    # UPLOAD_FILE_URL is a fixed https://substrate.office.com constant; the
+    # only caller-influenced input is the multipart body, never the URL.
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:  # nosec B310
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        logging.warning("UploadFile failed: HTTP %d", e.code)
+        raise ProtocolError(
+            f"image upload rejected by Sydney (HTTP {e.code}): {detail}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise ProtocolError(f"could not reach Sydney UploadFile: {e}") from e
+
+    doc_id = result.get("docId")
+    if not doc_id:
+        keys = ", ".join(sorted(result.keys()))
+        raise ProtocolError(f"Sydney UploadFile returned no docId (keys: {keys})")
+    logging.info(
+        "input image uploaded: docId=%s server_fileName=%s fileType=%s",
+        doc_id,
+        result.get("fileName"),
+        result.get("fileType"),
+    )
+    return {
+        "id": doc_id,
+        "messageAnnotationType": "ImageFile",
+        "messageAnnotationMetadata": {
+            "@type": "File",
+            "annotationType": "File",
+            "fileType": image["file_type"],
+            "fileName": image["filename"],
+        },
+    }
+
+
 def send_chat_message(
     ws,
     session_id,
@@ -2105,15 +2279,18 @@ def send_chat_message(
     timezone="UTC",
     timezone_offset=0,
     tool_mode=None,
+    image_annotations=None,
 ):
     trace_id = str(uuid.uuid4())
     logging.info(
-        "sending chat message: session_id=%s trace_id=%s text_length=%d chars locale=%s tool_mode=%s",
+        "sending chat message: session_id=%s trace_id=%s text_length=%d chars "
+        "locale=%s tool_mode=%s images=%d",
         session_id,
         trace_id,
         len(text),
         locale,
         tool_mode,
+        len(image_annotations or []),
     )
     # "action_request" mode suppresses Sydney's own code-interpreter-ish
     # OPTIONS_SETS entries (it fights against them, see
@@ -2185,6 +2362,10 @@ def send_chat_message(
             }
         ],
     }
+    if image_annotations:
+        # Attach uploaded input images to THIS turn's user message. The gptv
+        # optionsSets that make Sydney read them are already in OPTIONS_SETS.
+        payload["arguments"][0]["message"]["messageAnnotations"] = image_annotations
     ws.send_text(json.dumps(payload) + SIGNALR_RS)
 
 
@@ -2608,16 +2789,31 @@ def stream_chat_reply(ws, timeout_s=120):
     raise ProtocolError("timed out waiting for a Chathub reply")
 
 
-def run_chat_turn(token_cache, text, conversation_id=None, **kwargs):
+def run_chat_turn(token_cache, text, conversation_id=None, images=None, **kwargs):
     """End-to-end: cached/refreshed Sydney auth -> one Chathub turn -> yields
     text deltas. Generator; the WebSocket is closed once exhausted.
     `conversation_id`, if given, is passed straight through to
     `open_chathub()` -- see its docstring for why reusing one across calls
-    matters."""
+    matters.
+
+    `images`, if given, is a list of input images (see
+    `_extract_message_images`): each is uploaded to Sydney BEFORE the turn is
+    sent (`upload_image_to_sydney`) and attached to the user message as an
+    `ImageFile` annotation, so Sydney's GPT-V reads them. The upload reuses the
+    same `conversation_id` the turn will run under; a fresh one is minted here
+    when the caller didn't supply one, so the upload and the WebSocket agree."""
     auth = token_cache.get()
+    conversation_id = conversation_id or str(uuid.uuid4())
+    image_annotations = None
+    if images:
+        image_annotations = [
+            upload_image_to_sydney(auth, conversation_id, img) for img in images
+        ]
     ws, session_id = open_chathub(auth, conversation_id=conversation_id)
     try:
-        send_chat_message(ws, session_id, text, **kwargs)
+        send_chat_message(
+            ws, session_id, text, image_annotations=image_annotations, **kwargs
+        )
         yield from stream_chat_reply(ws)
     finally:
         ws.close()
@@ -2646,6 +2842,95 @@ def _message_text(m):
         ]
         return "\n".join(p for p in parts if p)
     return ""
+
+
+def _decode_data_uri_image(url):
+    """Decodes a `data:image/...;base64,...` URI into `(bytes, file_type)`,
+    or returns `(None, None)` if it isn't a base64 image data URI this proxy
+    supports. `file_type` is the extension with no dot (e.g. "png")."""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None, None
+    header, _, payload = url[len("data:") :].partition(",")
+    if not payload:
+        return None, None
+    mime = header.split(";", 1)[0].strip().lower()
+    file_type = _IMAGE_MIME_TO_FILETYPE.get(mime)
+    if file_type is None:
+        return None, None
+    if "base64" not in header.lower():
+        return None, None
+    try:
+        data = base64.b64decode(payload, validate=False)
+    except (ValueError, TypeError):
+        return None, None
+    return data, file_type
+
+
+def _extract_message_images(messages):
+    """Collects input images the caller attached to the LATEST user turn, as
+    OpenAI-style `image_url` content parts:
+
+        {"type": "image_url",
+         "image_url": {"url": "data:image/png;base64,...."}}
+
+    (the `image_url` value may also be a bare URL string). Only inline
+    `data:` URIs are supported -- an `http(s)://` image URL is skipped with a
+    warning, because fetching an arbitrary caller-supplied URL server-side is
+    a request-forgery footgun this proxy deliberately avoids.
+
+    Returns a list of `{data, filename, file_type}` dicts (empty if none),
+    drawn only from the last message whose role is `user`: Sydney attaches
+    input images to the current turn, and in a growing OpenAI transcript only
+    the newest user turn is the current one. Applies MAX_INPUT_IMAGES /
+    MAX_INPUT_IMAGE_BYTES defensively."""
+    last_user = None
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "user":
+            last_user = m
+    if last_user is None:
+        return []
+    content = last_user.get("content")
+    if not isinstance(content, list):
+        return []
+
+    images = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "image_url":
+            continue
+        iu = part.get("image_url")
+        url = iu.get("url") if isinstance(iu, dict) else iu
+        data, file_type = _decode_data_uri_image(url)
+        if data is None:
+            logging.warning(
+                "skipping an image_url content part: only inline base64 "
+                "data: URIs of a supported image type are accepted"
+            )
+            continue
+        if len(data) > MAX_INPUT_IMAGE_BYTES:
+            logging.warning(
+                "skipping an input image of %d bytes (over the %d-byte cap)",
+                len(data),
+                MAX_INPUT_IMAGE_BYTES,
+            )
+            continue
+        images.append(
+            {
+                # The exact data: URI string is what Sydney's UploadFile wants
+                # as its FileBase64 field (see upload_image_to_sydney); `data`
+                # is the decoded bytes, kept only for the size cap and logging.
+                "data_uri": url,
+                "data": data,
+                "file_type": file_type,
+                "filename": f"image_{len(images) + 1}.{file_type}",
+            }
+        )
+        if len(images) >= MAX_INPUT_IMAGES:
+            logging.warning(
+                "reached the %d-image input cap; ignoring any further images",
+                MAX_INPUT_IMAGES,
+            )
+            break
+    return images
 
 
 # ------------------------------------------------------------------------------
@@ -3845,6 +4130,7 @@ class _ChatTurnPlan:
     __slots__ = (
         "conversation_id",
         "delta_messages",
+        "images",
         "is_continuation",
         "lookup_fingerprint",
         "messages",
@@ -3869,6 +4155,7 @@ class _ChatTurnPlan:
         oid,
         turn_count,
         delta_messages=None,
+        images=None,
     ):
         self.prompt = prompt
         self.conversation_id = conversation_id
@@ -3879,6 +4166,10 @@ class _ChatTurnPlan:
         self.tools = tools
         self.tool_choice = tool_choice
         self.oid = oid
+        #: Input images (see `_extract_message_images`) attached to the latest
+        #: user turn, uploaded and referenced when the turn runs; None/empty
+        #: for an ordinary text turn.
+        self.images = images
         #: The new-messages slice (leading assistant turns already removed)
         #: this continuation will send as its delta, or None for a fresh turn.
         #: Kept so the tools path can re-render the delta per convention `mode`
@@ -3924,6 +4215,21 @@ def _plan_chat_turn(token_cache, messages, tools, tool_choice, conversation_sess
     should_track = conversation_sessions is not None
     oid = token_cache.get().oid if should_track else None
 
+    # Input images belong to the latest user turn regardless of whether this
+    # request is recognized as a continuation, so extract them once up front.
+    images = _extract_message_images(messages)
+    if images and tools:
+        # The emulated tool-calling path runs its own multi-attempt turns and
+        # does not thread image attachments; a request mixing images with
+        # `tools` gets the tool-calling behavior, images ignored. Vision input
+        # is supported on ordinary (non-tools) chat turns.
+        logging.warning(
+            "request carries %d input image(s) AND tools; input images are "
+            "only attached on non-tools chat turns and will be ignored here",
+            len(images),
+        )
+        images = []
+
     if should_track and len(messages) >= 2:
         match = _match_continuation(conversation_sessions, messages, oid)
         if match is not None:
@@ -3958,6 +4264,7 @@ def _plan_chat_turn(token_cache, messages, tools, tool_choice, conversation_sess
                     oid=oid,
                     turn_count=session.turn_count + 1,
                     delta_messages=delta_messages,
+                    images=images,
                 )
 
     prompt, conversation_id = _fresh_conversation_turn(messages, tools, tool_choice)
@@ -3974,6 +4281,7 @@ def _plan_chat_turn(token_cache, messages, tools, tool_choice, conversation_sess
         tool_choice=tool_choice,
         oid=oid,
         turn_count=1,
+        images=images,
     )
 
 
@@ -4145,7 +4453,10 @@ def make_handler(token_cache, conversation_sessions):
             try:
                 text = "".join(
                     run_chat_turn(
-                        token_cache, plan.prompt, conversation_id=plan.conversation_id
+                        token_cache,
+                        plan.prompt,
+                        conversation_id=plan.conversation_id,
+                        images=plan.images,
                     )
                 )
             except (ThrottledError, UnsupportedContentError):
@@ -4185,7 +4496,10 @@ def make_handler(token_cache, conversation_sessions):
                 plan.turn_count = 1
                 text = "".join(
                     run_chat_turn(
-                        token_cache, plan.prompt, conversation_id=plan.conversation_id
+                        token_cache,
+                        plan.prompt,
+                        conversation_id=plan.conversation_id,
+                        images=plan.images,
                     )
                 )
 
@@ -4205,7 +4519,10 @@ def make_handler(token_cache, conversation_sessions):
             parts = []
             try:
                 for delta in run_chat_turn(
-                    token_cache, plan.prompt, conversation_id=plan.conversation_id
+                    token_cache,
+                    plan.prompt,
+                    conversation_id=plan.conversation_id,
+                    images=plan.images,
                 ):
                     parts.append(delta)
                     yield delta

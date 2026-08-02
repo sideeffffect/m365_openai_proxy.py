@@ -3240,3 +3240,83 @@ surfaced as **HTTP 502 `unsupported_upstream_content`** with a message that
 says explicitly that this is not a rate limit and retrying will not help. A
 genuinely empty reply — no generated content — still surfaces as 429, since
 there the "back off and retry" advice is correct.
+
+## Update: Vision input — image *understanding* works (2026-08-02)
+
+Image *generation* (above) can't be delivered without the browser cookie
+session. Image **understanding** — uploading an image and asking Sydney about
+it ("what is on this image?") — is the mirror-image case, and it **does**
+work end-to-end through this proxy's own bearer token, with no cookie
+session. It is now wired to the OpenAI-standard `image_url` content part and
+was verified live (solid red/green/blue PNGs each described correctly,
+streaming and non-streaming).
+
+Reverse-engineered from a real browser session (`data/har1.har`, the turn
+*"what is on this image?"*, plus the `UploadFile` POST in the
+`26-08-02 15-06-28` capture). Two steps:
+
+**1. Upload the image to substrate's `UploadFile`.**
+
+```
+POST https://substrate.office.com/m365Copilot/UploadFile
+Authorization: Bearer <the SAME Sydney/Chathub token this proxy already mints>
+X-AnchorMailbox: Oid:<oid>@<tid>
+X-Scenario: OfficeWebIncludedCopilot
+X-Variants: feature.EnableImageSupportInUploadFile
+Content-Type: multipart/form-data; boundary=...
+
+  scenario       = UploadImage
+  conversationId = <the ConversationId the chat turn will run under>
+  FileBase64     = data:image/png;base64,iVBORw0KGgo...      (the WHOLE data URI)
+  optionsSets    = cwcgptvsan
+  optionsSets    = flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch
+  optionsSets    = gptvnorm2048
+
+→ 200 { "docId": "0-weu-d9-<hash>", "fileType": ".png",
+        "fileSanitizer": "ImageSanitizerBingAI", ... }
+```
+
+Two non-obvious things cost real debugging time and are load-bearing:
+
+- **`X-Variants: feature.EnableImageSupportInUploadFile` is required.** Without
+  it the endpoint feature-gates image upload off and returns an **empty
+  HTTP 403** — no body, no hint.
+- **`FileBase64` is a plain text form field carrying the *entire*
+  `data:<mime>;base64,<...>` data URI string** — despite the field name it is
+  neither raw bytes nor bare base64. Send raw bytes or strip the `data:`
+  prefix and the server's sanitizer rejects it with
+  `{"fileSanitizer":"None","result":{"value":"InvalidRequest"}}` (HTTP 400).
+  The `fileSanitizer:"None"` in that error is the tell: the server never
+  recognized the payload as an image. Conveniently, the OpenAI `image_url`
+  value is already exactly this data URI, so it's forwarded verbatim.
+
+**2. Reference the upload from the ordinary `chat` turn.** The turn is
+unchanged except that the user `message` carries a `messageAnnotations` entry
+naming the `docId`:
+
+```json
+"messageAnnotations": [
+  { "id": "0-weu-d9-<hash>",
+    "messageAnnotationType": "ImageFile",
+    "messageAnnotationMetadata": {
+      "@type": "File", "annotationType": "File",
+      "fileType": "png", "fileName": "image_1.png" } }
+]
+```
+
+The `optionsSets` that make Sydney actually *look* at the attachment
+(`cwcfluxgptv`, `gptvnorm2048`,
+`flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch`) are already in this
+proxy's `OPTIONS_SETS`, so nothing else about the invocation changes. The
+reply is ordinary streamed text and flows back through `stream_chat_reply`
+untouched.
+
+**Proxy surface.** Callers use the OpenAI vision shape unchanged — a `user`
+message whose `content` is a parts array with an `image_url` part
+(`{"url": "data:image/png;base64,..."}`). Only inline `data:` URIs are
+accepted; an `http(s)://` image URL is skipped with a warning, because
+fetching an arbitrary caller-supplied URL server-side is a request-forgery
+footgun the proxy avoids. Images are attached to the **latest user turn**;
+`tools` + images is not supported in one request (the emulated tool-calling
+path runs its own turns) and logs a warning. See `upload_image_to_sydney`,
+`_extract_message_images`, and `tests/test_vision_input.py`.

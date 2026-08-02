@@ -153,16 +153,22 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   counting is implemented.
 - One Chathub WebSocket is opened and closed per HTTP request — no
   connection pooling or reuse.
-- **This is a text-only API, so asking Copilot for an image fails on
-  purpose.** Image generation genuinely works on Sydney's side — it really
-  runs its `image_gen` tool and really produces a PNG — but it streams no
-  answer text, and the resulting file lives behind a Microsoft endpoint that
-  returns HTTP 401 to this proxy (it needs the browser's Office cookie
-  session, which the proxy deliberately doesn't have). Such a request comes
-  back as HTTP 502 `unsupported_upstream_content` with an explanation.
-  Previously it was reported as HTTP 429 "you're being throttled, wait and
-  retry" — which was wrong, and sent well-behaved clients into a retry loop
-  that could never succeed.
+- **Image *understanding* works; image *generation* does not.** You can send
+  an image and ask about it — use the OpenAI vision shape (a `user` message
+  whose `content` is a parts array with an `image_url` part holding an inline
+  `data:image/...;base64,...` URI) and Sydney's GPT-V reads it and answers as
+  ordinary text. Only inline `data:` URIs are accepted (a remote `http(s)://`
+  image URL is skipped, to avoid server-side request forgery); `tools` +
+  images in one request isn't supported. Image *generation*, by contrast,
+  fails on purpose: it genuinely works on Sydney's side — it runs its
+  `image_gen` tool and produces a PNG — but streams no answer text, and the
+  resulting file lives behind a Microsoft endpoint that returns HTTP 401 to
+  this proxy (it needs the browser's Office cookie session, which the proxy
+  deliberately doesn't have). Such a request comes back as HTTP 502
+  `unsupported_upstream_content` with an explanation. Previously it was
+  reported as HTTP 429 "you're being throttled, wait and retry" — which was
+  wrong, and sent well-behaved clients into a retry loop that could never
+  succeed.
 - **No access to your mail, files, calendar or directory.** Probed live
   (2026-08-02) and refused in all four cases, consistent with the
   `TenantDataAccess` / `PersonalDataAccess` allowances Sydney reports as `0`.
