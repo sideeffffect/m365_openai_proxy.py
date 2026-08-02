@@ -4330,7 +4330,31 @@ MCP_INSTRUCTIONS = (
 def _mcp_tool_definitions():
     """The `tools/list` payload: each tool's name, description, and JSON-Schema
     input contract. Kept as a function (not a constant) so `PROXY_VERSION` and
-    the caps stay in one place and it's trivially testable."""
+    the caps stay in one place and it's trivially testable.
+
+    TWO THINGS DELIBERATELY ABSENT, both of which look like obvious additions
+    and are not:
+
+    1. **No `tools` parameter.** Exposing this proxy's `/v1` tool-calling
+       emulation through an MCP tool would nest two tool loops: the MCP
+       client's own model calls `ask_copilot`, which prompt-steers Sydney into
+       emitting a fake tool call, which comes back as plain TEXT to a model
+       that already has a real, reliable, schema-enforced tool mechanism of
+       its own. The result is incoherent even before considering that the
+       emulation is probabilistic (see the module docstring's tool-calling
+       section). Copilot is a LEAF in the MCP role -- something the caller's
+       agent consults, never a second agent runtime. Keep it that way.
+
+    2. **No `conversation_id` -- yet.** Every call is an independent Sydney
+       conversation, which each tool's own description states plainly rather
+       than papering over. `/v1` infers continuity by fingerprinting the
+       resent `messages[]` array (see `_match_continuation`); that has no
+       equivalent here, because an MCP caller sends one prompt, not a
+       transcript. The natural fix is the opposite of `/v1`'s: an EXPLICIT
+       id in the schema, returned in the result and passed back next call --
+       honest here precisely because MCP arguments are supplied by a model
+       reading a schema, which will happily thread an opaque id through.
+       Purely additive whenever it's wanted; nothing below has to change."""
     return [
         {
             "name": "ask_copilot",

@@ -456,6 +456,21 @@ Two tools are exposed:
   the `/v1` `image_url` content part). `prompt` defaults to *"What is in this
   image?"*.
 
+Two deliberate differences from the `/v1` API, both worth knowing before you
+point a client at this:
+
+- **Each MCP tool call is a single, independent turn** — there is no
+  multi-turn memory here. The `/v1` API infers continuity by fingerprinting
+  the `messages[]` array a client resends, which has no equivalent when the
+  caller is a model invoking a tool. (Threading an explicit conversation id
+  through the tool schema would be the natural fix, and is additive whenever
+  it's wanted.)
+- **No `tools` parameter, on purpose.** An MCP client already has its own
+  real tool-calling loop driven by its own model; asking Copilot to *also*
+  emulate one inside a tool call would nest two loops and route the result
+  back as plain text. Copilot is a leaf here. Tool-calling emulation stays a
+  `/v1`-only feature — see the module docstring.
+
 A quick smoke test with `curl` (the `initialize` handshake, then a tool call):
 
 ```bash
