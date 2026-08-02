@@ -3,6 +3,12 @@
 m365_openai_proxy.py -- a minimal OpenAI-compatible HTTP API backed by
 https://m365.cloud.microsoft's Copilot chat backend ("Sydney" / Chathub).
 
+It exposes the same backend two ways on one host/port: the OpenAI-style HTTP
+API (`/v1/chat/completions`, `/v1/models`) and, by default, an MCP (Model
+Context Protocol) endpoint at `POST /mcp` over the Streamable HTTP transport,
+offering `ask_copilot` and `describe_image` tools (turn it off with
+--disable-mcp). See the "MCP (Model Context Protocol) layer" section below.
+
 SELF-CONTAINED: this single file uses ONLY the Python 3 standard library --
 no `pip install` of anything, ever, for any feature (including the MSAL
 encrypted-cache decrypt path, which needs AES-256-GCM; this file implements
@@ -18,8 +24,9 @@ which is checked at startup). The 3.7 floor comes from
 AUTHENTICATION MODEL -- READ THIS FIRST
 ------------------------------------------------------------------------------
 This proxy's OpenAI-style HTTP API (`/v1/chat/completions`, `/v1/models`)
-takes NO Authorization header and NO API key from its callers, by design.
-All of Microsoft's authentication is handled internally by this program.
+and its MCP endpoint (`/mcp`) take NO Authorization header and NO API key
+from their callers, by design. All of Microsoft's authentication is handled
+internally by this program.
 
 Instead, YOU (the operator) configure the proxy once, at startup, with raw
 material you copy out of your own already-authenticated browser session --
@@ -618,7 +625,7 @@ if sys.version_info < MIN_PYTHON:  # pragma: no cover - depends on interpreter
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.13.0"
+PROXY_VERSION = "0.14.0"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -4285,11 +4292,157 @@ def _plan_chat_turn(token_cache, messages, tools, tool_choice, conversation_sess
     )
 
 
-def make_handler(token_cache, conversation_sessions):
+# ==============================================================================
+# MCP (Model Context Protocol) layer -- a second, native way to reach the same
+# Copilot backend, served at POST /mcp over the "Streamable HTTP" transport.
+#
+# Same design contract as the OpenAI layer above: NO per-request auth (all the
+# Microsoft auth is handled internally from the configured credential), bind to
+# localhost. On by default; turn off with --disable-mcp.
+#
+# This implements the minimal spec-compliant subset an MCP client needs to
+# discover and call tools: the `initialize` handshake, `tools/list`,
+# `tools/call`, and `ping`, plus the `notifications/*` a client sends (which
+# take no response). It is stateless -- each POST is a self-contained JSON-RPC
+# message, no session id is issued -- and returns a single `application/json`
+# JSON-RPC response (the transport also permits an SSE stream, which this
+# server does not need since it never initiates messages). Hand-rolled on the
+# stdlib http.server like everything else here; no MCP SDK, per the
+# single-file/stdlib-only rule (see AGENTS.md).
+# ==============================================================================
+
+#: Protocol revision advertised in the `initialize` result when the client
+#: doesn't name one. The handshake echoes the client's requested version when
+#: it sends a string, which is what every current MCP client does.
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
+MCP_SERVER_INFO = {"name": "m365-copilot-proxy", "version": PROXY_VERSION}
+
+#: One-line human hints surfaced to an MCP client in the initialize result.
+MCP_INSTRUCTIONS = (
+    "Tools that relay to Microsoft 365 Copilot (Sydney). `ask_copilot` asks a "
+    "question and returns Copilot's answer (it can use web search and a Python "
+    "code interpreter on its side). `describe_image` asks about an image you "
+    "pass as a data: URI."
+)
+
+
+def _mcp_tool_definitions():
+    """The `tools/list` payload: each tool's name, description, and JSON-Schema
+    input contract. Kept as a function (not a constant) so `PROXY_VERSION` and
+    the caps stay in one place and it's trivially testable."""
+    return [
+        {
+            "name": "ask_copilot",
+            "description": (
+                "Ask Microsoft 365 Copilot (Sydney) a question and get its "
+                "text answer. Copilot may use its own web search and Python "
+                "code interpreter to answer. Each call is an independent, "
+                "stateless turn."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The question or instruction for Copilot.",
+                    }
+                },
+                "required": ["prompt"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "describe_image",
+            "description": (
+                "Ask Microsoft 365 Copilot about an image. Provide the image "
+                "as an inline data: URI (data:image/png;base64,...). Returns "
+                "Copilot's text answer."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "image": {
+                        "type": "string",
+                        "description": (
+                            "The image as a data:image/<type>;base64,<...> URI. "
+                            "Remote URLs are not accepted."
+                        ),
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "What to ask about the image. Defaults to "
+                            "'What is in this image?'."
+                        ),
+                    },
+                },
+                "required": ["image"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+class _MCPToolError(Exception):
+    """A tool-call failed in a way the caller (the LLM) should see as tool
+    output, not a transport error -- surfaced as an MCP result with
+    `isError: true` rather than a JSON-RPC error."""
+
+
+def _mcp_image_from_data_uri(url):
+    """Validates one data: URI and returns the image dict
+    `run_chat_turn`/`upload_image_to_sydney` expect, or raises `_MCPToolError`
+    with a client-facing reason."""
+    data, file_type = _decode_data_uri_image(url)
+    if data is None:
+        raise _MCPToolError(
+            "the `image` argument must be an inline data:image/<type>;base64,"
+            "<...> URI of a supported type (png, jpeg, gif, webp, bmp)"
+        )
+    if len(data) > MAX_INPUT_IMAGE_BYTES:
+        raise _MCPToolError(
+            f"image is {len(data)} bytes, over the {MAX_INPUT_IMAGE_BYTES}-byte limit"
+        )
+    return {
+        "data_uri": url,
+        "data": data,
+        "file_type": file_type,
+        "filename": f"image_1.{file_type}",
+    }
+
+
+def _mcp_run_tool(token_cache, name, arguments):
+    """Executes one MCP tool call and returns its text result. Raises
+    `_MCPToolError` for a bad argument (shown to the model as tool output) and
+    `KeyError` for an unknown tool name (surfaced as a JSON-RPC error by the
+    caller)."""
+    arguments = arguments or {}
+    if name == "ask_copilot":
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise _MCPToolError("`prompt` is required and must be a non-empty string")
+        return "".join(run_chat_turn(token_cache, prompt))
+    if name == "describe_image":
+        url = arguments.get("image")
+        if not isinstance(url, str) or not url:
+            raise _MCPToolError("`image` is required and must be a data: URI string")
+        image = _mcp_image_from_data_uri(url)
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            prompt = "What is in this image?"
+        return "".join(run_chat_turn(token_cache, prompt, images=[image]))
+    raise KeyError(name)
+
+
+def make_handler(token_cache, conversation_sessions, mcp_enabled=True):
     """Builds a request handler class bound to one TokenCache (in turn bound
     to one CredentialStore) -- the single configured Microsoft identity this
     proxy instance speaks as -- and one ConversationSessionStore (or None if
-    --disable-conversation-continuity was given)."""
+    --disable-conversation-continuity was given).
+
+    `mcp_enabled` (default True) serves the MCP endpoint at /mcp; set False
+    (via --disable-mcp) to route /mcp to 404 exactly like any other path."""
 
     class ProxyHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -4352,6 +4505,16 @@ def make_handler(token_cache, conversation_sessions):
                 )
             elif path == "/healthz" or path == "":
                 self._write_json(200, {"status": "ok"})
+            elif path == "/mcp" and mcp_enabled:
+                # Streamable HTTP allows a GET to open a server->client SSE
+                # stream; this server never initiates messages, so it declines
+                # with 405 + Allow: POST, exactly as the spec prescribes.
+                self.send_response(405)
+                self.send_header("Allow", "POST")
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
             else:
                 self._error(404, "not found")
 
@@ -4371,23 +4534,33 @@ def make_handler(token_cache, conversation_sessions):
                 except Exception:  # nosec B110  # noqa: BLE001,S110 - see comment above
                     pass
 
+        def _read_json_body(self):
+            """Reads the request body and parses it as JSON. Returns
+            `(obj, None)` on success or `(None, error_message)` on a bad
+            Content-Length or unparseable body."""
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                return None, "invalid Content-Length header"
+            raw_body = self.rfile.read(length) if length else b"{}"
+            try:
+                return json.loads(raw_body), None
+            except json.JSONDecodeError:
+                return None, "invalid JSON body"
+
         def _do_POST(self):
             path = self.path.split("?", 1)[0].rstrip("/")
             logging.debug("POST %s from %s", path, self.address_string())
+            if path == "/mcp" and mcp_enabled:
+                self._handle_mcp()
+                return
             if path != "/v1/chat/completions":
                 self._error(404, "not found")
                 return
 
-            try:
-                length = int(self.headers.get("Content-Length", "0") or "0")
-            except ValueError:
-                self._error(400, "invalid Content-Length header")
-                return
-            raw_body = self.rfile.read(length) if length else b"{}"
-            try:
-                body = json.loads(raw_body)
-            except json.JSONDecodeError:
-                self._error(400, "invalid JSON body")
+            body, err = self._read_json_body()
+            if err is not None:
+                self._error(400, err)
                 return
 
             messages = body.get("messages") or []
@@ -4417,6 +4590,167 @@ def make_handler(token_cache, conversation_sessions):
                 self._handle_streaming(plan, model)
             else:
                 self._handle_full(plan, model)
+
+        # --- MCP (Streamable HTTP) endpoint ---------------------------------
+
+        def _write_accepted(self):
+            """Empty HTTP 202 for a JSON-RPC message that warrants no response
+            body (a notification), as the Streamable HTTP transport prescribes."""
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+        @staticmethod
+        def _jsonrpc_error(msg_id, code, message):
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": code, "message": message},
+            }
+
+        @staticmethod
+        def _jsonrpc_result(msg_id, result):
+            return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+        def _handle_mcp(self):
+            body, err = self._read_json_body()
+            if err is not None:
+                # -32700 Parse error (JSON-RPC), no id available.
+                self._write_json(400, self._jsonrpc_error(None, -32700, err))
+                return
+            if not isinstance(body, dict):
+                # Batched requests (a JSON array) were removed in MCP
+                # 2025-06-18 and this server never supported them.
+                self._write_json(
+                    400,
+                    self._jsonrpc_error(
+                        None, -32600, "expected a single JSON-RPC object"
+                    ),
+                )
+                return
+
+            method = body.get("method")
+            msg_id = body.get("id")
+            is_notification = "id" not in body
+            logging.info(
+                "MCP request from %s: method=%s notification=%s",
+                self.address_string(),
+                method,
+                is_notification,
+            )
+
+            # Notifications (no id) -- client->server one-way messages such as
+            # notifications/initialized -- get a bare 202 and no JSON-RPC body.
+            if is_notification:
+                self._write_accepted()
+                return
+
+            if method == "initialize":
+                requested = body.get("params", {}).get("protocolVersion")
+                self._write_json(
+                    200,
+                    self._jsonrpc_result(
+                        msg_id,
+                        {
+                            "protocolVersion": requested
+                            if isinstance(requested, str)
+                            else MCP_PROTOCOL_VERSION,
+                            "capabilities": {"tools": {"listChanged": False}},
+                            "serverInfo": MCP_SERVER_INFO,
+                            "instructions": MCP_INSTRUCTIONS,
+                        },
+                    ),
+                )
+                return
+            if method == "ping":
+                self._write_json(200, self._jsonrpc_result(msg_id, {}))
+                return
+            if method == "tools/list":
+                self._write_json(
+                    200,
+                    self._jsonrpc_result(msg_id, {"tools": _mcp_tool_definitions()}),
+                )
+                return
+            if method == "tools/call":
+                self._handle_mcp_tools_call(msg_id, body.get("params") or {})
+                return
+
+            self._write_json(
+                200,
+                self._jsonrpc_error(msg_id, -32601, f"method not found: {method}"),
+            )
+
+        def _handle_mcp_tools_call(self, msg_id, params):
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            completion_id = uuid.uuid4().hex
+            logging.info("MCP tools/call %s name=%r", completion_id, name)
+            try:
+                text = _mcp_run_tool(token_cache, name, arguments)
+            except KeyError:
+                self._write_json(
+                    200,
+                    self._jsonrpc_error(msg_id, -32602, f"unknown tool: {name}"),
+                )
+                return
+            except _MCPToolError as e:
+                # A bad argument the model can correct -- an isError result, not
+                # a transport error, so the tool text reaches the model.
+                self._write_json(
+                    200,
+                    self._jsonrpc_result(
+                        msg_id, self._mcp_tool_text(str(e), is_error=True)
+                    ),
+                )
+                return
+            except (ThrottledError, UnsupportedContentError) as e:
+                logging.info("MCP tools/call %s upstream refusal: %s", completion_id, e)
+                self._write_json(
+                    200,
+                    self._jsonrpc_result(
+                        msg_id, self._mcp_tool_text(str(e), is_error=True)
+                    ),
+                )
+                return
+            except Exception as e:
+                logging.exception("MCP tools/call %s failed", completion_id)
+                self._write_json(
+                    200,
+                    self._jsonrpc_result(
+                        msg_id, self._mcp_tool_text(f"tool failed: {e}", is_error=True)
+                    ),
+                )
+                return
+
+            if _looks_like_throttled_empty_reply(text):
+                logging.error(
+                    "MCP tools/call %s got a completely empty reply -- likely "
+                    "Microsoft-side throttling",
+                    completion_id,
+                )
+                self._write_json(
+                    200,
+                    self._jsonrpc_result(
+                        msg_id, self._mcp_tool_text(_THROTTLED_EMPTY_MSG, is_error=True)
+                    ),
+                )
+                return
+
+            logging.info(
+                "MCP tools/call %s finished (reply_length=%d chars)",
+                completion_id,
+                len(text),
+            )
+            self._write_json(
+                200, self._jsonrpc_result(msg_id, self._mcp_tool_text(text))
+            )
+
+        @staticmethod
+        def _mcp_tool_text(text, is_error=False):
+            """An MCP `tools/call` result carrying a single text content block."""
+            return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
         def _remember_turn(self, plan):
             """Shared tail of the plain and tool-call turn runners: if `plan`
@@ -4861,7 +5195,7 @@ def _log_startup_banner(args):
     )
     logging.info(
         "args: host=%s port=%d credentials_prefix=%s log_file=%s log_level=%s "
-        "init_credentials=%s disable_conversation_continuity=%s",
+        "init_credentials=%s disable_conversation_continuity=%s disable_mcp=%s",
         args.host,
         args.port,
         args.credentials_prefix,
@@ -4869,6 +5203,7 @@ def _log_startup_banner(args):
         args.log_level,
         args.init_credentials,
         args.disable_conversation_continuity,
+        args.disable_mcp,
     )
     logging.info("cwd=%s script=%s", os.getcwd(), os.path.abspath(__file__))
     logging.info("=" * 78)
@@ -4951,6 +5286,13 @@ def main():
         "enabled by default (see module docstring's 'Sydney-native conversation "
         "continuity' section); this is an escape hatch if it ever causes trouble",
     )
+    parser.add_argument(
+        "--disable-mcp",
+        action="store_true",
+        help="do not serve the MCP endpoint at /mcp. The Model Context Protocol "
+        "endpoint (Streamable HTTP) is served on the same host/port by default, "
+        "alongside the OpenAI-compatible /v1 API; pass this to turn it off",
+    )
     args = parser.parse_args()
 
     _configure_logging(args.log_file, getattr(logging, args.log_level))
@@ -5008,16 +5350,21 @@ def main():
     conversation_sessions = (
         None if args.disable_conversation_continuity else ConversationSessionStore()
     )
-    handler_cls = make_handler(token_cache, conversation_sessions)
+    mcp_enabled = not args.disable_mcp
+    handler_cls = make_handler(
+        token_cache, conversation_sessions, mcp_enabled=mcp_enabled
+    )
     server = _LoggingHTTPServer((args.host, args.port), handler_cls)
     logging.info(
         "listening on http://%s:%d (Ctrl+C to stop) -- no auth required on the API "
-        "itself; Sydney-native conversation continuity is %s",
+        "itself; Sydney-native conversation continuity is %s; MCP endpoint at "
+        "/mcp is %s",
         args.host,
         args.port,
         "disabled (--disable-conversation-continuity)"
         if conversation_sessions is None
         else "enabled",
+        "enabled" if mcp_enabled else "disabled (--disable-mcp)",
     )
     try:
         server.serve_forever()

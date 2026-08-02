@@ -431,9 +431,42 @@ every token exchange with Entra's newly-rotated refresh token (Entra
 invalidates the previous one on each redemption) — the other three files
 are left untouched.
 
+### MCP endpoint (`/mcp`)
+
+The same server also speaks **MCP** (Model Context Protocol) at `POST /mcp`,
+on the same host/port, **enabled by default** (turn it off with
+`--disable-mcp`). It uses the Streamable HTTP transport and needs no auth
+header, exactly like the `/v1` API. Point any MCP client at
+`http://127.0.0.1:8001/mcp`; for a client configured via JSON that's usually:
+
+```json
+{
+  "mcpServers": {
+    "m365-copilot": { "type": "http", "url": "http://127.0.0.1:8001/mcp" }
+  }
+}
+```
+
+Two tools are exposed:
+
+- **`ask_copilot`** — `{"prompt": "..."}`; returns Copilot's text answer (it
+  may use its own web search and Python code interpreter).
+- **`describe_image`** — `{"image": "data:image/png;base64,...", "prompt":
+  "..."}`; asks Copilot about an inline image (the same GPT-V vision path as
+  the `/v1` `image_url` content part). `prompt` defaults to *"What is in this
+  image?"*.
+
+A quick smoke test with `curl` (the `initialize` handshake, then a tool call):
+
+```bash
+curl http://127.0.0.1:8001/mcp -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"ask_copilot","arguments":{"prompt":"hello"}}}'
+```
+
 Run `python3 m365_openai_proxy.py --help` for all flags, including
 `--host`/`--port`, `--credentials-prefix`, `--log-file`/`--log-level`,
-`--disable-conversation-continuity`.
+`--disable-conversation-continuity`, `--disable-mcp`.
 
 See `REVERSE_ENGINEERING.md` for the full protocol reverse-engineering
 writeup this implementation is based on (Chathub/SignalR wire format, the
@@ -441,10 +474,11 @@ FOCI token-family auth chain, the MSAL cache-encryption algorithm, etc).
 `tests/` holds the network-free test suite (`pytest`), which drives the
 proxy's real HTTP handler with `run_chat_turn` stubbed out so it needs no
 live credentials or quota — `test_continuity.py`, `test_throttle_429.py`,
-`test_throttling_quota.py`, `test_generated_content.py`, and
-`test_token_refresh_race.py` cover the conversation-continuity,
-throttle-harmonization, quota-block logging, non-text-content/capability, and
-token-refresh-race wiring respectively.
+`test_throttling_quota.py`, `test_generated_content.py`,
+`test_token_refresh_race.py`, `test_vision_input.py`, and `test_mcp.py` cover
+the conversation-continuity, throttle-harmonization, quota-block logging,
+non-text-content/capability, token-refresh-race, vision-input (image
+understanding), and MCP-endpoint wiring respectively.
 `scripts/` holds live, credential-requiring dev probes (**not** automated
 tests): `probe_conversation_reuse.py` (confirms a reused `ConversationId`
 carries real server-side memory), `dump_frames.py` (raw SignalR frame dump,

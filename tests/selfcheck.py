@@ -177,6 +177,51 @@ def declared_floor_matches_this_interpreter():
     )
 
 
+@check
+def vision_input_extracts_and_encodes():
+    # A 1x1 PNG as an inline data: URI -> _extract_message_images must keep the
+    # exact URI (that is what UploadFile wants) and decode bytes for the size
+    # cap; _multipart_body must produce a well-formed body. Exercises base64
+    # and the data-URI parsing on every interpreter.
+    import base64
+
+    png = _hex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108020000009077"
+        "53de0000000c4944415408d763f8cfc0f01f0005000151d1c9b8000000004945"
+        "4e44ae426082"
+    )
+    uri = "data:image/png;base64," + base64.b64encode(png).decode()
+    msgs = [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": uri}}]}
+    ]
+    images = proxy._extract_message_images(msgs)
+    assert len(images) == 1, images
+    assert images[0]["data_uri"] == uri
+    assert images[0]["file_type"] == "png"
+    ctype, body = proxy._multipart_body([("scenario", "UploadImage"), ("f", uri)])
+    assert ctype.startswith("multipart/form-data; boundary=")
+    assert b"UploadImage" in body and uri.encode() in body
+
+
+@check
+def mcp_tool_surface_is_well_formed():
+    tools = {t["name"]: t for t in proxy._mcp_tool_definitions()}
+    assert set(tools) == {"ask_copilot", "describe_image"}, tools
+    assert tools["ask_copilot"]["inputSchema"]["required"] == ["prompt"]
+    # Unknown tool -> KeyError; bad image arg -> _MCPToolError (both are how the
+    # handler decides JSON-RPC-error vs isError-result).
+    try:
+        proxy._mcp_run_tool(None, "does_not_exist", {})
+        raise AssertionError("expected KeyError for unknown tool")
+    except KeyError:
+        pass
+    try:
+        proxy._mcp_image_from_data_uri("https://example.com/x.png")
+        raise AssertionError("expected _MCPToolError for a non-data: URI")
+    except proxy._MCPToolError:
+        pass
+
+
 def run():
     """Run every check. Returns a list of (name, exception) for failures."""
     failures = []
