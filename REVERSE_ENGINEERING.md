@@ -3522,10 +3522,33 @@ the shipped code plus a few lines:
 - **image in** — just use the proxy: send an OpenAI `image_url` content part
   with a `data:` URI (see the "Vision input" section and
   `tests/test_vision_input.py`).
-- **image out** — ask the proxy for an image (it will 502), pull the
-  `ImageReferenceUrls` value out of `m365_openai_proxy.log` at DEBUG, then
-  mint the designer token by calling `exchange_refresh_token()` with
-  `SYDNEY_SCOPE` temporarily swapped for the designer scope above, and GET
-  the URL with `fileToken` moved into a `filetoken` header.
+- **image out** — three steps, all on shipped code plus a few lines:
+  1. **Get the URL from the RAW FRAMES, not from the log.** Drive one image
+     turn with `open_chathub()` / `send_chat_message()` / `SignalRBuffer`
+     (`scripts/dump_frames.py` is exactly this, with its prompt changed) and
+     read `messages[].contentGenerationProgressList[].ImageReferenceUrls[]`.
+
+     ⚠️ An earlier version of this recipe said to pull the URL out of
+     `m365_openai_proxy.log` at DEBUG. **That does not work and never did** —
+     measured on 2026-08-02, a DEBUG log of the exact turn that produced an
+     image contains *zero* occurrences of `designerapp`,
+     `ImageReferenceUrls`, or `fileToken`. `_note_generated_content` only
+     tallies generated-content *kinds* (`image x3`); it deliberately never
+     logs the item, and it should stay that way — the `fileToken` is an
+     access-granting capability for that file, so logging it verbatim would
+     break this project's "never log secrets" rule (see the module
+     docstring's LOGGING section).
+  2. Mint the designer token by calling `exchange_refresh_token()` with
+     `SYDNEY_SCOPE` temporarily swapped for the designer scope above, and
+     **persist the rotation with `CredentialStore.rotate()`** — not optional.
+  3. GET the URL with `fileToken` moved out of the query string and into a
+     `filetoken` header.
+
+  Re-verified end to end on 2026-08-02 after the probe script was deleted,
+  precisely to confirm the deletion lost nothing: raw frames → URL on
+  `designerapp.officeapps.live.com`, scope swap → a 2513-char 5-part JWE, and
+  the fetch → **HTTP 200, `image/png`, 3,217,818 bytes, valid PNG**, with both
+  controls reproducing (the `Bearer ` prefix optional, the `filetoken` header
+  required — omitting it still gives 400).
 - **raw frames** — `scripts/dump_frames.py` still dumps every SignalR frame
   of one turn, which is what most of this document was built from.
