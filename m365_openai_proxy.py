@@ -303,8 +303,29 @@ KNOWN LIMITATIONS
   this one proxy PROCESS (in memory, not persisted) -- restarting the proxy
   always starts cold, with every conversation falling back to fresh
   context-stuffing until it's seen once more.
+- **This API is TEXT-ONLY, and a request that makes Copilot generate an
+  image fails by design.** Sydney's image generation works -- it really
+  invokes its `image_gen` tool and really produces a file -- but it streams
+  no answer text at all, and the resulting `ImageReferenceUrls` link is
+  served by `designerapp.officeapps.live.com`, which returns HTTP 401 both
+  anonymously and with this proxy's own Sydney bearer token (live-tested
+  2026-08-02). Fetching it needs the browser's Office cookie session, which
+  this proxy deliberately does not have. Such a turn is surfaced as HTTP 502
+  `unsupported_upstream_content` with an explanation (see
+  `UnsupportedContentError`) -- previously it was misreported as HTTP 429
+  "you are being throttled, wait and retry", which was wrong in every part
+  and sent clients into a retry loop that could never succeed.
 - `usage` (prompt/completion/total tokens) in every response is hardcoded
   to zero -- this proxy does no token counting at all.
+- Sydney's `throttling` block also carries a `metering` sub-object listing
+  15 named, metered CAPABILITIES (`CodeInterpreter`, `TenantDataAccess`,
+  `PersonalDataAccess`, `ImageGeneration`, ...) with a `remainingAllowance`
+  each. It is logged (see `_metering_summary`) and nothing else: the
+  allowance numbers were measured NOT to mean what they appear to
+  (`CodeInterpreter` read 0 on a turn whose code interpreter demonstrably
+  ran, and no value moved across 8 consecutive turns), so this proxy never
+  branches on them. Note this block rides on the type-2 StreamItem frame,
+  not the type-1 `update` frames.
 - One Chathub WebSocket is opened, used for exactly one turn, and closed
   per HTTP request -- no connection pooling or reuse across requests.
 - Sydney's own throttling info (the Chathub protocol's `throttling` field)
@@ -328,9 +349,24 @@ KNOWN LIMITATIONS
   nowhere near any per-conversation ceiling, which rules that explanation
   out instead of leaving it open.
 - **Tool/function calling is EMULATED and probabilistic, not a guarantee.**
-  Sydney has no native OpenAI-style `tools`/`tool_calls` mechanism this proxy
-  can use (its real one, Local MCP, is a separate, unimplemented, much
-  harder project -- see below). This proxy instead teaches the model ONE OF
+  Sydney exposes no native OpenAI-style `tools`/`tool_calls` mechanism *to a
+  client* that this proxy can use (its real one, Local MCP, is a separate,
+  unimplemented, much harder project -- see below).
+
+  Read that precisely, because a blunter earlier version of this sentence
+  ("Sydney has no native ... mechanism") was disproven on the wire on
+  2026-08-02. Sydney very much HAS one and uses it internally for its own
+  built-in tools: an image-generation turn was captured emitting
+  `{"function": {"name": "image_gen", "arguments": "{...}"},
+  "id": "call_zvq9VI82lh3kvZdNlbDl5c", "type": "function"}` -- exactly
+  OpenAI's `tool_calls` entry shape, `call_`-prefixed id and all (see
+  `_native_invocation_names`, which now logs these). What remains unknown,
+  and is the interesting open question, is whether a CLIENT-declared tool can
+  be registered into that namespace; nothing in this proxy assumes it can.
+  Until that is answered the emulation below stays exactly as it is. See
+  REVERSE_ENGINEERING.md's "Sydney's own capability surface, probed".
+
+  This proxy instead teaches the model ONE OF
   TWO independent textual conventions per attempt, cycling through both
   across retries (`_TOOL_CALL_MODES`, `_run_tool_call_turn()`), and parses
   whichever one the model actually used back into a real OpenAI `tool_calls`
@@ -571,7 +607,7 @@ if sys.version_info < MIN_PYTHON:  # pragma: no cover - depends on interpreter
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.12.0"
+PROXY_VERSION = "0.13.0"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -1053,6 +1089,29 @@ class ThrottledError(ProtocolError):
     temporarily unable to respond to this volume of requests. Please try
     again later.") -- see `stream_chat_reply`'s handling of `StreamItem`
     frames for where this is detected."""
+
+
+class UnsupportedContentError(ProtocolError):
+    """Sydney answered with generated NON-TEXT content (an image, so far) and
+    no answer text at all, so there is nothing this text-only API can return.
+
+    This exists to keep that case from being misreported as throttling.
+    Sydney's image generation streams `Progress` entries carrying a
+    `contentGenerationProgressList` (and, at the end, a real
+    `ImageReferenceUrls` link) but never emits an answer-text entry -- so
+    before this error existed, an image request produced an empty reply,
+    which `_looks_like_throttled_empty_reply` then reported as HTTP 429
+    "Microsoft is temporarily throttling this account ... wait a bit and try
+    again". That advice was wrong in every part: nothing was throttled, and
+    waiting changes nothing -- the same request fails identically forever.
+
+    The image itself is genuinely out of reach for this proxy, not merely
+    unimplemented: the `ImageReferenceUrls` link points at
+    `designerapp.officeapps.live.com`, which was live-tested (2026-08-02) to
+    return HTTP 401 both anonymously AND with this proxy's own Sydney bearer
+    token. Fetching it needs the browser's Office (OHP) cookie session, which
+    this proxy deliberately does not have -- see the module docstring's
+    AUTHENTICATION MODEL section."""
 
 
 class WSError(Exception):
@@ -2201,8 +2260,168 @@ def _throttling_summary(info):
     for key in sorted(info):
         if key in rendered:
             continue
-        parts.append(f"{key}={_throttling_scalar_repr(info[key])}")
+        value = info[key]
+        if key == _METERING_KEY and isinstance(value, dict):
+            parts.append(f"{key}[{_metering_summary(value)}]")
+            continue
+        parts.append(f"{key}={_throttling_scalar_repr(value)}")
     return " ".join(parts) if parts else "(empty)"
+
+
+#: The `throttling` sub-object naming Sydney's own metered CAPABILITIES, and
+#: the per-capability key holding the allowance. Live-observed 2026-08-02 on
+#: the type-2 StreamItem frame (NOT on the type-1 `update` frames, which carry
+#: only the three message counters) -- see `_metering_summary`.
+_METERING_KEY = "metering"
+_METERING_ALLOWANCE_KEY = "remainingAllowance"
+
+
+def _metering_summary(metering):
+    """Renders the `throttling.metering` block -- Sydney's own list of metered
+    capabilities -- as `Name=allowance` pairs, e.g.
+    `CodeInterpreter=0 FileReference=3 LLMOnly=100`.
+
+    This is the closest thing to a capability manifest Sydney puts on the
+    wire. Live-observed (2026-08-02, one real M365 Copilot account) with 15
+    entries: `LLMOnly`, `ImageGeneration`, `ImageAnalysis`, `VisualCreator`,
+    `GraphicArt`, `CodeInterpreter`, `TenantDataAccess`, `PersonalDataAccess`,
+    `FileReference`, `DeepResearch`, `DeepWork`, `CopilotTuning`,
+    `NotebookCowork`, `WXPAgentMode`, `CostQuota`.
+
+    DO NOT read an allowance as availability, and do not make this proxy
+    branch on one. Two measurements say the numbers do not mean what they
+    look like: `CodeInterpreter` read 0 on a turn whose code interpreter
+    demonstrably ran and returned a correct answer, and every value was
+    byte-identical across 8 consecutive turns (`LLMOnly` stayed 100,
+    `ImageGeneration` stayed 100) rather than counting down. The NAMES are
+    solid evidence of a real capability taxonomy; the numbers are not yet
+    interpretable. This is logged for diagnosis only -- see
+    REVERSE_ENGINEERING.md's "Sydney's own capability surface, probed".
+
+    Renders every capability and every sub-key present, for the same reason
+    `_throttling_summary` does: this list is server-controlled and the point
+    is to notice when it changes."""
+    parts = []
+    for name in sorted(metering):
+        entry = metering[name]
+        if not isinstance(entry, dict):
+            parts.append(f"{name}={_throttling_scalar_repr(entry)}")
+            continue
+        allowance = entry.get(_METERING_ALLOWANCE_KEY)
+        rendered = (
+            [f"{name}={_throttling_scalar_repr(allowance)}"]
+            if _METERING_ALLOWANCE_KEY in entry
+            else []
+        )
+        rendered += [
+            f"{name}.{k}={_throttling_scalar_repr(entry[k])}"
+            for k in sorted(entry)
+            if k != _METERING_ALLOWANCE_KEY
+        ]
+        parts.extend(rendered or [f"{name}=(empty)"])
+    return " ".join(parts) if parts else "(empty)"
+
+
+def _native_invocation_names(invocation):
+    """Extracts the function names from a bot message's `invocation` field.
+
+    This field is direct wire evidence that Sydney has a REAL, native,
+    OpenAI-shaped function-calling mechanism for its own built-in tools --
+    something this proxy's docstring asserted did not exist. Captured
+    verbatim (2026-08-02) from an image-generation turn:
+
+        {"function": {"name": "image_gen",
+                      "arguments": "{\\"orientation\\":\\"landscape\\"}"},
+         "id": "call_zvq9VI82lh3kvZdNlbDl5c", "type": "function"}
+
+    -- i.e. exactly OpenAI's `tool_calls` entry shape, `call_`-prefixed id and
+    all. Whether a CLIENT-declared tool can be injected into that namespace is
+    a separate, unanswered question (Sydney's Local MCP bridge is the
+    candidate mechanism -- see REVERSE_ENGINEERING.md); nothing here assumes
+    it can. This parses the names purely so the log can show which built-in
+    tool a turn actually used.
+
+    The field is doubly JSON-encoded -- a JSON string holding an array of JSON
+    strings, each holding one call object -- so this unwraps defensively and
+    returns [] for anything it doesn't recognize rather than raising: a
+    logging aid must never be able to break a chat turn."""
+    if not isinstance(invocation, str):
+        return []
+    try:
+        outer = json.loads(invocation)
+    except ValueError:
+        return []
+    names = []
+    for entry in outer if isinstance(outer, list) else [outer]:
+        if isinstance(entry, str):
+            try:
+                entry = json.loads(entry)
+            except ValueError:
+                continue
+        if not isinstance(entry, dict):
+            continue
+        function = entry.get("function")
+        if isinstance(function, dict) and function.get("name"):
+            names.append(str(function["name"]))
+    return names
+
+
+def _note_generated_content(msg, generated_content, seen_invocations):
+    """Records, from one bot message, (a) any NON-TEXT content Sydney
+    generated for this turn and (b) any of its own built-in tools it invoked.
+
+    Both ride on `Progress` entries -- Sydney's UI chrome, which
+    `stream_chat_reply` otherwise discards -- so without this they are
+    invisible. (a) is load-bearing: it is what lets an image-only turn be
+    reported accurately instead of as a rate limit (see
+    `UnsupportedContentError`). (b) is diagnostic only."""
+    for item in msg.get("contentGenerationProgressList") or []:
+        if not isinstance(item, dict):
+            continue
+        # `contentType` is the specific kind ("image"); `contentOrigin` on the
+        # enclosing message is the producing capability ("ImageGeneration").
+        kind = item.get("contentType") or msg.get("contentOrigin") or "unknown"
+        generated_content[str(kind)] = generated_content.get(str(kind), 0) + 1
+    for name in _native_invocation_names(msg.get("invocation")):
+        if name in seen_invocations:
+            continue
+        seen_invocations.add(name)
+        logging.info(
+            "Sydney invoked one of its OWN built-in tools: name=%r (native "
+            "OpenAI-shaped function call -- see _native_invocation_names)",
+            name,
+        )
+
+
+#: Message for the image-only / non-text-only turn (see
+#: `UnsupportedContentError`). Deliberately states that retrying is pointless:
+#: the bug this replaces told callers the exact opposite.
+_UNSUPPORTED_CONTENT_MSG = (
+    "Copilot answered with generated non-text content (%s) and no text at "
+    "all, so there is nothing this text-only OpenAI-compatible API can "
+    "return. The generated file is served from a Microsoft endpoint that "
+    "requires the browser's Office session, which this proxy does not have. "
+    "This is NOT a rate limit and retrying will not help -- ask for a text "
+    "answer instead."
+)
+
+
+def _raise_if_non_text_only(yielded_len, generated_content):
+    """Turns "the turn produced only non-text content" into a specific error
+    instead of an empty reply that later looks like throttling. A no-op when
+    any answer text arrived (a normal reply that merely happened to include a
+    chart is a success) or when nothing was generated (a genuinely empty
+    reply, which IS the throttle signature -- see
+    `_looks_like_throttled_empty_reply`)."""
+    if yielded_len or not generated_content:
+        return
+    summary = ", ".join(f"{k} x{v}" for k, v in sorted(generated_content.items()))
+    logging.error(
+        "Sydney generated only non-text content (%s) and no answer text -- "
+        "surfacing as an explicit error, NOT as a throttle",
+        summary,
+    )
+    raise UnsupportedContentError(_UNSUPPORTED_CONTENT_MSG % summary)
 
 
 def stream_chat_reply(ws, timeout_s=120):
@@ -2247,6 +2466,11 @@ def stream_chat_reply(ws, timeout_s=120):
     # one comparison and the alternative (assume-once) would silently hide a
     # mid-turn quota change, which is precisely the event worth seeing.
     last_throttling = None
+    #: Non-text content Sydney generated this turn (kind -> count), and the
+    #: built-in tools it invoked. Both come off `Progress` chrome entries that
+    #: are otherwise discarded -- see `_note_generated_content`.
+    generated_content = {}
+    seen_invocations = set()
     buf = SignalRBuffer()
     logging.debug("waiting for Chathub reply (timeout=%ds)", timeout_s)
 
@@ -2283,6 +2507,12 @@ def stream_chat_reply(ws, timeout_s=120):
                             )
                         if msg.get("author") != "bot":
                             continue
+                        # Before the messageType filter below discards chrome:
+                        # image generation and Sydney's own native tool calls
+                        # ride on `Progress` entries and are invisible after it.
+                        _note_generated_content(
+                            msg, generated_content, seen_invocations
+                        )
                         msg_type = msg.get("messageType")
                         if msg_type not in ANSWER_MESSAGE_TYPES:
                             # Sydney's own status/progress chrome, not answer
@@ -2315,8 +2545,25 @@ def stream_chat_reply(ws, timeout_s=120):
                             yielded_len += len(delta)
                         snapshots[msg.get("messageId")] = text
 
-            elif ftype == 2 and not yielded_len:
-                # StreamItem: normally just an echo of the user's own message
+            elif ftype == 2:
+                # The StreamItem carries its OWN `throttling` block, and it is
+                # a strict superset of the one on the `update` frames above:
+                # only this one has the `metering` capability list (live-
+                # observed 2026-08-02 -- see `_metering_summary`). Logged
+                # regardless of `yielded_len`, unlike the failure check below,
+                # since a successful turn's quota state is just as diagnostic
+                # as a failed one's.
+                item = frame.get("item") or {}
+                throttling = item.get("throttling")
+                if isinstance(throttling, dict) and throttling != last_throttling:
+                    last_throttling = throttling
+                    logging.info(
+                        "Sydney throttling/quota state: %s",
+                        _throttling_summary(throttling),
+                    )
+
+                # The rest of the StreamItem is normally just an echo of the
+                # user's own message
                 # (persisted/enriched -- see module comments elsewhere), safe
                 # to ignore. But when a turn is refused before any normal
                 # `target:"update"` streaming ever starts (observed live:
@@ -2332,23 +2579,28 @@ def stream_chat_reply(ws, timeout_s=120):
                 # as answer text, a turn that emitted only a "Gathering
                 # details..." placeholder before failing is now correctly
                 # reported as the failure it is instead of being masked by it.
-                item = frame.get("item") or {}
-                for msg in item.get("messages") or []:
-                    if msg.get("author") == "bot" and msg.get("turnState") == "Failed":
-                        reason = msg.get("text") or "(no message from Sydney)"
-                        logging.error("Sydney refused/failed the turn: %r", reason)
-                        raise ThrottledError(f"Sydney refused the turn: {reason!r}")
+                if not yielded_len:
+                    for msg in item.get("messages") or []:
+                        if (
+                            msg.get("author") == "bot"
+                            and msg.get("turnState") == "Failed"
+                        ):
+                            reason = msg.get("text") or "(no message from Sydney)"
+                            logging.error("Sydney refused/failed the turn: %r", reason)
+                            raise ThrottledError(f"Sydney refused the turn: {reason!r}")
 
             elif ftype == 3:  # Completion frame: this invocation is done
                 logging.info(
                     "Chathub reply complete (total_length=%d chars)", yielded_len
                 )
+                _raise_if_non_text_only(yielded_len, generated_content)
                 return
             elif ftype == 7:  # hub closed
                 logging.info(
                     "Chathub hub closed the connection (total_length so far=%d chars)",
                     yielded_len,
                 )
+                _raise_if_non_text_only(yielded_len, generated_content)
                 return
             # ignore: type 6 (ping), and Invocation frames with target "Metrics"
 
@@ -3896,14 +4148,18 @@ def make_handler(token_cache, conversation_sessions):
                         token_cache, plan.prompt, conversation_id=plan.conversation_id
                     )
                 )
-            except ThrottledError:
-                # Sydney itself is over capacity right now, not specifically
-                # unhappy with this conversation_id -- a fresh conversation
-                # would not be any less throttled, so retrying immediately
-                # would just burn a second doomed Chathub call. Forget the
-                # session regardless (harmless either way) and propagate so
-                # the client sees the real reason and can back off/retry
-                # itself, same as a non-continuation turn always has.
+            except (ThrottledError, UnsupportedContentError):
+                # Neither of these is a problem with this conversation_id, so
+                # the retry-as-a-fresh-conversation path below would just burn
+                # a second doomed Chathub call:
+                #   - ThrottledError: Sydney is over capacity right now, and a
+                #     fresh conversation would not be any less throttled.
+                #   - UnsupportedContentError: the turn produced an image and
+                #     no text; asking again in a new conversation produces the
+                #     same image and the same absence of text.
+                # Forget the session regardless (harmless either way) and
+                # propagate so the client sees the real reason, same as a
+                # non-continuation turn always has.
                 if plan.is_continuation:
                     conversation_sessions.forget(plan.lookup_fingerprint)
                 raise
@@ -4079,11 +4335,16 @@ def make_handler(token_cache, conversation_sessions):
                 logging.exception(
                     "chat completion (streaming) %s failed", completion_id
                 )
-                err_type = (
-                    "upstream_throttled"
-                    if isinstance(e, ThrottledError)
-                    else "proxy_error"
-                )
+                # UnsupportedContentError is checked FIRST: it is a
+                # ProtocolError like ThrottledError, and mixing the two up in
+                # this direction is exactly the bug being fixed (an image-only
+                # turn reported as "back off and retry").
+                if isinstance(e, UnsupportedContentError):
+                    err_type = "unsupported_upstream_content"
+                elif isinstance(e, ThrottledError):
+                    err_type = "upstream_throttled"
+                else:
+                    err_type = "proxy_error"
                 err = {"error": {"message": str(e), "type": err_type}}
                 try:
                     self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
@@ -4114,6 +4375,18 @@ def make_handler(token_cache, conversation_sessions):
                 # matching the empty-reply throttle detection below.
                 logging.exception("chat completion %s throttled", completion_id)
                 self._error(429, str(e), err_type="upstream_throttled")
+                return
+            except UnsupportedContentError as e:
+                # NOT 429: this is the case that used to be misreported as
+                # throttling, telling callers to back off and retry when
+                # retrying can never work. 502 with a distinct err_type so a
+                # client can tell "the upstream produced something I can't
+                # represent" apart from "slow down".
+                logging.exception(
+                    "chat completion %s produced only non-text content",
+                    completion_id,
+                )
+                self._error(502, str(e), err_type="unsupported_upstream_content")
                 return
             except Exception as e:
                 # See the comment in _handle_streaming's except clause: broad

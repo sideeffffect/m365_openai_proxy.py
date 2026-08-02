@@ -153,6 +153,24 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   counting is implemented.
 - One Chathub WebSocket is opened and closed per HTTP request — no
   connection pooling or reuse.
+- **This is a text-only API, so asking Copilot for an image fails on
+  purpose.** Image generation genuinely works on Sydney's side — it really
+  runs its `image_gen` tool and really produces a PNG — but it streams no
+  answer text, and the resulting file lives behind a Microsoft endpoint that
+  returns HTTP 401 to this proxy (it needs the browser's Office cookie
+  session, which the proxy deliberately doesn't have). Such a request comes
+  back as HTTP 502 `unsupported_upstream_content` with an explanation.
+  Previously it was reported as HTTP 429 "you're being throttled, wait and
+  retry" — which was wrong, and sent well-behaved clients into a retry loop
+  that could never succeed.
+- **No access to your mail, files, calendar or directory.** Probed live
+  (2026-08-02) and refused in all four cases, consistent with the
+  `TenantDataAccess` / `PersonalDataAccess` allowances Sydney reports as `0`.
+  Copilot answers here as a general model, not as a grounded assistant over
+  your tenant's data. This may be a licensing artifact of the account tested
+  — see REVERSE_ENGINEERING.md's "Sydney's own capability surface, probed".
+  What *does* work: its Python code interpreter (plugin `Pyexec`) and web
+  search.
 - Sydney's own per-conversation rate limiting (the `throttling:
   {maxNumUserMessagesInConversation, ...}` field) is now **logged** once per
   turn (`Sydney throttling/quota state: used=… max=… headroom=…`) but still
@@ -417,16 +435,21 @@ FOCI token-family auth chain, the MSAL cache-encryption algorithm, etc).
 `tests/` holds the network-free test suite (`pytest`), which drives the
 proxy's real HTTP handler with `run_chat_turn` stubbed out so it needs no
 live credentials or quota — `test_continuity.py`, `test_throttle_429.py`,
-`test_throttling_quota.py`, and `test_token_refresh_race.py` cover the
-conversation-continuity, throttle-harmonization, quota-block logging, and
+`test_throttling_quota.py`, `test_generated_content.py`, and
+`test_token_refresh_race.py` cover the conversation-continuity,
+throttle-harmonization, quota-block logging, non-text-content/capability, and
 token-refresh-race wiring respectively.
 `scripts/` holds live, credential-requiring dev probes (**not** automated
 tests): `probe_conversation_reuse.py` (confirms a reused `ConversationId`
 carries real server-side memory), `dump_frames.py` (raw SignalR frame dump,
-used to find the rate-limit handling gap), and `probe_local_mcp.py` (the live
+used to find the rate-limit handling gap), `probe_local_mcp.py` (the live
 probe that confirmed Sydney's Local MCP handshake on the wire and pinned down
 the tool-surfacing blocker — see the "Local MCP tool-calling bridge" section
-of REVERSE_ENGINEERING.md). See REVERSE_ENGINEERING.md for what each one found.
+of REVERSE_ENGINEERING.md), and `probe_sydney_capabilities.py` (drives one
+turn per suspected capability and reports what actually fires on the wire —
+what found the metering capability list, Sydney's native `tool_calls`, and
+the image-reported-as-throttling bug). See REVERSE_ENGINEERING.md for what
+each one found.
 None of them are part of the shipped proxy or required to run it — and, per
 `AGENTS.md`, unlike the proxy itself they may use any Python tooling/libraries.
 
