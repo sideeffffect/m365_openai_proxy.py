@@ -2985,3 +2985,98 @@ the emulation with large tool payloads and no client-side fallback
 survive *both* tool-calling conventions, so it is a genuine model-behavior
 mismatch (large injected tool schemas → refusal or code-interpreter
 self-preemption), not an artifact of any one convention this proxy invented.
+
+## Update: Sydney's `throttling` block, finally measured (2026-08-02) — real, but not the limit that bites
+
+The Chathub `throttling` object has been listed in this document's
+frame-by-frame table since the very first protocol writeup (frame 5,
+`target:"update"`), and the proxy has been receiving it and discarding it for
+its entire history. `_looks_like_throttled_empty_reply`'s docstring recorded
+the reason as *"this proxy has never observed it populated with anything
+informative"*.
+
+**That claim was wrong, and is now retired.** The block is fully populated on
+every turn. It was simply never parsed.
+
+### The measurement
+
+Live, against a real M365 Copilot account, using `scripts/dump_frames.py` for
+the raw wire capture and the proxy itself (with this change) for the
+per-turn logging:
+
+```json
+"throttling": {
+  "maxNumUserMessagesInConversation": 600,
+  "numUserMessagesInConversation": 1,
+  "numLongDocSummaryUserMessagesInConversation": 0
+}
+```
+
+Three findings, each independently checked:
+
+1. **It is fully populated, every turn.** Not empty, not partial.
+2. **`numLongDocSummaryUserMessagesInConversation` is new.** It appears in no
+   earlier capture or writeup in this project. It is presumably a separate
+   sub-quota for long-document-summarization turns; its cap is not sent
+   alongside it, so the ceiling for that one remains unknown.
+3. **It arrives in exactly ONE frame per turn** — 1 of the 10 frames in a
+   full captured turn carried it. Earlier drafts of this change assumed it
+   repeated across frames; the capture disproved that.
+
+### It is per-conversation, and it resets
+
+Three consecutive proxy requests, read straight out of the proxy log:
+
+| turn | request | logged state |
+|---|---|---|
+| 1 | new conversation | `used=1 max=600 headroom=599` |
+| 2 | continuation (reused `ConversationId`) | `used=2 max=600 headroom=598` |
+| 3 | new conversation | `used=1 max=600 headroom=599` |
+
+Turn 2 also independently corroborates the Sydney-native continuity feature
+from the *server's* point of view: the counter incremented on the reused
+`ConversationId` rather than restarting, which is only possible if Sydney
+really is appending to the same server-side conversation.
+
+### Why this does NOT explain the empty-reply throttle (the useful negative result)
+
+The motivation for parsing this field was to settle an open question from the
+"deep, adversarial load-testing" section above: were the Batch E failures
+(1 of 9 succeeded, silent empty completions) caused by approaching a quota
+ceiling, or by task content?
+
+**The measurement rules this field out as the explanation, decisively.** The
+only ceiling it exposes is 600 user messages *within a single conversation*,
+and it resets on every new `ConversationId`. The empty-reply throttle is
+reproducibly triggered by roughly 40–50 requests spread across *many short
+conversations* in a few minutes — a workload under which this counter never
+climbs past a handful before resetting to 1. The two limits are unrelated:
+
+- **per-conversation** (this field): cap 600, effectively unreachable in
+  normal agent use, visible on the wire.
+- **account/volume-level** (the one that actually bites): fires after tens of
+  requests in a short window regardless of conversation boundaries, **not
+  exposed on the wire at all** — its only observable signature remains the
+  silent empty completion.
+
+So the Batch E confound is *narrowed but not resolved*: "the account was near
+a per-conversation quota" is now eliminated, and the remaining candidates are
+account-level volume throttling and the task-shape hypothesis. Distinguishing
+those two still requires a controlled re-run (same task shapes, deliberately
+spaced out, batch order shuffled), because nothing on the wire reports the
+account-level limit.
+
+### What the proxy does with it
+
+Logs it, once per distinct state per turn (`Sydney throttling/quota state:
+used=… max=… headroom=…`), and nothing else — see `_throttling_summary`. It
+is deliberately **not** surfaced through the HTTP API and never alters proxy
+behavior: with a cap of 600 that resets per conversation, there is nothing
+actionable to back off from. Its value is diagnostic: a log from a failed run
+can now positively show the account was nowhere near a per-conversation
+ceiling, closing off one explanation instead of leaving it open.
+
+The summary renders **every** key in the block, not a known-key list —
+`numLongDocSummaryUserMessagesInConversation` is the concrete precedent for
+why: a hardcoded list would have silently dropped the one genuinely new thing
+this measurement found.

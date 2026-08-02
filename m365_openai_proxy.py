@@ -307,10 +307,26 @@ KNOWN LIMITATIONS
   to zero -- this proxy does no token counting at all.
 - One Chathub WebSocket is opened, used for exactly one turn, and closed
   per HTTP request -- no connection pooling or reuse across requests.
-- Sydney's own per-conversation throttling info (seen in the Chathub
-  protocol's `throttling: {maxNumUserMessagesInConversation, ...}` field --
-  see REVERSE_ENGINEERING.md) is not surfaced or specially handled; if you
-  hit a quota, whatever Sydney returns is passed through as-is.
+- Sydney's own throttling info (the Chathub protocol's `throttling` field)
+  is now LOGGED once per distinct state per turn (`Sydney throttling/quota
+  state: used=... max=... headroom=...`, see `_throttling_summary`), but is
+  not surfaced through the HTTP API and never changes this proxy's
+  behavior: nothing backs off, refuses, or warns a client because of it.
+  Measured live (2026-08-02): it reports a PER-CONVERSATION user-message
+  count against a cap of **600**, plus a third counter,
+  `numLongDocSummaryUserMessagesInConversation`. It resets to 1 on every new
+  `ConversationId`.
+
+  Read that cap carefully before relying on it: at 600 messages per
+  conversation it is effectively unreachable in normal use, and it is NOT
+  the limit that actually bites. The throttling operators really hit -- the
+  silent empty reply after a burst of requests (see
+  `_looks_like_throttled_empty_reply`) -- is account-level, fires across
+  many separate short conversations, and is not exposed on the wire at all.
+  This field cannot predict it. The value of logging it is therefore
+  diagnostic and partly negative: a log can now show that a failed run was
+  nowhere near any per-conversation ceiling, which rules that explanation
+  out instead of leaving it open.
 - **Tool/function calling is EMULATED and probabilistic, not a guarantee.**
   Sydney has no native OpenAI-style `tools`/`tool_calls` mechanism this proxy
   can use (its real one, Local MCP, is a separate, unimplemented, much
@@ -555,7 +571,7 @@ if sys.version_info < MIN_PYTHON:  # pragma: no cover - depends on interpreter
 
 # Single source of truth for the version string reported in the startup
 # banner (see _log_startup_banner) and in the HTTP Server header.
-PROXY_VERSION = "0.11.0"
+PROXY_VERSION = "0.12.0"
 
 # ==============================================================================
 # Pure-Python AES-256-GCM (decrypt only) -- stdlib only, no third-party deps.
@@ -2113,6 +2129,82 @@ def send_chat_message(
     ws.send_text(json.dumps(payload) + SIGNALR_RS)
 
 
+#: The two keys inside Sydney's `throttling` block that carry the
+#: per-conversation user-message quota. Naming them only fixes their position
+#: at the front of the logged summary and lets the derived headroom figure be
+#: computed; every OTHER key the block carries is logged too (see
+#: `_throttling_summary`), because what that block actually contains in
+#: practice is exactly the open question this logging exists to answer.
+_THROTTLING_USED_KEY = "numUserMessagesInConversation"
+_THROTTLING_MAX_KEY = "maxNumUserMessagesInConversation"
+
+
+def _throttling_scalar_repr(value):
+    """Renders one `throttling` value for the log, keeping to this project's
+    metadata-only logging convention: scalars are shown as-is (they are
+    counters/flags, not secrets), while anything longer or structured is
+    reduced to its type and size rather than dumped. Nothing in this block has
+    ever been observed to hold a payload, but it is server-controlled and
+    logging it verbatim would be the one place this proxy prints an
+    unbounded, unexamined server value into the log file."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return repr(value) if len(value) <= 80 else f"<str len={len(value)}>"
+    if isinstance(value, (list, tuple, dict)):
+        return f"<{type(value).__name__} len={len(value)}>"
+    return f"<{type(value).__name__}>"
+
+
+def _throttling_summary(info):
+    """Renders Sydney's per-turn `throttling` block as one compact log line,
+    e.g. `used=3 max=30 headroom=27 someFlag=False`.
+
+    `used`/`max`/`headroom` come from the two documented quota keys; every
+    other key present is appended verbatim (sorted, via
+    `_throttling_scalar_repr`) so a field this proxy has never seen still
+    shows up in the log the first time Sydney sends it, instead of being
+    silently dropped by a hardcoded key list.
+
+    Live-observed shape (2026-08-02, a real M365 Copilot account):
+    `{"maxNumUserMessagesInConversation": 600,
+      "numUserMessagesInConversation": 1,
+      "numLongDocSummaryUserMessagesInConversation": 0}` -- i.e. fully
+    populated, and carrying a third counter that was not previously documented
+    anywhere in this project. That third key is exactly why this renders every
+    key present instead of the two it knows about.
+
+    `headroom` is only emitted when BOTH counters are real ints, so a
+    partially-populated block still logs whatever it does carry rather than
+    nothing at all."""
+    parts = []
+    used = info.get(_THROTTLING_USED_KEY)
+    limit = info.get(_THROTTLING_MAX_KEY)
+    used_ok = isinstance(used, int) and not isinstance(used, bool)
+    limit_ok = isinstance(limit, int) and not isinstance(limit, bool)
+    if used_ok:
+        parts.append(f"used={used}")
+    if limit_ok:
+        parts.append(f"max={limit}")
+    if used_ok and limit_ok:
+        parts.append(f"headroom={limit - used}")
+    # Every key NOT already rendered as a counter above is logged generically
+    # -- including a counter key itself when it held an unexpected type (a
+    # bool, say, which `isinstance(x, int)` would otherwise wave through as
+    # `used=1`). Skipping those unconditionally would make the one shape most
+    # worth noticing the one shape that vanishes from the log.
+    rendered = set()
+    if used_ok:
+        rendered.add(_THROTTLING_USED_KEY)
+    if limit_ok:
+        rendered.add(_THROTTLING_MAX_KEY)
+    for key in sorted(info):
+        if key in rendered:
+            continue
+        parts.append(f"{key}={_throttling_scalar_repr(info[key])}")
+    return " ".join(parts) if parts else "(empty)"
+
+
 def stream_chat_reply(ws, timeout_s=120):
     """Yield text deltas as the bot's reply streams in. Reassembles deltas by
     diffing successive full-text snapshots (`messages[].text`) rather than
@@ -2131,7 +2223,16 @@ def stream_chat_reply(ws, timeout_s=120):
     separate messages with their own ids: a single shared "last text" makes a
     switch between two messages look like a snapshot that doesn't extend the
     previous one, which the diff can only resolve by re-yielding the whole
-    text."""
+    text.
+
+    The same `target:"update"` frames also carry Sydney's own `throttling`
+    block (a sibling of `messages`, not a message entry) holding its
+    per-conversation quota counters. That is logged -- once per distinct state
+    per turn, see `_throttling_summary` -- and otherwise left alone: it does
+    not affect what this generator yields, and is not surfaced through the
+    HTTP API. It exists in the log so a run that ends in Sydney's silent
+    empty-reply throttle (see `_looks_like_throttled_empty_reply`) can be told
+    apart from one that merely ran out of per-conversation quota."""
     deadline = time.time() + timeout_s
     # Latest full-text snapshot of each answer message, keyed by `messageId`.
     snapshots = {}
@@ -2139,6 +2240,13 @@ def stream_chat_reply(ws, timeout_s=120):
     # signal (and the logged length). Deliberately NOT a length of any one
     # message: see the type-2 branch below.
     yielded_len = 0
+    # Last `throttling` block logged this turn, so a repeat logs only on
+    # change. Live-observed (scripts/dump_frames.py, 2026-08-02): Sydney sends
+    # it in exactly ONE frame per turn -- 1 of 10 frames carried it -- so this
+    # is defensive rather than load-bearing today. It stays because the cost is
+    # one comparison and the alternative (assume-once) would silently hide a
+    # mid-turn quota change, which is precisely the event worth seeing.
+    last_throttling = None
     buf = SignalRBuffer()
     logging.debug("waiting for Chathub reply (timeout=%ds)", timeout_s)
 
@@ -2155,6 +2263,13 @@ def stream_chat_reply(ws, timeout_s=120):
 
             if ftype == 1 and frame.get("target") == "update":
                 for arg in frame.get("arguments") or []:
+                    throttling = arg.get("throttling")
+                    if isinstance(throttling, dict) and throttling != last_throttling:
+                        last_throttling = throttling
+                        logging.info(
+                            "Sydney throttling/quota state: %s",
+                            _throttling_summary(throttling),
+                        )
                     for msg in arg.get("messages") or []:
                         if msg.get("messageType") == "AuthError":
                             # Log/raise only the server's own description text,
@@ -3071,12 +3186,21 @@ def _looks_like_throttled_empty_reply(text):
     reliably after roughly 40-50 requests in a few minutes during this
     proxy's own tool-calling emulation A/B testing, and did not clear after
     45 seconds, only after a few minutes (see REVERSE_ENGINEERING.md's
-    "Sydney-side request throttling" section for the exact timeline). The
-    Chathub protocol's own `throttling: {maxNumUserMessagesInConversation,
-    ...}` field (see REVERSE_ENGINEERING.md) is presumably related, though
-    this proxy has never observed it populated with anything informative
-    that would let it detect the condition proactively instead of
-    reactively (i.e. only after already getting an empty reply).
+    "Sydney-side request throttling" section for the exact timeline).
+
+    The Chathub protocol's own `throttling` field (now parsed and logged --
+    see `_throttling_summary`) turns out NOT to be related, which is a
+    genuinely useful negative result rather than a gap. Live measurement
+    (2026-08-02) found it reports a PER-CONVERSATION user-message count
+    against a cap of 600, and that it resets to 1 on every new
+    `ConversationId`. So it cannot detect this condition even in principle:
+    the empty-reply throttle fires after ~40-50 requests spread across many
+    short conversations, where this counter never climbs past a handful
+    before resetting. The two limits are simply different -- this one is
+    per-conversation and effectively unreachable in normal use; the one that
+    actually bites is account-level and is not exposed on the wire at all.
+    Detection therefore stays reactive (an empty reply), and this function
+    remains the only signal for it.
 
     Treating this as a normal empty answer would silently confuse whoever's
     on the other end of the API -- a coding agent has no way to distinguish

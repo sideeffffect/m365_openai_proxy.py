@@ -154,9 +154,13 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
 - One Chathub WebSocket is opened and closed per HTTP request — no
   connection pooling or reuse.
 - Sydney's own per-conversation rate limiting (the `throttling:
-  {maxNumUserMessagesInConversation, ...}` field) isn't specially handled
-  or surfaced; if you hit that quota, whatever Sydney returns is passed
-  through as-is. Its separate, apparently account/backend-wide "too much
+  {maxNumUserMessagesInConversation, ...}` field) is now **logged** once per
+  turn (`Sydney throttling/quota state: used=… max=… headroom=…`) but still
+  isn't surfaced through the API or acted on; if you hit that quota,
+  whatever Sydney returns is passed through as-is. Measured live: the cap is
+  **600 user messages per conversation**, and it resets on every new
+  conversation — so in practice you will not reach it, and it is *not* the
+  limit you will actually run into. Its separate, apparently account/backend-wide "too much
   volume right now" rate limit IS now surfaced properly, though (found
   live while testing conversation continuity above): it used to arrive in
   a WebSocket frame shape this proxy silently ignored, so a throttled turn
@@ -413,8 +417,9 @@ FOCI token-family auth chain, the MSAL cache-encryption algorithm, etc).
 `tests/` holds the network-free test suite (`pytest`), which drives the
 proxy's real HTTP handler with `run_chat_turn` stubbed out so it needs no
 live credentials or quota — `test_continuity.py`, `test_throttle_429.py`,
-and `test_token_refresh_race.py` cover the conversation-continuity,
-throttle-harmonization, and token-refresh-race wiring respectively.
+`test_throttling_quota.py`, and `test_token_refresh_race.py` cover the
+conversation-continuity, throttle-harmonization, quota-block logging, and
+token-refresh-race wiring respectively.
 `scripts/` holds live, credential-requiring dev probes (**not** automated
 tests): `probe_conversation_reuse.py` (confirms a reused `ConversationId`
 carries real server-side memory), `dump_frames.py` (raw SignalR frame dump,
