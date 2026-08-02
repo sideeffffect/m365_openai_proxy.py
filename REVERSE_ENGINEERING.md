@@ -186,10 +186,14 @@ sections below are where that lives.
   agent generates exactly this kind of request burst).
 - **Not actually in this repo**: none of the `.har` capture files or
   `Chathub.log.jsonl` referenced throughout this document were ever committed
-  (they carry live session cookies/tokens and are `.gitignore`d) — this
-  document is the durable record of what they showed, not a pointer to files
-  you can go re-read locally unless you made your own captures during
-  development.
+  (they carry live session cookies/tokens) — this document is the durable
+  record of what they showed, not a pointer to files you can go re-read
+  locally unless you made your own captures during development. By
+  convention they live in **`data/`**, which is `.gitignore`d wholesale
+  precisely so that any capture dropped there is credential-safe by default,
+  whatever it happens to be named. Filenames cited below (e.g.
+  `m365.cloud.microsoft_Archive [26-07-18 16-50-48].har`) are therefore
+  `data/<name>` on a machine that has them.
 
 ---
 
