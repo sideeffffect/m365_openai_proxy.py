@@ -322,23 +322,36 @@ KNOWN LIMITATIONS
   Only inline `data:` URIs are accepted (a remote `http(s)://` image URL is
   skipped, to avoid server-side request forgery), and `tools` + images in one
   request is not supported.
-  Image GENERATION, by contrast, is NOT SUPPORTED by this text-only API.
-  Sydney's image generation works -- it really invokes its `image_gen` tool
-  and really produces a PNG -- but it streams no answer text at all, so such
-  a turn is surfaced as HTTP 502 `unsupported_upstream_content` with an
-  explanation (see `UnsupportedContentError`) -- previously it was misreported
-  as HTTP 429 "you are being throttled, wait and retry", which was wrong in
-  every part and sent clients into a retry loop that could never succeed.
-  Note the file itself is REACHABLE (an earlier revision of this docstring
-  wrongly said it needed the browser's Office cookie session; that was
-  disproven live -- it needs a second FOCI-minted token for the
-  `designerappservice.officeapps.live.com` resource plus a `filetoken`
-  header, and the full recipe is in REVERSE_ENGINEERING.md's "Fetching a
-  generated image"). It is unimplemented rather than impossible, because
-  chat-completions has nowhere to put a 2.7 MB PNG; MCP's image content
-  blocks would be the natural home if it is ever added.
-- `usage` (prompt/completion/total tokens) in every response is hardcoded
-  to zero -- this proxy does no token counting at all.
+  Image GENERATION works too, but NOT on `/v1/chat/completions` -- it has its
+  own endpoint, `POST /v1/images/generations` (OpenAI's own image API, whose
+  response format is base64 image data), and the MCP `generate_image` tool
+  (which returns a real MCP image content block). A chat-completions response
+  can only carry text, so offering it there would mean either a URL the caller
+  cannot authenticate to or megabytes of base64 stuffed into `content`; asking
+  for an image on the chat endpoint therefore still fails, now with a message
+  pointing at the two places that do work. Under the hood the file is fetched
+  with a SECOND access token, for the `designerappservice` resource, minted
+  from the very same FOCI refresh token (see `fetch_generated_image`,
+  `TokenCache.get(scope=...)`, and REVERSE_ENGINEERING.md's "Fetching a
+  generated image").
+  Two honest caveats: generation is reached by ASKING for it in a chat turn, so
+  Sydney can decline or answer in prose instead (surfaced as HTTP 502
+  `upstream_no_image`, carrying Sydney's own wording); and there is a DAILY
+  per-account image cap, observed live, which Sydney reports only as prose
+  ("Sorry, I can't generate any more images today") and which its own
+  `throttling.metering` block does NOT reflect -- `ImageGeneration` still read
+  `100` with the cap already hit.
+  On the chat endpoint an image-only turn is surfaced as HTTP 502
+  `unsupported_upstream_content` (see `UnsupportedContentError`) -- which two
+  earlier revisions got wrong in instructive ways, both now fixed: it was
+  first misreported as HTTP 429 "you are being throttled, wait and retry"
+  (wrong in every part, and it sent clients into a retry loop that could never
+  succeed), and the explanation then blamed a browser Office cookie session
+  the proxy lacks (disproven live -- see above).
+- `usage` (prompt/completion/total tokens) in every chat-completions response
+  is hardcoded to zero -- this proxy does no token counting at all. (On
+  `/v1/images/generations`, where OpenAI's own schema makes `usage` optional,
+  it is OMITTED instead of faked.)
 - Sydney's `throttling` block also carries a `metering` sub-object listing
   15 named, metered CAPABILITIES (`CodeInterpreter`, `TenantDataAccess`,
   `PersonalDataAccess`, `ImageGeneration`, ...) with a `remainingAllowance`
@@ -1109,6 +1122,33 @@ TOOL_MODE_OPTIONS_SETS = [
 # `stream_chat_reply` unchanged.
 UPLOAD_FILE_URL = "https://substrate.office.com/m365Copilot/UploadFile"
 
+# ------------------------------------------------------------------------------
+# Image generation (image OUT)
+#
+# Sydney generates images fine -- it invokes its own `image_gen` tool and
+# streams `contentGenerationProgressList` entries that end with a real
+# `ImageReferenceUrls` link -- but it emits NO answer text for such a turn, so
+# there is nothing for a chat-completions response to carry. That is why
+# `/v1/chat/completions` still reports an image-only turn as an error (see
+# `UnsupportedContentError`), and why image generation lives on its own
+# endpoint instead: OpenAI's `/v1/images/generations`, whose response format is
+# base64 image bytes rather than text.
+#
+# Fetching the generated file needs a SECOND access token, for a different
+# resource than Chathub -- minted from the very same FOCI refresh token, so no
+# extra credential is required from the operator. See REVERSE_ENGINEERING.md's
+# "Fetching a generated image" for the full derivation and its live controls.
+DESIGNER_SCOPE = (
+    "https://designerappservice.officeapps.live.com/.default "
+    "openid profile offline_access"
+)
+
+#: Host serving generated images. The fetch URL arrives verbatim from Sydney;
+#: this is asserted against it before the proxy will fetch, so a
+#: server-supplied URL can never redirect this proxy's authenticated request at
+#: an arbitrary host.
+DESIGNER_HOST = "designerapp.officeapps.live.com"
+
 #: The `optionsSets` the browser sends as multipart form parts on the
 #: `UploadFile` POST itself (distinct from the chat turn's OPTIONS_SETS).
 UPLOAD_IMAGE_OPTIONS_SETS = [
@@ -1174,8 +1214,15 @@ class UnsupportedContentError(ProtocolError):
     again". That advice was wrong in every part: nothing was throttled, and
     waiting changes nothing -- the same request fails identically forever.
 
-    The image itself is UNIMPLEMENTED, not unreachable. (An earlier revision
-    of this docstring claimed the latter -- that fetching it needed the
+    The image itself IS now retrievable -- just not through this API. Use
+    `POST /v1/images/generations` or the MCP `generate_image` tool, both built
+    on `generate_image()`/`fetch_generated_image()`; this error's message points
+    the caller at them. What remains true is that a chat-completions response
+    has nowhere to put the bytes, which is why this endpoint still refuses
+    rather than inlining megabytes of base64 into `content`.
+
+    (An earlier revision of this docstring claimed the file was out of reach
+    entirely -- that fetching it needed the
     browser's Office (OHP) cookie session -- inferred from the
     `ImageReferenceUrls` link returning HTTP 401 both anonymously and with
     this proxy's own Sydney bearer token. The 401s are real; the inference was
@@ -1184,12 +1231,7 @@ class UnsupportedContentError(ProtocolError):
     `designerappservice.officeapps.live.com` resource, plus the URL's
     `fileToken` query param moved into a `filetoken` header. That fetch
     returns a valid 2.7 MB PNG. See REVERSE_ENGINEERING.md's "Fetching a
-    generated image" for the full recipe and its controls.)
-
-    It stays unimplemented because chat-completions can only return text: the
-    choices would be a markdown link the caller cannot authenticate to, or
-    megabytes of inline base64. MCP has first-class image content blocks and
-    would be the natural home for image output if it is ever added."""
+    generated image" for the full recipe and its controls.)"""
 
 
 class WSError(Exception):
@@ -1891,9 +1933,9 @@ def parse_home_account_id(local_storage_key):
     return oid, tid
 
 
-def exchange_refresh_token(refresh_token, oid=None, tid=None):
-    """POST the refresh_token grant to Entra ID, scoped to the Sydney/Chathub
-    resource, mimicking the exact shape observed from a real browser --
+def exchange_refresh_token(refresh_token, oid=None, tid=None, scope=None):
+    """POST the refresh_token grant to Entra ID, mimicking the exact shape
+    observed from a real browser --
     cross-checked against every refresh_token-grant request captured across
     every HAR in this project's development (~16 examples, different
     scopes, different sessions hours apart): all of them, without
@@ -1913,10 +1955,21 @@ def exchange_refresh_token(refresh_token, oid=None, tid=None):
     them (the plaintext-refresh_token-only credential path, where no tenant
     id is available ahead of the first exchange) this falls back to the
     /common/ endpoint and omits `X-AnchorMailbox`, which is still a
-    documented-valid way to redeem a multi-tenant refresh token."""
+    documented-valid way to redeem a multi-tenant refresh token.
+
+    `scope` defaults to `SYDNEY_SCOPE` (the Chathub resource). The ONLY other
+    value this proxy uses is `DESIGNER_SCOPE`, to fetch a generated image --
+    that is the same FOCI redemption against a different resource, and every
+    other parameter is byte-identical (see REVERSE_ENGINEERING.md's "Fetching
+    a generated image"). Callers must go through `TokenCache.get(scope=...)`
+    rather than calling this directly: each redemption ROTATES the shared
+    refresh token, so the exchange has to be serialized across ALL scopes."""
+    scope = scope or SYDNEY_SCOPE
     token_url = TOKEN_URL_TEMPLATE.format(tid=tid) if tid else TOKEN_URL_COMMON
     logging.debug(
-        "exchanging refresh token for a Sydney/Chathub access token via %s", token_url
+        "exchanging refresh token for an access token (scope=%r) via %s",
+        scope,
+        token_url,
     )
 
     query_params = {
@@ -1931,7 +1984,7 @@ def exchange_refresh_token(refresh_token, oid=None, tid=None):
     form_fields = {
         "client_id": FOCI_CLIENT_ID,
         "redirect_uri": TOKEN_REDIRECT_URI,
-        "scope": SYDNEY_SCOPE,
+        "scope": scope,
         "grant_type": "refresh_token",
         "client_info": "1",
         "x-client-SKU": MSAL_CLIENT_SKU,
@@ -1997,35 +2050,51 @@ class SydneyAuth:
 
 
 class TokenCache:
-    """Caches the Sydney access token derived from the CredentialStore's one
-    configured refresh token, re-exchanging only when the cached access
-    token is near expiry, and persisting each rotation back to the store."""
+    """Caches the access tokens derived from the CredentialStore's one
+    configured refresh token, re-exchanging only when a cached access token is
+    near expiry, and persisting each rotation back to the store.
+
+    Cached PER SCOPE (`get(scope=...)`), because this proxy needs two different
+    audiences from the same credential: `SYDNEY_SCOPE` for Chathub (and the
+    substrate `UploadFile` endpoint, same audience) and `DESIGNER_SCOPE` to
+    fetch a generated image. Both redemptions go through the SAME
+    `_refresh_lock`, which is not an optimization but a correctness
+    requirement: Entra invalidates the previous refresh token on every
+    redemption and each redemption returns a new one, so two scopes redeeming
+    concurrently would have the second rejected as `invalid_grant` AND race
+    each other's `store.rotate()` writes -- corrupting the credential file
+    badly enough to need a fresh browser capture. A per-scope lock would
+    reintroduce exactly the bug the single lock was added to fix."""
 
     def __init__(self, credential_store):
         self.store = credential_store
         #: Guards reads/writes of self._auth (held only briefly).
         self._lock = threading.Lock()
         #: Serializes the token exchange itself so at most one thread ever
-        #: redeems the refresh token at a time -- see get() for why.
+        #: redeems the refresh token at a time, ACROSS ALL SCOPES -- see the
+        #: class docstring and get() for why.
         self._refresh_lock = threading.Lock()
-        self._auth = None
+        #: scope string -> SydneyAuth
+        self._auth = {}
 
-    def _cached_auth(self):
-        """Returns the cached SydneyAuth if it exists and isn't within 60s of
-        expiry, else None."""
+    def _cached_auth(self, scope):
+        """Returns the cached SydneyAuth for `scope` if it exists and isn't
+        within 60s of expiry, else None."""
         with self._lock:
-            auth = self._auth
+            auth = self._auth.get(scope)
         if auth and auth.expires_at - 60 > time.time():
             logging.debug(
-                "reusing cached Sydney access token (oid=%s, expires in %.0fs)",
+                "reusing cached access token (oid=%s, scope=%r, expires in %.0fs)",
                 auth.oid,
+                scope,
                 auth.expires_at - time.time(),
             )
             return auth
         return None
 
-    def get(self):
-        cached = self._cached_auth()
+    def get(self, scope=None):
+        scope = scope or SYDNEY_SCOPE
+        cached = self._cached_auth(scope)
         if cached is not None:
             return cached
 
@@ -2037,25 +2106,34 @@ class TokenCache:
         # their two store.rotate() writes would race. Only one thread performs
         # the exchange; any others block here and then find the freshly-cached
         # token on the re-check below instead of redeeming a second time.
+        # NOTE this lock is deliberately NOT per-scope: see class docstring.
         with self._refresh_lock:
-            cached = self._cached_auth()
+            cached = self._cached_auth(scope)
             if cached is not None:
                 logging.debug(
-                    "another thread refreshed the Sydney access token while we waited"
+                    "another thread refreshed the access token (scope=%r) while "
+                    "we waited",
+                    scope,
                 )
                 return cached
 
-            return self._exchange_locked()
+            return self._exchange_locked(scope)
 
-    def _exchange_locked(self):
-        """Performs the refresh-token -> access-token exchange and caches the
-        result. MUST be called with self._refresh_lock held (see get())."""
+    def _exchange_locked(self, scope):
+        """Performs the refresh-token -> access-token exchange for `scope` and
+        caches the result. MUST be called with self._refresh_lock held (see
+        get())."""
         logging.info(
-            "cached Sydney access token missing or near expiry; exchanging refresh token"
+            "cached access token (scope=%r) missing or near expiry; exchanging "
+            "refresh token",
+            scope,
         )
         refresh_token = self.store.current()
         body = exchange_refresh_token(
-            refresh_token, oid=self.store.oid_hint, tid=self.store.tid_hint
+            refresh_token,
+            oid=self.store.oid_hint,
+            tid=self.store.tid_hint,
+            scope=scope,
         )
 
         new_rt = body.get("refresh_token")
@@ -2077,6 +2155,44 @@ class TokenCache:
             raise AuthError(
                 f"token exchange response had no access_token (response keys={list(body.keys())})"
             )
+
+        if scope == SYDNEY_SCOPE:
+            auth = self._sydney_auth_from_claims(access_token, body)
+        else:
+            # A non-Chathub resource's token is not necessarily a readable JWT:
+            # the designerappservice one is a 5-part JWE (encrypted), so
+            # `jwt_claims` cannot see an `oid`/`tid`/`exp` in it at all
+            # (live-verified -- see REVERSE_ENGINEERING.md's "Fetching a
+            # generated image"). Take the lifetime from the response's own
+            # `expires_in` instead, and the identity from the credential
+            # store's hints -- nothing that uses these tokens needs either
+            # claim, they are carried only for logging symmetry.
+            expires_in = body.get("expires_in")
+            auth = SydneyAuth(
+                access_token=access_token,
+                oid=self.store.oid_hint,
+                tid=self.store.tid_hint,
+                expires_at=time.time()
+                + (int(expires_in) if str(expires_in).isdigit() else 300),
+            )
+
+        logging.info(
+            "access token acquired: scope=%r oid=%s tid=%s expires_in=%ss opaque=%s",
+            scope,
+            auth.oid,
+            auth.tid,
+            body.get("expires_in", "?"),
+            access_token.count(".") != 2,
+        )
+        with self._lock:
+            self._auth[scope] = auth
+        return auth
+
+    @staticmethod
+    def _sydney_auth_from_claims(access_token, body):
+        """Builds the Chathub `SydneyAuth` from the token's own JWT claims.
+        `oid`/`tid` are REQUIRED here (they go into the Chathub WebSocket URL
+        path), unlike for the other scopes above."""
         claims = jwt_claims(access_token)
         auth = SydneyAuth(
             access_token=access_token,
@@ -2085,8 +2201,8 @@ class TokenCache:
             expires_at=claims.get("exp", time.time() + 300),
         )
         if not auth.oid or not auth.tid:
-            # Same reasoning as above: log only the claim NAMES present, not
-            # their values (which can include the signed-in user's email/UPN).
+            # Log only the claim NAMES present, not their values (which can
+            # include the signed-in user's email/UPN).
             logging.error(
                 "access_token was missing oid/tid claims (claims present=%s)",
                 list(claims.keys()),
@@ -2094,15 +2210,6 @@ class TokenCache:
             raise AuthError(
                 f"access_token was missing oid/tid claims (claims present={list(claims.keys())})"
             )
-
-        logging.info(
-            "Sydney access token acquired: oid=%s tid=%s expires_in=%ss",
-            auth.oid,
-            auth.tid,
-            body.get("expires_in", "?"),
-        )
-        with self._lock:
-            self._auth = auth
         return auth
 
 
@@ -2289,6 +2396,116 @@ def upload_image_to_sydney(auth, conversation_id, image):
             "fileName": image["filename"],
         },
     }
+
+
+def fetch_generated_image(token_cache, url):
+    """Downloads one image Sydney generated, returning `(bytes, mime_type)`.
+
+    `url` is an `ImageReferenceUrls` entry straight off the wire (see
+    `_note_generated_content`). Three things about this request are non-obvious
+    and all three were established live -- see REVERSE_ENGINEERING.md's
+    "Fetching a generated image" for the derivation and its controls:
+
+      1. It needs a DIFFERENT access token than Chathub, for the
+         `designerappservice` resource -- minted from the very same FOCI
+         refresh token, so no extra credential is involved
+         (`TokenCache.get(scope=DESIGNER_SCOPE)`; that token is an encrypted
+         JWE, not a readable JWT).
+      2. The URL's `fileToken` query parameter must be MOVED into a
+         `filetoken` request header. Leaving it in the query string gets
+         HTTP 400.
+      3. The `Bearer ` prefix on `Authorization` is optional here (the browser
+         omits it; both work).
+
+    The host is asserted against `DESIGNER_HOST` before anything is sent. That
+    matters: `url` is server-supplied, and this is the one place this proxy
+    would attach a real access token to a URL it did not construct itself -- so
+    a hostile or mangled `ImageReferenceUrls` must not be able to redirect a
+    credentialed request anywhere else. Redirects are refused for the same
+    reason.
+
+    Neither the URL nor the `fileToken` is ever logged: that token grants
+    access to the file, so it falls under the module docstring's "never log
+    secrets" rule. Only sizes and the host are logged."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname != DESIGNER_HOST:
+        # Deliberately does NOT include `url` in the message: it carries the
+        # capability-bearing fileToken.
+        logging.error(
+            "refusing to fetch generated content from an unexpected host "
+            "(scheme=%r host=%r, expected https://%s)",
+            parsed.scheme,
+            parsed.hostname,
+            DESIGNER_HOST,
+        )
+        raise ProtocolError(
+            "Copilot returned a generated-content URL on an unexpected host "
+            f"({parsed.hostname!r}); refusing to send credentials to it"
+        )
+
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    file_tokens = query.pop("fileToken", None) or []
+    if not file_tokens or not file_tokens[0]:
+        raise ProtocolError(
+            "generated-content URL carried no fileToken, which this endpoint "
+            "requires as a header"
+        )
+    fetch_url = urllib.parse.urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urllib.parse.urlencode(query, doseq=True),
+            "",
+        )
+    )
+
+    auth = token_cache.get(scope=DESIGNER_SCOPE)
+    req = urllib.request.Request(
+        fetch_url,
+        method="GET",
+        headers={
+            "Authorization": "Bearer " + auth.access_token,
+            "filetoken": file_tokens[0],
+            "User-Agent": USER_AGENT,
+            "Origin": "https://m365.cloud.microsoft",
+            "Referer": "https://m365.cloud.microsoft/",
+            "Accept": "*/*",
+        },
+    )
+    logging.info("fetching generated content from %s", DESIGNER_HOST)
+    # The host was asserted above and redirects are refused below, so this is
+    # not an arbitrary-URL open despite `url` being server-supplied.
+    opener = urllib.request.build_opener(_NoRedirect())
+    try:
+        with opener.open(req, timeout=90) as resp:  # nosec B310
+            data = resp.read()
+            mime = resp.headers.get("Content-Type") or "application/octet-stream"
+    except urllib.error.HTTPError as e:
+        logging.warning("generated-content fetch failed: HTTP %d", e.code)
+        raise ProtocolError(
+            f"could not download the generated file (HTTP {e.code})"
+        ) from e
+    except urllib.error.URLError as e:
+        raise ProtocolError(f"could not reach {DESIGNER_HOST}: {e}") from e
+
+    mime = mime.split(";", 1)[0].strip().lower()
+    logging.info(
+        "generated content downloaded: bytes=%d content_type=%s", len(data), mime
+    )
+    if not data:
+        raise ProtocolError("the generated file downloaded as zero bytes")
+    return data, mime
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuses redirects, so a credentialed generated-content fetch can never
+    be bounced off `DESIGNER_HOST` to somewhere else (see
+    `fetch_generated_image`, which asserts the host of the URL it is given --
+    an assertion a followed redirect would silently invalidate)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def send_chat_message(
@@ -2567,15 +2784,32 @@ def _native_invocation_names(invocation):
     return names
 
 
-def _note_generated_content(msg, generated_content, seen_invocations):
-    """Records, from one bot message, (a) any NON-TEXT content Sydney
-    generated for this turn and (b) any of its own built-in tools it invoked.
+#: `status` value on a `contentGenerationProgressList` entry meaning "this
+#: generated file is finished and its `ImageReferenceUrls` is now populated".
+#: Earlier entries for the same file carry an empty `ImageReferenceUrls` list
+#: (live-observed: 3 `Loading image` progress entries, only the last two with
+#: a URL), so a fetch must use the FINAL one.
+_CONTENT_READY_STATUS = 2
 
-    Both ride on `Progress` entries -- Sydney's UI chrome, which
+
+def _note_generated_content(
+    msg, generated_content, seen_invocations, generated_urls=None
+):
+    """Records, from one bot message, (a) any NON-TEXT content Sydney
+    generated for this turn, (b) the fetch URL of each finished file, and
+    (c) any of its own built-in tools it invoked.
+
+    All three ride on `Progress` entries -- Sydney's UI chrome, which
     `stream_chat_reply` otherwise discards -- so without this they are
     invisible. (a) is load-bearing: it is what lets an image-only turn be
     reported accurately instead of as a rate limit (see
-    `UnsupportedContentError`). (b) is diagnostic only."""
+    `UnsupportedContentError`). (b) is what `/v1/images/generations` returns.
+    (c) is diagnostic only.
+
+    `generated_urls`, when given, is appended to with each finished file's URL.
+    NOTE these URLs are capability-bearing (their `fileToken` query parameter
+    grants access to that file), so they are NEVER logged -- see
+    `fetch_generated_image` and the module docstring's LOGGING section."""
     for item in msg.get("contentGenerationProgressList") or []:
         if not isinstance(item, dict):
             continue
@@ -2583,6 +2817,11 @@ def _note_generated_content(msg, generated_content, seen_invocations):
         # enclosing message is the producing capability ("ImageGeneration").
         kind = item.get("contentType") or msg.get("contentOrigin") or "unknown"
         generated_content[str(kind)] = generated_content.get(str(kind), 0) + 1
+        if generated_urls is None or item.get("status") != _CONTENT_READY_STATUS:
+            continue
+        for url in item.get("ImageReferenceUrls") or []:
+            if isinstance(url, str) and url and url not in generated_urls:
+                generated_urls.append(url)
     for name in _native_invocation_names(msg.get("invocation")):
         if name in seen_invocations:
             continue
@@ -2599,11 +2838,10 @@ def _note_generated_content(msg, generated_content, seen_invocations):
 #: the bug this replaces told callers the exact opposite.
 _UNSUPPORTED_CONTENT_MSG = (
     "Copilot answered with generated non-text content (%s) and no text at "
-    "all, so there is nothing this text-only OpenAI-compatible API can "
-    "return. The generated file is served from a Microsoft endpoint that "
-    "requires the browser's Office session, which this proxy does not have. "
-    "This is NOT a rate limit and retrying will not help -- ask for a text "
-    "answer instead."
+    "all, so there is nothing a chat-completions response can carry. This is "
+    "NOT a rate limit and retrying will not help. For a generated IMAGE, use "
+    "POST /v1/images/generations (or the MCP `generate_image` tool), which "
+    "return the image itself; otherwise ask for a text answer instead."
 )
 
 
@@ -2625,7 +2863,28 @@ def _raise_if_non_text_only(yielded_len, generated_content):
     raise UnsupportedContentError(_UNSUPPORTED_CONTENT_MSG % summary)
 
 
-def stream_chat_reply(ws, timeout_s=120):
+def _finish_turn(yielded_len, generated_content, generated_urls, content_sink):
+    """Shared tail of `stream_chat_reply`'s two terminal frames (Completion and
+    hub-Close): hands any generated non-text content to a caller that asked for
+    it, and otherwise applies the text-only API's "an image-only turn is an
+    error" rule.
+
+    The two are mutually exclusive by design -- providing a `content_sink` IS
+    the caller declaring it can represent non-text content, so raising at it
+    would be wrong."""
+    if content_sink is not None:
+        content_sink["kinds"] = generated_content
+        content_sink["images"] = list(generated_urls or [])
+        logging.info(
+            "turn generated non-text content: kinds=%s finished_files=%d",
+            generated_content or "{}",
+            len(content_sink["images"]),
+        )
+        return
+    _raise_if_non_text_only(yielded_len, generated_content)
+
+
+def stream_chat_reply(ws, timeout_s=120, content_sink=None):
     """Yield text deltas as the bot's reply streams in. Reassembles deltas by
     diffing successive full-text snapshots (`messages[].text`) rather than
     trying to interpret the `writeAtCursor` partial-append fields directly --
@@ -2652,7 +2911,15 @@ def stream_chat_reply(ws, timeout_s=120):
     not affect what this generator yields, and is not surfaced through the
     HTTP API. It exists in the log so a run that ends in Sydney's silent
     empty-reply throttle (see `_looks_like_throttled_empty_reply`) can be told
-    apart from one that merely ran out of per-conversation quota."""
+    apart from one that merely ran out of per-conversation quota.
+
+    `content_sink`, when given, is a dict this fills in with
+    `{"kinds": {...}, "images": [url, ...]}` for whatever NON-TEXT content the
+    turn generated. Passing one also declares "this caller can handle non-text
+    content", which suppresses `UnsupportedContentError`: an image-only turn is
+    a normal, successful outcome for `/v1/images/generations` and the MCP
+    `generate_image` tool, and an error for the text-only chat API. Leave it
+    None and the pre-existing behavior is unchanged in every respect."""
     deadline = time.time() + timeout_s
     # Latest full-text snapshot of each answer message, keyed by `messageId`.
     snapshots = {}
@@ -2672,6 +2939,10 @@ def stream_chat_reply(ws, timeout_s=120):
     #: are otherwise discarded -- see `_note_generated_content`.
     generated_content = {}
     seen_invocations = set()
+    #: Fetch URLs of finished generated files, collected only when the caller
+    #: asked for them (`content_sink`); None otherwise so the text-only path
+    #: does not even accumulate these capability-bearing URLs.
+    generated_urls = [] if content_sink is not None else None
     buf = SignalRBuffer()
     logging.debug("waiting for Chathub reply (timeout=%ds)", timeout_s)
 
@@ -2712,7 +2983,7 @@ def stream_chat_reply(ws, timeout_s=120):
                         # image generation and Sydney's own native tool calls
                         # ride on `Progress` entries and are invisible after it.
                         _note_generated_content(
-                            msg, generated_content, seen_invocations
+                            msg, generated_content, seen_invocations, generated_urls
                         )
                         msg_type = msg.get("messageType")
                         if msg_type not in ANSWER_MESSAGE_TYPES:
@@ -2794,14 +3065,18 @@ def stream_chat_reply(ws, timeout_s=120):
                 logging.info(
                     "Chathub reply complete (total_length=%d chars)", yielded_len
                 )
-                _raise_if_non_text_only(yielded_len, generated_content)
+                _finish_turn(
+                    yielded_len, generated_content, generated_urls, content_sink
+                )
                 return
             elif ftype == 7:  # hub closed
                 logging.info(
                     "Chathub hub closed the connection (total_length so far=%d chars)",
                     yielded_len,
                 )
-                _raise_if_non_text_only(yielded_len, generated_content)
+                _finish_turn(
+                    yielded_len, generated_content, generated_urls, content_sink
+                )
                 return
             # ignore: type 6 (ping), and Invocation frames with target "Metrics"
 
@@ -2809,7 +3084,9 @@ def stream_chat_reply(ws, timeout_s=120):
     raise ProtocolError("timed out waiting for a Chathub reply")
 
 
-def run_chat_turn(token_cache, text, conversation_id=None, images=None, **kwargs):
+def run_chat_turn(
+    token_cache, text, conversation_id=None, images=None, content_sink=None, **kwargs
+):
     """End-to-end: cached/refreshed Sydney auth -> one Chathub turn -> yields
     text deltas. Generator; the WebSocket is closed once exhausted.
     `conversation_id`, if given, is passed straight through to
@@ -2821,7 +3098,11 @@ def run_chat_turn(token_cache, text, conversation_id=None, images=None, **kwargs
     sent (`upload_image_to_sydney`) and attached to the user message as an
     `ImageFile` annotation, so Sydney's GPT-V reads them. The upload reuses the
     same `conversation_id` the turn will run under; a fresh one is minted here
-    when the caller didn't supply one, so the upload and the WebSocket agree."""
+    when the caller didn't supply one, so the upload and the WebSocket agree.
+
+    `content_sink` is passed straight through to `stream_chat_reply` -- see
+    there; it is how `/v1/images/generations` collects a generated image
+    instead of getting an `UnsupportedContentError`."""
     auth = token_cache.get()
     conversation_id = conversation_id or str(uuid.uuid4())
     image_annotations = None
@@ -2834,10 +3115,86 @@ def run_chat_turn(token_cache, text, conversation_id=None, images=None, **kwargs
         send_chat_message(
             ws, session_id, text, image_annotations=image_annotations, **kwargs
         )
-        yield from stream_chat_reply(ws)
+        yield from stream_chat_reply(ws, content_sink=content_sink)
     finally:
         ws.close()
         logging.info("Chathub WebSocket closed (session_id=%s)", session_id)
+
+
+#: How the caller's image description is worded to Sydney. Image generation is
+#: reached by ASKING for it in a chat turn -- Sydney has no separate
+#: image-generation API -- so a bare noun phrase like "a red bicycle" (which is
+#: exactly what OpenAI's `/v1/images/generations` `prompt` normally is) would
+#: otherwise just get a prose answer about bicycles. Like the tool-calling
+#: emulation, this is prompt-level steering with no formal contract: Sydney can
+#: always answer in prose instead, which `generate_image` surfaces as an
+#: explicit error rather than an empty success.
+_IMAGE_PROMPT_TEMPLATE = "Generate an image based on this description: %s"
+
+#: Cap on how many generated files a single image request will download, so a
+#: surprising server response can't make this proxy fetch an unbounded number
+#: of multi-megabyte files. Sydney returns one image per turn in practice.
+MAX_GENERATED_IMAGES = 4
+
+
+def generate_image(token_cache, prompt, n=1):
+    """Asks Copilot to generate an image and returns `[(bytes, mime), ...]`.
+
+    Two steps, both live-verified (see REVERSE_ENGINEERING.md's "Fetching a
+    generated image"): run an ordinary Chathub turn that asks for an image and
+    collect the finished files' URLs off its `Progress` frames
+    (`content_sink`), then download each one with the separate
+    `designerappservice` token (`fetch_generated_image`).
+
+    `n` images are requested by running `n` INDEPENDENT turns: Sydney produces
+    one image per turn and has no batch parameter, so this is the only honest
+    way to serve `n > 1`. Capped at `MAX_GENERATED_IMAGES`.
+
+    Raises `UnsupportedContentError` when a turn produced no image at all --
+    Sydney answered in prose, refused on content policy, or was throttled.
+    That is a real and not-rare outcome (this is prompt-steering, see
+    `_IMAGE_PROMPT_TEMPLATE`), and it must be an explicit error rather than an
+    empty-but-successful response."""
+    wanted = max(1, min(int(n or 1), MAX_GENERATED_IMAGES))
+    logging.info(
+        "image generation requested: n=%d prompt_length=%d", wanted, len(prompt)
+    )
+    out = []
+    for attempt in range(wanted):
+        sink = {}
+        text = "".join(
+            run_chat_turn(
+                token_cache, _IMAGE_PROMPT_TEMPLATE % prompt, content_sink=sink
+            )
+        )
+        urls = sink.get("images") or []
+        if not urls:
+            # Sydney answered SOMETHING but generated no file. Its own words are
+            # the single most useful diagnostic here (a content-policy refusal
+            # reads completely differently from a prose answer), so pass a
+            # trimmed version through rather than a generic message.
+            detail = " ".join(text.split())[:300] or "(no text either)"
+            logging.error(
+                "image generation produced no image on attempt %d/%d "
+                "(kinds=%s, reply_length=%d)",
+                attempt + 1,
+                wanted,
+                sink.get("kinds") or "{}",
+                len(text),
+            )
+            raise UnsupportedContentError(
+                "Copilot did not generate an image for that prompt. It is "
+                "asked for one in an ordinary chat turn, so it can decline or "
+                f'answer in prose instead. It said: "{detail}"'
+            )
+        for url in urls[: MAX_GENERATED_IMAGES - len(out)]:
+            out.append(fetch_generated_image(token_cache, url))
+    logging.info(
+        "image generation finished: images=%d total_bytes=%d",
+        len(out),
+        sum(len(d) for d, _ in out),
+    )
+    return out
 
 
 # ==============================================================================
@@ -4418,6 +4775,25 @@ def _mcp_tool_definitions():
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "generate_image",
+            "description": (
+                "Ask Microsoft 365 Copilot to generate an image from a text "
+                "description. Returns the image itself. Copilot may decline or "
+                "answer in prose instead, which is reported as an error."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "What the image should depict.",
+                    }
+                },
+                "required": ["prompt"],
+                "additionalProperties": False,
+            },
+        },
     ]
 
 
@@ -4450,16 +4826,22 @@ def _mcp_image_from_data_uri(url):
 
 
 def _mcp_run_tool(token_cache, name, arguments):
-    """Executes one MCP tool call and returns its text result. Raises
-    `_MCPToolError` for a bad argument (shown to the model as tool output) and
-    `KeyError` for an unknown tool name (surfaced as a JSON-RPC error by the
-    caller)."""
+    """Executes one MCP tool call and returns its result as a list of MCP
+    content blocks. Raises `_MCPToolError` for a bad argument (shown to the
+    model as tool output) and `KeyError` for an unknown tool name (surfaced as
+    a JSON-RPC error by the caller).
+
+    Content BLOCKS rather than a plain string because `generate_image` returns
+    an actual image: MCP has a first-class `{"type": "image", "data": <base64>,
+    "mimeType": ...}` block, which is the whole reason image OUTPUT is offered
+    here as well as on `/v1/images/generations` and not at all on
+    `/v1/chat/completions`."""
     arguments = arguments or {}
     if name == "ask_copilot":
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             raise _MCPToolError("`prompt` is required and must be a non-empty string")
-        return "".join(run_chat_turn(token_cache, prompt))
+        return [_mcp_text_block("".join(run_chat_turn(token_cache, prompt)))]
     if name == "describe_image":
         url = arguments.get("image")
         if not isinstance(url, str) or not url:
@@ -4468,8 +4850,26 @@ def _mcp_run_tool(token_cache, name, arguments):
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             prompt = "What is in this image?"
-        return "".join(run_chat_turn(token_cache, prompt, images=[image]))
+        return [
+            _mcp_text_block("".join(run_chat_turn(token_cache, prompt, images=[image])))
+        ]
+    if name == "generate_image":
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise _MCPToolError("`prompt` is required and must be a non-empty string")
+        return [
+            {
+                "type": "image",
+                "data": base64.b64encode(raw).decode("ascii"),
+                "mimeType": mime,
+            }
+            for raw, mime in generate_image(token_cache, prompt)
+        ]
     raise KeyError(name)
+
+
+def _mcp_text_block(text):
+    return {"type": "text", "text": text}
 
 
 def make_handler(token_cache, conversation_sessions, mcp_enabled=True):
@@ -4591,6 +4991,9 @@ def make_handler(token_cache, conversation_sessions, mcp_enabled=True):
             if path == "/mcp" and mcp_enabled:
                 self._handle_mcp()
                 return
+            if path == "/v1/images/generations":
+                self._handle_images_generations()
+                return
             if path != "/v1/chat/completions":
                 self._error(404, "not found")
                 return
@@ -4627,6 +5030,104 @@ def make_handler(token_cache, conversation_sessions, mcp_enabled=True):
                 self._handle_streaming(plan, model)
             else:
                 self._handle_full(plan, model)
+
+        # --- OpenAI images endpoint ----------------------------------------
+
+        def _handle_images_generations(self):
+            """`POST /v1/images/generations` -- OpenAI's own image endpoint.
+
+            Image generation lives here rather than on `/v1/chat/completions`
+            because a chat-completions response can only carry text: the
+            choices there would be a URL the caller cannot authenticate to, or
+            megabytes of base64 in `content`. This endpoint's response format
+            IS base64 image data, so it fits exactly.
+
+            `response_format` is accepted for compatibility but only
+            `b64_json` can be honored -- returning a `url` would mean handing
+            the caller a `designerapp.officeapps.live.com` link that 401s
+            without a token this proxy holds and will not hand out. That
+            mirrors OpenAI's own GPT-image models, which likewise only return
+            `b64_json`."""
+            body, err = self._read_json_body()
+            if err is not None:
+                self._error(400, err)
+                return
+
+            prompt = body.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                self._error(400, "'prompt' is required and must be a non-empty string")
+                return
+            response_format = body.get("response_format") or "b64_json"
+            if response_format != "b64_json":
+                self._error(
+                    400,
+                    f"response_format={response_format!r} is not supported; only "
+                    "'b64_json' is (the generated file is served from a Microsoft "
+                    "endpoint that requires a token this proxy does not hand out, "
+                    "so a usable 'url' cannot be returned)",
+                    err_type="invalid_request_error",
+                )
+                return
+            for ignored in ("size", "quality", "style", "background"):
+                if body.get(ignored) is not None:
+                    logging.warning(
+                        "ignoring unsupported image parameter %r -- Copilot's "
+                        "image generation exposes no such control",
+                        ignored,
+                    )
+
+            request_id = f"img-{uuid.uuid4().hex}"
+            logging.info(
+                "image generation request from %s: %s prompt_length=%d n=%s model=%r",
+                self.address_string(),
+                request_id,
+                len(prompt),
+                body.get("n"),
+                body.get("model"),
+            )
+            try:
+                images = generate_image(token_cache, prompt, n=body.get("n") or 1)
+            except ThrottledError as e:
+                logging.exception("image generation %s throttled", request_id)
+                self._error(429, str(e), err_type="upstream_throttled")
+                return
+            except UnsupportedContentError as e:
+                # Copilot answered without producing an image (prose, or a
+                # content-policy refusal). Not a rate limit, and not a proxy
+                # bug -- a different prompt may well work, so it gets its own
+                # err_type rather than being lumped in with either.
+                logging.info("image generation %s produced no image: %s", request_id, e)
+                self._error(502, str(e), err_type="upstream_no_image")
+                return
+            except Exception as e:
+                logging.exception("image generation %s failed", request_id)
+                self._error(502, str(e))
+                return
+
+            data = []
+            for raw, mime in images:
+                data.append({"b64_json": base64.b64encode(raw).decode("ascii")})
+            logging.info(
+                "image generation %s finished successfully (images=%d)",
+                request_id,
+                len(data),
+            )
+            self._write_json(
+                200,
+                {
+                    "created": int(time.time()),
+                    "data": data,
+                    # Echoing the real format back is part of OpenAI's own
+                    # ImagesResponse, and its allowed values ("png"/"jpeg"/
+                    # "webp") are exactly the subtype of the Content-Type the
+                    # download reported. `usage` is deliberately OMITTED rather
+                    # than reported as zeros: it is optional in OpenAI's schema,
+                    # and this proxy does no token counting (see the module
+                    # docstring's note on `usage` for chat completions, where
+                    # the field is required and so has to be faked).
+                    "output_format": images[0][1].split("/")[-1] or "png",
+                },
+            )
 
         # --- MCP (Streamable HTTP) endpoint ---------------------------------
 
@@ -4725,7 +5226,7 @@ def make_handler(token_cache, conversation_sessions, mcp_enabled=True):
             completion_id = uuid.uuid4().hex
             logging.info("MCP tools/call %s name=%r", completion_id, name)
             try:
-                text = _mcp_run_tool(token_cache, name, arguments)
+                content = _mcp_run_tool(token_cache, name, arguments)
             except KeyError:
                 self._write_json(
                     200,
@@ -4761,7 +5262,16 @@ def make_handler(token_cache, conversation_sessions, mcp_enabled=True):
                 )
                 return
 
-            if _looks_like_throttled_empty_reply(text):
+            text = "".join(
+                b.get("text", "") for b in content if b.get("type") == "text"
+            )
+            non_text = [b for b in content if b.get("type") != "text"]
+            # The empty-reply throttle signature only applies to a turn that was
+            # supposed to answer in TEXT. A `generate_image` result is all image
+            # blocks and no text at all, which is a complete success -- checking
+            # it here would report every generated image as throttling, exactly
+            # the bug this release fixes on the chat path.
+            if not non_text and _looks_like_throttled_empty_reply(text):
                 logging.error(
                     "MCP tools/call %s got a completely empty reply -- likely "
                     "Microsoft-side throttling",
@@ -4776,18 +5286,20 @@ def make_handler(token_cache, conversation_sessions, mcp_enabled=True):
                 return
 
             logging.info(
-                "MCP tools/call %s finished (reply_length=%d chars)",
+                "MCP tools/call %s finished (text_length=%d chars, non_text_blocks=%d)",
                 completion_id,
                 len(text),
+                len(non_text),
             )
             self._write_json(
-                200, self._jsonrpc_result(msg_id, self._mcp_tool_text(text))
+                200,
+                self._jsonrpc_result(msg_id, {"content": content, "isError": False}),
             )
 
         @staticmethod
         def _mcp_tool_text(text, is_error=False):
             """An MCP `tools/call` result carrying a single text content block."""
-            return {"content": [{"type": "text", "text": text}], "isError": is_error}
+            return {"content": [_mcp_text_block(text)], "isError": is_error}
 
         def _remember_turn(self, plan):
             """Shared tail of the plain and tool-call turn runners: if `plan`

@@ -3349,8 +3349,8 @@ path runs its own turns) and logs a warning. See `upload_image_to_sydney`,
 
 This section supersedes the "Can the image be delivered instead?" claim above.
 Image **output** — downloading the PNG Sydney's `image_gen` produces — is a
-solved problem on the wire. It is simply **not implemented** in the proxy,
-which is a scope decision, not a blocker.
+solved problem on the wire, and is now **implemented**: see "This is now
+implemented — and where" at the end of this section.
 
 It was solved by reverse-engineering the `26-08-02 15-06-28` HAR and then
 verified end-to-end live against a real account. This section records the
@@ -3445,23 +3445,60 @@ Both controls matter. The first kills the theory that the browser's unusual
 bare-`Authorization` spelling was significant; the second proves the
 `filetoken` header is not redundant with the token.
 
-### Why this still isn't implemented
+### This is now implemented — and where
 
-Two reasons, both design rather than protocol:
+Shipped as `fetch_generated_image()` + `generate_image()`, exposed on **`POST
+/v1/images/generations`** (OpenAI's own image endpoint, whose response format
+is base64 image data) and the MCP **`generate_image`** tool (which returns a
+real MCP image content block).
 
-1. **The OpenAI chat-completions API has nowhere to put an image.** A
-   response can only carry text, so the options are a markdown link (to a URL
-   the client cannot authenticate to) or inlining ~2.7 MB of base64 into
-   `content`. Neither is good. MCP, by contrast, has first-class image
-   content blocks — if image output is ever shipped, `/mcp` is its natural
-   home, not `/v1`.
-2. **It costs a second token audience and a rotation** on a credential whose
-   refresh token is already the single point of failure for the whole proxy.
+Deliberately NOT on `/v1/chat/completions`: a chat-completions response can
+only carry text, so the options there would be a markdown link to a URL the
+caller cannot authenticate to, or inlining megabytes of base64 into `content`.
+An image-only chat turn therefore still surfaces as HTTP 502
+`unsupported_upstream_content` — its message now points at the two endpoints
+that do return the image, instead of (wrongly) claiming the file is
+unreachable.
 
-So an image-only turn is still surfaced as HTTP 502
-`unsupported_upstream_content` (see `UnsupportedContentError`). What must be
-corrected is the *reason* given: it is "this text-only API cannot return an
-image", **not** "the image is unreachable".
+Two implementation notes that matter more than they look:
+
+- **The second token audience shares ONE refresh lock.** `TokenCache` is now
+  keyed by scope, but its `_refresh_lock` is deliberately *not* per-scope: the
+  refresh token is single-use and every redemption rotates it, so two scopes
+  redeeming concurrently would get the second rejected as `invalid_grant` *and*
+  race each other's `CredentialStore.rotate()` writes — corrupting the
+  credential file badly enough to need a fresh browser capture. A per-scope
+  lock would reintroduce exactly the bug the single lock exists to prevent.
+- **The fetch asserts the host before sending anything.** `ImageReferenceUrls`
+  is server-supplied, and this is the only place the proxy attaches a real
+  access token to a URL it did not construct, so the host must equal
+  `DESIGNER_HOST` and redirects are refused (a followed redirect would silently
+  invalidate the assertion). The `fileToken` is treated as a secret: never
+  logged, and never echoed into an error message.
+
+### A daily image-generation cap exists, and metering does not reflect it
+
+Found by exhausting it during this work. Once hit, an image request comes back
+as an ordinary prose answer:
+
+> Sorry, I can't generate any more images today. Try again tomorrow, or ask me
+> to find similar images on the web instead.
+
+That is Sydney's *only* signal — no error frame, no `turnState: "Failed"`, no
+distinct `messageType`. So the proxy passes Sydney's own wording through in its
+`502 upstream_no_image` message rather than substituting a generic one; without
+that, this condition is indistinguishable from "the prompt was refused" or
+"Copilot answered in prose".
+
+**Crucially, `throttling.metering` still read `ImageGeneration: 100` with the
+cap already exhausted.** That is the third independent data point (after
+`CodeInterpreter: 0` on a turn whose interpreter ran, and every value being
+static across 8 turns) that those `remainingAllowance` numbers do not mean
+availability. Anyone tempted to branch on them should read this section first.
+
+The cap's exact size was not measured — roughly a dozen images across the day's
+testing was enough to hit it, but that count includes turns from several
+separate probes and is not a controlled figure.
 
 ## Update: Vision input — the negative results and method behind it
 

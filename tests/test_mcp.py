@@ -138,7 +138,7 @@ def test_tools_list_shape(mcp_port):
     status, r = _mcp(mcp_port, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     assert status == 200
     tools = {t["name"]: t for t in r["result"]["tools"]}
-    assert set(tools) == {"ask_copilot", "describe_image"}
+    assert set(tools) == {"ask_copilot", "describe_image", "generate_image"}
     for t in tools.values():
         assert t["inputSchema"]["type"] == "object"
         assert "description" in t

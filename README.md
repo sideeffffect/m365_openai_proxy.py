@@ -153,25 +153,26 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   counting is implemented.
 - One Chathub WebSocket is opened and closed per HTTP request — no
   connection pooling or reuse.
-- **Image *understanding* works; image *generation* does not.** You can send
+- **Image *understanding* and image *generation* both work — but generation
+  has its own endpoint.** You can send
   an image and ask about it — use the OpenAI vision shape (a `user` message
   whose `content` is a parts array with an `image_url` part holding an inline
   `data:image/...;base64,...` URI) and Sydney's GPT-V reads it and answers as
   ordinary text. Only inline `data:` URIs are accepted (a remote `http(s)://`
   image URL is skipped, to avoid server-side request forgery); `tools` +
-  images in one request isn't supported. Image *generation*, by contrast,
-  isn't supported: it genuinely works on Sydney's side — it runs its
-  `image_gen` tool and produces a PNG — but streams no answer text, so such a
-  request comes back as HTTP 502 `unsupported_upstream_content` with an
-  explanation. (Previously it was reported as HTTP 429 "you're being
-  throttled, wait and retry" — which was wrong, and sent well-behaved clients
-  into a retry loop that could never succeed.) The generated file *is*
-  fetchable — that took a second Microsoft-minted token and is written up in
-  REVERSE_ENGINEERING.md — but returning it isn't implemented, because a
-  chat-completions response can only carry text: the options would be a link
-  you can't authenticate to, or megabytes of inline base64. If image output
-  is ever added, the `/mcp` endpoint (which has real image content blocks) is
-  where it belongs.
+  images in one request isn't supported.
+
+  Image *generation* works through **`POST /v1/images/generations`** (OpenAI's
+  own image endpoint) or the MCP **`generate_image`** tool — see "Generating
+  images" below. It is deliberately *not* on `/v1/chat/completions`: a
+  chat-completions response can only carry text, so asking for an image there
+  still fails (HTTP 502 `unsupported_upstream_content`), now with a message
+  pointing at the two endpoints that do return one. Two caveats worth knowing
+  up front: Copilot is *asked* for an image in an ordinary chat turn, so it can
+  decline or answer in prose instead (HTTP 502 `upstream_no_image`, carrying
+  its own wording); and there is a **daily per-account image cap** — once hit,
+  Copilot just says *"Sorry, I can't generate any more images today"* until
+  tomorrow, and its own quota block does **not** reflect it.
 - **No access to your mail, files, calendar or directory.** Probed live
   (2026-08-02) and refused in all four cases, consistent with the
   `TenantDataAccess` / `PersonalDataAccess` allowances Sydney reports as `0`.
@@ -434,6 +435,36 @@ every token exchange with Entra's newly-rotated refresh token (Entra
 invalidates the previous one on each redemption) — the other three files
 are left untouched.
 
+### Generating images (`/v1/images/generations`)
+
+```bash
+curl http://127.0.0.1:8001/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{"model": "m365-copilot", "prompt": "a red bicycle leaning on a white wall"}'
+```
+
+```jsonc
+{ "created": 1785700000,
+  "data": [ { "b64_json": "iVBORw0KGgo..." } ],
+  "output_format": "png" }
+```
+
+`prompt` is the only parameter that does anything. `n` (capped at 4) runs that
+many independent turns, since Copilot produces one image per turn and has no
+batch parameter. `response_format` must be `b64_json` — a `url` would point at
+a Microsoft host that 401s without a token this proxy holds and won't hand out,
+which is also why OpenAI's own GPT-image models return only `b64_json`.
+`size`/`quality`/`style` are accepted and ignored (Copilot exposes no such
+control), so an OpenAI client that always sends them still works.
+
+Failure modes, both normal rather than exotic — the image is *asked* for in a
+chat turn, so there is no contract that one comes back:
+
+| response | meaning |
+|---|---|
+| `502 upstream_no_image` | Copilot answered without generating an image — a prose reply, a content-policy refusal, or the **daily image cap**. Its own wording is passed through in the message. |
+| `429 upstream_throttled` | ordinary Sydney rate limiting; back off and retry |
+
 ### MCP endpoint (`/mcp`)
 
 The same server also speaks **MCP** (Model Context Protocol) at `POST /mcp`,
@@ -458,6 +489,11 @@ Two tools are exposed:
   "..."}`; asks Copilot about an inline image (the same GPT-V vision path as
   the `/v1` `image_url` content part). `prompt` defaults to *"What is in this
   image?"*.
+- **`generate_image`** — `{"prompt": "..."}`; returns the generated image as a
+  real MCP **image content block** (`{"type": "image", "data": …,
+  "mimeType": …}`) rather than a link or base64-in-text. That first-class block
+  is precisely why image output is offered here as well as on
+  `/v1/images/generations`, and not at all on `/v1/chat/completions`.
 
 Two deliberate differences from the `/v1` API, both worth knowing before you
 point a client at this:

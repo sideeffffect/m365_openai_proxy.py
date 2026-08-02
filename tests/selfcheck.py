@@ -206,7 +206,7 @@ def vision_input_extracts_and_encodes():
 @check
 def mcp_tool_surface_is_well_formed():
     tools = {t["name"]: t for t in proxy._mcp_tool_definitions()}
-    assert set(tools) == {"ask_copilot", "describe_image"}, tools
+    assert set(tools) == {"ask_copilot", "describe_image", "generate_image"}, tools
     assert tools["ask_copilot"]["inputSchema"]["required"] == ["prompt"]
     # Unknown tool -> KeyError; bad image arg -> _MCPToolError (both are how the
     # handler decides JSON-RPC-error vs isError-result).
