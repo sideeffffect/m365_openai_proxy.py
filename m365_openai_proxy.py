@@ -6,8 +6,9 @@ https://m365.cloud.microsoft's Copilot chat backend ("Sydney" / Chathub).
 It exposes the same backend two ways on one host/port: the OpenAI-style HTTP
 API (`/v1/chat/completions`, `/v1/models`) and, by default, an MCP (Model
 Context Protocol) endpoint at `POST /mcp` over the Streamable HTTP transport,
-offering `ask_copilot` and `describe_image` tools (turn it off with
---disable-mcp). See the "MCP (Model Context Protocol) layer" section below.
+offering `ask_copilot`, `describe_image` and `generate_image` tools (turn it
+off with --disable-mcp). See the "MCP (Model Context Protocol) layer" section
+below.
 
 SELF-CONTAINED: this single file uses ONLY the Python 3 standard library --
 no `pip install` of anything, ever, for any feature (including the MSAL
@@ -310,7 +311,8 @@ KNOWN LIMITATIONS
   this one proxy PROCESS (in memory, not persisted) -- restarting the proxy
   always starts cold, with every conversation falling back to fresh
   context-stuffing until it's seen once more.
-- **Image INPUT (understanding) works; image OUTPUT (generation) does not.**
+- **Image INPUT (understanding) and image OUTPUT (generation) both work --
+  but generation is NOT on `/v1/chat/completions`.**
   Send an image with the OpenAI vision shape -- a `user` message whose
   `content` is a parts array carrying an `image_url` part with an inline
   `data:image/...;base64,...` URI -- and Sydney's GPT-V reads it and answers
@@ -4693,7 +4695,8 @@ MCP_INSTRUCTIONS = (
     "Tools that relay to Microsoft 365 Copilot (Sydney). `ask_copilot` asks a "
     "question and returns Copilot's answer (it can use web search and a Python "
     "code interpreter on its side). `describe_image` asks about an image you "
-    "pass as a data: URI."
+    "pass as a data: URI. `generate_image` turns a text description into a "
+    "generated image, returned as an image content block."
 )
 
 

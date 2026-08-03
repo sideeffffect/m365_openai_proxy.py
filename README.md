@@ -481,7 +481,7 @@ header, exactly like the `/v1` API. Point any MCP client at
 }
 ```
 
-Two tools are exposed:
+Three tools are exposed:
 
 - **`ask_copilot`** — `{"prompt": "..."}`; returns Copilot's text answer (it
   may use its own web search and Python code interpreter).
