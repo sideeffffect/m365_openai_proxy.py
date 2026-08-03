@@ -4,11 +4,11 @@ m365_openai_proxy.py -- a minimal OpenAI-compatible HTTP API backed by
 https://m365.cloud.microsoft's Copilot chat backend ("Sydney" / Chathub).
 
 It exposes the same backend two ways on one host/port: the OpenAI-style HTTP
-API (`/v1/chat/completions`, `/v1/models`) and, by default, an MCP (Model
-Context Protocol) endpoint at `POST /mcp` over the Streamable HTTP transport,
-offering `ask_copilot`, `describe_image` and `generate_image` tools (turn it
-off with --disable-mcp). See the "MCP (Model Context Protocol) layer" section
-below.
+API (`/v1/chat/completions`, `/v1/models`) and an MCP (Model Context Protocol)
+endpoint at `POST /mcp` over the Streamable HTTP transport, offering
+`ask_copilot`, `describe_image` and `generate_image` tools. Both are always
+served -- neither can be turned off. See the "MCP (Model Context Protocol)
+layer" section below.
 
 SELF-CONTAINED: this single file uses ONLY the Python 3 standard library --
 no `pip install` of anything, ever, for any feature (including the MSAL
@@ -4670,7 +4670,12 @@ def _plan_chat_turn(token_cache, messages, tools, tool_choice, conversation_sess
 #
 # Same design contract as the OpenAI layer above: NO per-request auth (all the
 # Microsoft auth is handled internally from the configured credential), bind to
-# localhost. On by default; turn off with --disable-mcp.
+# localhost. ALWAYS served, with no flag to turn it off: it is one of the two
+# ways this proxy is meant to be used, not an optional extra, and an off switch
+# would be pure config surface for no benefit. It buys no security either --
+# /mcp reaches exactly the same backend, as the same single identity, with the
+# same absence of per-request auth, as the /v1 API sitting next to it on the
+# same port; disabling it protects nothing that /v1 does not already expose.
 #
 # This implements the minimal spec-compliant subset an MCP client needs to
 # discover and call tools: the `initialize` handshake, `tools/list`,
@@ -4875,14 +4880,15 @@ def _mcp_text_block(text):
     return {"type": "text", "text": text}
 
 
-def make_handler(token_cache, conversation_sessions, mcp_enabled=True):
+def make_handler(token_cache, conversation_sessions):
     """Builds a request handler class bound to one TokenCache (in turn bound
     to one CredentialStore) -- the single configured Microsoft identity this
     proxy instance speaks as -- and one ConversationSessionStore (or None if
     --disable-conversation-continuity was given).
 
-    `mcp_enabled` (default True) serves the MCP endpoint at /mcp; set False
-    (via --disable-mcp) to route /mcp to 404 exactly like any other path."""
+    Serves both surfaces unconditionally: the OpenAI-style /v1 API and the MCP
+    endpoint at /mcp (see the "MCP (Model Context Protocol) layer" section for
+    why /mcp has no off switch)."""
 
     class ProxyHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -4945,7 +4951,7 @@ def make_handler(token_cache, conversation_sessions, mcp_enabled=True):
                 )
             elif path == "/healthz" or path == "":
                 self._write_json(200, {"status": "ok"})
-            elif path == "/mcp" and mcp_enabled:
+            elif path == "/mcp":
                 # Streamable HTTP allows a GET to open a server->client SSE
                 # stream; this server never initiates messages, so it declines
                 # with 405 + Allow: POST, exactly as the spec prescribes.
@@ -4991,7 +4997,7 @@ def make_handler(token_cache, conversation_sessions, mcp_enabled=True):
         def _do_POST(self):
             path = self.path.split("?", 1)[0].rstrip("/")
             logging.debug("POST %s from %s", path, self.address_string())
-            if path == "/mcp" and mcp_enabled:
+            if path == "/mcp":
                 self._handle_mcp()
                 return
             if path == "/v1/images/generations":
@@ -5747,7 +5753,7 @@ def _log_startup_banner(args):
     )
     logging.info(
         "args: host=%s port=%d credentials_prefix=%s log_file=%s log_level=%s "
-        "init_credentials=%s disable_conversation_continuity=%s disable_mcp=%s",
+        "init_credentials=%s disable_conversation_continuity=%s",
         args.host,
         args.port,
         args.credentials_prefix,
@@ -5755,7 +5761,6 @@ def _log_startup_banner(args):
         args.log_level,
         args.init_credentials,
         args.disable_conversation_continuity,
-        args.disable_mcp,
     )
     logging.info("cwd=%s script=%s", os.getcwd(), os.path.abspath(__file__))
     logging.info("=" * 78)
@@ -5838,13 +5843,6 @@ def main():
         "enabled by default (see module docstring's 'Sydney-native conversation "
         "continuity' section); this is an escape hatch if it ever causes trouble",
     )
-    parser.add_argument(
-        "--disable-mcp",
-        action="store_true",
-        help="do not serve the MCP endpoint at /mcp. The Model Context Protocol "
-        "endpoint (Streamable HTTP) is served on the same host/port by default, "
-        "alongside the OpenAI-compatible /v1 API; pass this to turn it off",
-    )
     args = parser.parse_args()
 
     _configure_logging(args.log_file, getattr(logging, args.log_level))
@@ -5902,21 +5900,17 @@ def main():
     conversation_sessions = (
         None if args.disable_conversation_continuity else ConversationSessionStore()
     )
-    mcp_enabled = not args.disable_mcp
-    handler_cls = make_handler(
-        token_cache, conversation_sessions, mcp_enabled=mcp_enabled
-    )
+    handler_cls = make_handler(token_cache, conversation_sessions)
     server = _LoggingHTTPServer((args.host, args.port), handler_cls)
     logging.info(
         "listening on http://%s:%d (Ctrl+C to stop) -- no auth required on the API "
-        "itself; Sydney-native conversation continuity is %s; MCP endpoint at "
-        "/mcp is %s",
+        "itself; Sydney-native conversation continuity is %s; MCP endpoint served "
+        "at /mcp",
         args.host,
         args.port,
         "disabled (--disable-conversation-continuity)"
         if conversation_sessions is None
         else "enabled",
-        "enabled" if mcp_enabled else "disabled (--disable-mcp)",
     )
     try:
         server.serve_forever()

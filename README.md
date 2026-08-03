@@ -468,9 +468,10 @@ chat turn, so there is no contract that one comes back:
 ### MCP endpoint (`/mcp`)
 
 The same server also speaks **MCP** (Model Context Protocol) at `POST /mcp`,
-on the same host/port, **enabled by default** (turn it off with
-`--disable-mcp`). It uses the Streamable HTTP transport and needs no auth
-header, exactly like the `/v1` API. Point any MCP client at
+on the same host/port, **always** — it is one of the two ways this proxy is
+meant to be used, so there is no flag to turn it off. It uses the Streamable
+HTTP transport and needs no auth header, exactly like the `/v1` API. Point any
+MCP client at
 `http://127.0.0.1:8001/mcp`; for a client configured via JSON that's usually:
 
 ```json
@@ -520,7 +521,7 @@ curl http://127.0.0.1:8001/mcp -H "Content-Type: application/json" \
 
 Run `python3 m365_openai_proxy.py --help` for all flags, including
 `--host`/`--port`, `--credentials-prefix`, `--log-file`/`--log-level`,
-`--disable-conversation-continuity`, `--disable-mcp`.
+`--disable-conversation-continuity`.
 
 See `REVERSE_ENGINEERING.md` for the full protocol reverse-engineering
 writeup this implementation is based on (Chathub/SignalR wire format, the

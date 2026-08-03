@@ -8,6 +8,7 @@ error paths). See REVERSE_ENGINEERING.md / README for the surface.
 """
 
 import base64
+import inspect
 import json
 import struct
 import threading
@@ -287,7 +288,7 @@ def test_non_object_body_is_rejected(mcp_port):
 
 
 # ---------------------------------------------------------------------------
-# routing: GET 405, and --disable-mcp -> 404
+# routing: GET 405, and /mcp is served unconditionally (no off switch)
 # ---------------------------------------------------------------------------
 
 
@@ -301,14 +302,25 @@ def test_get_mcp_returns_405(mcp_port):
         assert e.headers.get("Allow") == "POST"
 
 
-def test_disable_mcp_routes_to_404(fake_token_cache):
-    handler_cls = proxy.make_handler(fake_token_cache, None, mcp_enabled=False)
+def test_mcp_cannot_be_switched_off(fake_token_cache):
+    """/mcp is part of what this proxy IS, not an optional extra.
+
+    There used to be a `--disable-mcp` flag (and an `mcp_enabled` argument
+    behind it); both are gone deliberately -- see the "MCP (Model Context
+    Protocol) layer" comment in the proxy. This guards that decision from
+    being quietly undone: `make_handler` takes no toggle, and a handler built
+    the only way there is serves /mcp."""
+    assert "mcp_enabled" not in inspect.signature(proxy.make_handler).parameters
+    assert "--disable-mcp" not in proxy.__doc__
+
+    handler_cls = proxy.make_handler(fake_token_cache, None)
     server = proxy._LoggingHTTPServer(("127.0.0.1", 0), handler_cls)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         port = server.server_address[1]
-        status, _r = _mcp(port, {"jsonrpc": "2.0", "id": 1, "method": "initialize"})
-        assert status == 404
+        status, r = _mcp(port, {"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        assert status == 200
+        assert r["result"]["serverInfo"]["name"] == "m365-copilot-proxy"
     finally:
         server.shutdown()
         server.server_close()
