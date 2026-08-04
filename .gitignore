@@ -1,5 +1,14 @@
-# Raw browser captures — these carry LIVE credentials (session cookies, bearer JWTs,
-# access_token query params) and must never be committed. Keep them local only.
+# Raw browser captures and debug artifacts — these carry LIVE credentials
+# (session cookies, bearer JWTs, access_token query params) and must never be
+# committed. Keep them local only.
+#
+# data/ is where they all live now, and it is ignored WHOLESALE rather than by
+# extension: everything dropped in there is credential-grade by assumption, so
+# a capture saved with an unanticipated name (a .txt frame dump, a .flow from
+# mitmproxy, a saved response body) is covered without anyone having to
+# remember to add a pattern first. The per-extension rules below stay as a
+# safety net for a capture saved outside data/ by accident.
+data/
 *.har
 *.log.jsonl
 request-curl.sh

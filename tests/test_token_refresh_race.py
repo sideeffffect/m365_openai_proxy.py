@@ -50,7 +50,7 @@ def harness(monkeypatch):
             rotate_calls.append(new_rt)
             current_rt["v"] = new_rt
 
-    def fake_exchange(refresh_token, oid=None, tid=None):
+    def fake_exchange(refresh_token, oid=None, tid=None, scope=None):
         # Simulate Entra: single-use. Record the redemption; redeeming the same
         # token twice is exactly the bug we're guarding against.
         with exchange_lock:

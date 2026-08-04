@@ -153,6 +153,34 @@ See the top of `m365_openai_proxy.py`'s module docstring for:
   counting is implemented.
 - One Chathub WebSocket is opened and closed per HTTP request — no
   connection pooling or reuse.
+- **Image *understanding* and image *generation* both work — but generation
+  has its own endpoint.** You can send
+  an image and ask about it — use the OpenAI vision shape (a `user` message
+  whose `content` is a parts array with an `image_url` part holding an inline
+  `data:image/...;base64,...` URI) and Sydney's GPT-V reads it and answers as
+  ordinary text. Only inline `data:` URIs are accepted (a remote `http(s)://`
+  image URL is skipped, to avoid server-side request forgery); `tools` +
+  images in one request isn't supported.
+
+  Image *generation* works through **`POST /v1/images/generations`** (OpenAI's
+  own image endpoint) or the MCP **`generate_image`** tool — see "Generating
+  images" below. It is deliberately *not* on `/v1/chat/completions`: a
+  chat-completions response can only carry text, so asking for an image there
+  still fails (HTTP 502 `unsupported_upstream_content`), now with a message
+  pointing at the two endpoints that do return one. Two caveats worth knowing
+  up front: Copilot is *asked* for an image in an ordinary chat turn, so it can
+  decline or answer in prose instead (HTTP 502 `upstream_no_image`, carrying
+  its own wording); and there is a **daily per-account image cap** — once hit,
+  Copilot just says *"Sorry, I can't generate any more images today"* until
+  tomorrow, and its own quota block does **not** reflect it.
+- **No access to your mail, files, calendar or directory.** Probed live
+  (2026-08-02) and refused in all four cases, consistent with the
+  `TenantDataAccess` / `PersonalDataAccess` allowances Sydney reports as `0`.
+  Copilot answers here as a general model, not as a grounded assistant over
+  your tenant's data. This may be a licensing artifact of the account tested
+  — see REVERSE_ENGINEERING.md's "Sydney's own capability surface, probed".
+  What *does* work: its Python code interpreter (plugin `Pyexec`) and web
+  search.
 - Sydney's own per-conversation rate limiting (the `throttling:
   {maxNumUserMessagesInConversation, ...}` field) is now **logged** once per
   turn (`Sydney throttling/quota state: used=… max=… headroom=…`) but still
@@ -407,6 +435,90 @@ every token exchange with Entra's newly-rotated refresh token (Entra
 invalidates the previous one on each redemption) — the other three files
 are left untouched.
 
+### Generating images (`/v1/images/generations`)
+
+```bash
+curl http://127.0.0.1:8001/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{"model": "m365-copilot", "prompt": "a red bicycle leaning on a white wall"}'
+```
+
+```jsonc
+{ "created": 1785700000,
+  "data": [ { "b64_json": "iVBORw0KGgo..." } ],
+  "output_format": "png" }
+```
+
+`prompt` is the only parameter that does anything. `n` (capped at 4) runs that
+many independent turns, since Copilot produces one image per turn and has no
+batch parameter. `response_format` must be `b64_json` — a `url` would point at
+a Microsoft host that 401s without a token this proxy holds and won't hand out,
+which is also why OpenAI's own GPT-image models return only `b64_json`.
+`size`/`quality`/`style` are accepted and ignored (Copilot exposes no such
+control), so an OpenAI client that always sends them still works.
+
+Failure modes, both normal rather than exotic — the image is *asked* for in a
+chat turn, so there is no contract that one comes back:
+
+| response | meaning |
+|---|---|
+| `502 upstream_no_image` | Copilot answered without generating an image — a prose reply, a content-policy refusal, or the **daily image cap**. Its own wording is passed through in the message. |
+| `429 upstream_throttled` | ordinary Sydney rate limiting; back off and retry |
+
+### MCP endpoint (`/mcp`)
+
+The same server also speaks **MCP** (Model Context Protocol) at `POST /mcp`,
+on the same host/port, **always** — it is one of the two ways this proxy is
+meant to be used, so there is no flag to turn it off. It uses the Streamable
+HTTP transport and needs no auth header, exactly like the `/v1` API. Point any
+MCP client at
+`http://127.0.0.1:8001/mcp`; for a client configured via JSON that's usually:
+
+```json
+{
+  "mcpServers": {
+    "m365-copilot": { "type": "http", "url": "http://127.0.0.1:8001/mcp" }
+  }
+}
+```
+
+Three tools are exposed:
+
+- **`ask_copilot`** — `{"prompt": "..."}`; returns Copilot's text answer (it
+  may use its own web search and Python code interpreter).
+- **`describe_image`** — `{"image": "data:image/png;base64,...", "prompt":
+  "..."}`; asks Copilot about an inline image (the same GPT-V vision path as
+  the `/v1` `image_url` content part). `prompt` defaults to *"What is in this
+  image?"*.
+- **`generate_image`** — `{"prompt": "..."}`; returns the generated image as a
+  real MCP **image content block** (`{"type": "image", "data": …,
+  "mimeType": …}`) rather than a link or base64-in-text. That first-class block
+  is precisely why image output is offered here as well as on
+  `/v1/images/generations`, and not at all on `/v1/chat/completions`.
+
+Two deliberate differences from the `/v1` API, both worth knowing before you
+point a client at this:
+
+- **Each MCP tool call is a single, independent turn** — there is no
+  multi-turn memory here. The `/v1` API infers continuity by fingerprinting
+  the `messages[]` array a client resends, which has no equivalent when the
+  caller is a model invoking a tool. (Threading an explicit conversation id
+  through the tool schema would be the natural fix, and is additive whenever
+  it's wanted.)
+- **No `tools` parameter, on purpose.** An MCP client already has its own
+  real tool-calling loop driven by its own model; asking Copilot to *also*
+  emulate one inside a tool call would nest two loops and route the result
+  back as plain text. Copilot is a leaf here. Tool-calling emulation stays a
+  `/v1`-only feature — see the module docstring.
+
+A quick smoke test with `curl` (the `initialize` handshake, then a tool call):
+
+```bash
+curl http://127.0.0.1:8001/mcp -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"ask_copilot","arguments":{"prompt":"hello"}}}'
+```
+
 Run `python3 m365_openai_proxy.py --help` for all flags, including
 `--host`/`--port`, `--credentials-prefix`, `--log-file`/`--log-level`,
 `--disable-conversation-continuity`.
@@ -417,16 +529,22 @@ FOCI token-family auth chain, the MSAL cache-encryption algorithm, etc).
 `tests/` holds the network-free test suite (`pytest`), which drives the
 proxy's real HTTP handler with `run_chat_turn` stubbed out so it needs no
 live credentials or quota — `test_continuity.py`, `test_throttle_429.py`,
-`test_throttling_quota.py`, and `test_token_refresh_race.py` cover the
-conversation-continuity, throttle-harmonization, quota-block logging, and
-token-refresh-race wiring respectively.
+`test_throttling_quota.py`, `test_generated_content.py`,
+`test_token_refresh_race.py`, `test_vision_input.py`, and `test_mcp.py` cover
+the conversation-continuity, throttle-harmonization, quota-block logging,
+non-text-content/capability, token-refresh-race, vision-input (image
+understanding), and MCP-endpoint wiring respectively.
 `scripts/` holds live, credential-requiring dev probes (**not** automated
 tests): `probe_conversation_reuse.py` (confirms a reused `ConversationId`
 carries real server-side memory), `dump_frames.py` (raw SignalR frame dump,
-used to find the rate-limit handling gap), and `probe_local_mcp.py` (the live
+used to find the rate-limit handling gap), `probe_local_mcp.py` (the live
 probe that confirmed Sydney's Local MCP handshake on the wire and pinned down
 the tool-surfacing blocker — see the "Local MCP tool-calling bridge" section
-of REVERSE_ENGINEERING.md). See REVERSE_ENGINEERING.md for what each one found.
+of REVERSE_ENGINEERING.md), and `probe_sydney_capabilities.py` (drives one
+turn per suspected capability and reports what actually fires on the wire —
+what found the metering capability list, Sydney's native `tool_calls`, and
+the image-reported-as-throttling bug). See REVERSE_ENGINEERING.md for what
+each one found.
 None of them are part of the shipped proxy or required to run it — and, per
 `AGENTS.md`, unlike the proxy itself they may use any Python tooling/libraries.
 

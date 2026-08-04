@@ -186,10 +186,14 @@ sections below are where that lives.
   agent generates exactly this kind of request burst).
 - **Not actually in this repo**: none of the `.har` capture files or
   `Chathub.log.jsonl` referenced throughout this document were ever committed
-  (they carry live session cookies/tokens and are `.gitignore`d) — this
-  document is the durable record of what they showed, not a pointer to files
-  you can go re-read locally unless you made your own captures during
-  development.
+  (they carry live session cookies/tokens) — this document is the durable
+  record of what they showed, not a pointer to files you can go re-read
+  locally unless you made your own captures during development. By
+  convention they live in **`data/`**, which is `.gitignore`d wholesale
+  precisely so that any capture dropped there is credential-safe by default,
+  whatever it happens to be named. Filenames cited below (e.g.
+  `m365.cloud.microsoft_Archive [26-07-18 16-50-48].har`) are therefore
+  `data/<name>` on a machine that has them.
 
 ---
 
@@ -3080,3 +3084,508 @@ The summary renders **every** key in the block, not a known-key list —
 `numLongDocSummaryUserMessagesInConversation` is the concrete precedent for
 why: a hardcoded list would have silently dropped the one genuinely new thing
 this measurement found.
+
+## Update: Sydney's own capability surface, probed (2026-08-02) — a real capability list, native `tool_calls`, and no tenant grounding
+
+Everything below is from `scripts/probe_sydney_capabilities.py`, which drives
+one Chathub turn per suspected capability (each in its own fresh
+`ConversationId`) and records what actually fires on the wire, rather than
+asking Copilot what it can do. Eight probes, one real M365 Copilot account.
+
+The question it set out to answer — *what tools does Sydney offer?* — turns
+out to have three different answers depending on which direction you look.
+
+### 1. What the CLIENT declares (not an advertisement)
+
+`optionsSets` (~29 flags), `plugins: [{"Id": "BingWebSearch", "Source":
+"BuiltIn"}]` and `allowedMessageTypes` (~30) all travel client→server in the
+`chat` invocation, and are already documented above. This is the proxy
+telling Sydney what to enable. Sydney does not answer with a menu.
+
+### 2. What Sydney sends back: `throttling.metering` — 15 named capabilities
+
+Every turn's **type-2 StreamItem** carries a `throttling` block that is a
+strict superset of the one on the type-1 `update` frames documented in the
+v0.12.0 section above. Only this one has `metering`:
+
+```json
+"metering": {
+  "LLMOnly":            {"remainingAllowance": 100},
+  "ImageGeneration":    {"remainingAllowance": 100},
+  "WXPAgentMode":       {"remainingAllowance": 7},
+  "FileReference":      {"remainingAllowance": 3},
+  "TenantDataAccess":   {"remainingAllowance": 0},
+  "PersonalDataAccess": {"remainingAllowance": 0},
+  "CodeInterpreter":    {"remainingAllowance": 0},
+  "ImageAnalysis":      {"remainingAllowance": 0},
+  "VisualCreator":      {"remainingAllowance": 0},
+  "GraphicArt":         {"remainingAllowance": 0},
+  "DeepResearch":       {"remainingAllowance": 0},
+  "DeepWork":           {"remainingAllowance": 0},
+  "CopilotTuning":      {"remainingAllowance": 0},
+  "NotebookCowork":     {"remainingAllowance": 0},
+  "CostQuota":          {"remainingAllowance": 0}
+}
+```
+
+This is the closest thing to a capability manifest Sydney puts on the wire,
+and it is why v0.12.0's quota logging — which read the `update` frames only —
+never saw it.
+
+**Do not read an allowance as availability.** Two measurements say the
+numbers do not mean what they look like:
+
+1. `CodeInterpreter` read **0** on the very turn whose code interpreter
+   demonstrably ran and returned a correct answer (sum of primes below 1000 =
+   76127, with the Python source echoed back).
+2. Every value was **byte-identical across 8 consecutive turns** — `LLMOnly`
+   stayed 100, `ImageGeneration` stayed 100 — rather than counting down.
+
+So the *names* are solid evidence of a real capability taxonomy; the
+*numbers* are not yet interpretable. The proxy logs them and never branches
+on them.
+
+### 3. What actually fires
+
+| capability | wire evidence | works? |
+|---|---|---|
+| **`python`** (plugin id **`Pyexec`**) | `pluginInfo: {"id": "Pyexec", "source": "BuiltIn", "version": "1.0", "isGraphConnectorPluginType": false, "isThirdPartyPluginSource": false}` on the StreamItem, plus `GeneratedCode` entries | ✅ correct result |
+| **`web.run`** | `searchQueries: ["BBC News homepage"]` — the actual query it issued | ⚠️ invoked, fetch failed |
+| **`image_gen`** | a native function call (below) + `contentGenerationProgressList` | ⚠️ invoked, output unreachable |
+| mail / files / calendar / directory | 4 of 4 explicit refusals | ❌ |
+
+`pluginInfo`'s two booleans are themselves informative: they imply a plugin
+taxonomy with **Graph-connector** and **third-party** plugin sources that
+this account simply has none of.
+
+### The big one: Sydney emits REAL, native, OpenAI-shaped `tool_calls`
+
+The image turn put this on the wire, in a `Progress` entry's `invocation`
+field (doubly JSON-encoded — a JSON string holding an array of JSON strings):
+
+```json
+{"function": {"name": "image_gen", "arguments": "{\"orientation\":\"landscape\"}"},
+ "id": "call_zvq9VI82lh3kvZdNlbDl5c", "type": "function"}
+```
+
+That is **exactly** OpenAI's `tool_calls` entry shape, `call_`-prefixed id and
+all. This directly disproves the claim that stood in the proxy's own module
+docstring until now:
+
+> Sydney has no native OpenAI-style `tools`/`tool_calls` mechanism this proxy
+> can use
+
+It has one, and it is running. What remains unknown is whether a
+**client-declared** tool can be registered into that namespace — the Local MCP
+bridge documented earlier in this file is the obvious candidate mechanism.
+That question is now the highest-value open thread in this project: the entire
+two-convention prompt-steering emulation exists because this machinery was
+believed absent. Nothing has been changed on the strength of it yet; the proxy
+only logs these invocations (`_native_invocation_names`).
+
+### No tenant grounding on this path
+
+Four probes — mail, OneDrive/SharePoint files, calendar, directory/manager —
+produced four explicit refusals ("I can't access your mailbox because I don't
+have permission or a mail connector available in this chat"). This is
+consistent with `TenantDataAccess: 0` and `PersonalDataAccess: 0`, though
+given finding (2) above the metering values are corroboration, not proof.
+
+This matters for scoping: "Copilot as an M365 tenant-data oracle" is not
+something this proxy can currently offer, and any feature premised on it
+(an MCP server exposing mail/file/calendar search, say) would be advertising
+capabilities that provably do not work. **Caveat:** one account, one tenant,
+one license — this may well be a licensing artifact, and a differently
+licensed tenant could behave completely differently.
+
+Self-report, recorded for corroboration only (models confabulate tool lists):
+`python`, `web.run`, `image_gen`, `record_memory`, `canmore_create_textdoc`,
+`container.exec`, `container.download`, `container.open_image`,
+`api_tool_skills.list_resources`, `api_tool_skills.read_resource`,
+`multi_tool_use.parallel`. Three are independently confirmed on the wire,
+which makes the list credible without making it evidence.
+
+### The bug this found: image generation was reported as rate limiting
+
+Sydney's image generation *works*. It invokes `image_gen`, streams
+`Loading image` progress entries carrying a `contentGenerationProgressList`,
+and finishes with `status: 2` and a real `ImageReferenceUrls` link to a PNG.
+What it never streams is **answer text**.
+
+So the turn completed with `total_length=0 chars`, which
+`_looks_like_throttled_empty_reply` — correctly, for its own purposes — could
+not distinguish from the silent empty-completion throttle. Live, before the
+fix:
+
+```
+HTTP 429  {"type": "upstream_throttled",
+           "message": "...Microsoft is temporarily throttling this account
+                       after a burst of requests -- wait a bit and try again."}
+```
+
+Every part of that was wrong: nothing was throttled, and waiting changes
+nothing — the identical request fails identically forever, so a
+well-behaved client that honors 429 by backing off and retrying loops
+indefinitely.
+
+**Can the image be delivered instead?** The first answer here was *no, it
+needs the browser's Office (OHP) cookie session* — and that was **WRONG**.
+It has since been disproven live — see the "Fetching a generated image"
+section below, which fetches the PNG successfully with a bearer token and no
+cookie at all.
+
+What was actually observed at the time: the `ImageReferenceUrls` link
+(`designerapp.officeapps.live.com/designerapp/document.ashx?...`) returns
+**HTTP 401 both anonymously and with this proxy's own Sydney bearer token**.
+That much is true and reproducible. The error was the inference drawn from
+it — "401 for our bearer token, therefore it must want cookies". In fact it
+wants a *different bearer token*: one minted from the very same FOCI refresh
+token for the `designerappservice.officeapps.live.com` resource, plus a
+`filetoken` header. Worth recording as a methodology lesson: two failing auth
+attempts do not enumerate the auth space, and the "Consolidated: the
+authentication situation" section's cookie-vs-bearer split made the wrong
+answer feel well-founded.
+
+Delivering the image is therefore **possible but not implemented** — see
+"Fetching a generated image" for exactly what it would take, and why the
+reporting fix below is still the right behavior in a text-only API.
+
+The fix is therefore accurate reporting, not delivery: `stream_chat_reply`
+now notices generated non-text content and raises `UnsupportedContentError`,
+surfaced as **HTTP 502 `unsupported_upstream_content`** with a message that
+says explicitly that this is not a rate limit and retrying will not help. A
+genuinely empty reply — no generated content — still surfaces as 429, since
+there the "back off and retry" advice is correct.
+
+## Update: Vision input — image *understanding* works (2026-08-02)
+
+Image *generation* (above) can't be delivered without the browser cookie
+session. Image **understanding** — uploading an image and asking Sydney about
+it ("what is on this image?") — is the mirror-image case, and it **does**
+work end-to-end through this proxy's own bearer token, with no cookie
+session. It is now wired to the OpenAI-standard `image_url` content part and
+was verified live (solid red/green/blue PNGs each described correctly,
+streaming and non-streaming).
+
+Reverse-engineered from a real browser session (`data/har1.har`, the turn
+*"what is on this image?"*, plus the `UploadFile` POST in the
+`26-08-02 15-06-28` capture). Two steps:
+
+**1. Upload the image to substrate's `UploadFile`.**
+
+```
+POST https://substrate.office.com/m365Copilot/UploadFile
+Authorization: Bearer <the SAME Sydney/Chathub token this proxy already mints>
+X-AnchorMailbox: Oid:<oid>@<tid>
+X-Scenario: OfficeWebIncludedCopilot
+X-Variants: feature.EnableImageSupportInUploadFile
+Content-Type: multipart/form-data; boundary=...
+
+  scenario       = UploadImage
+  conversationId = <the ConversationId the chat turn will run under>
+  FileBase64     = data:image/png;base64,iVBORw0KGgo...      (the WHOLE data URI)
+  optionsSets    = cwcgptvsan
+  optionsSets    = flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch
+  optionsSets    = gptvnorm2048
+
+→ 200 { "docId": "0-weu-d9-<hash>", "fileType": ".png",
+        "fileSanitizer": "ImageSanitizerBingAI", ... }
+```
+
+Two non-obvious things cost real debugging time and are load-bearing:
+
+- **`X-Variants: feature.EnableImageSupportInUploadFile` is required.** Without
+  it the endpoint feature-gates image upload off and returns an **empty
+  HTTP 403** — no body, no hint.
+- **`FileBase64` is a plain text form field carrying the *entire*
+  `data:<mime>;base64,<...>` data URI string** — despite the field name it is
+  neither raw bytes nor bare base64. Send raw bytes or strip the `data:`
+  prefix and the server's sanitizer rejects it with
+  `{"fileSanitizer":"None","result":{"value":"InvalidRequest"}}` (HTTP 400).
+  The `fileSanitizer:"None"` in that error is the tell: the server never
+  recognized the payload as an image. Conveniently, the OpenAI `image_url`
+  value is already exactly this data URI, so it's forwarded verbatim.
+
+  How this was pinned down, since it is not guessable and the HAR shows the
+  field only as an opaque blob: **arithmetic on the capture**. The browser's
+  `FileBase64` field was 716,422 chars while the server echoed back
+  `fileSize: 716400` — a difference of exactly 22, which is precisely
+  `len("data:image/png;base64,")`. That ruled out both bare base64 and raw
+  bytes before a single request was sent. (Note the echoed `fileSize` is the
+  *base64* length minus the prefix, not the decoded byte count.)
+
+**2. Reference the upload from the ordinary `chat` turn.** The turn is
+unchanged except that the user `message` carries a `messageAnnotations` entry
+naming the `docId`:
+
+```json
+"messageAnnotations": [
+  { "id": "0-weu-d9-<hash>",
+    "messageAnnotationType": "ImageFile",
+    "messageAnnotationMetadata": {
+      "@type": "File", "annotationType": "File",
+      "fileType": "png", "fileName": "image_1.png" } }
+]
+```
+
+The `optionsSets` that make Sydney actually *look* at the attachment
+(`cwcfluxgptv`, `gptvnorm2048`,
+`flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch`) are already in this
+proxy's `OPTIONS_SETS`, so nothing else about the invocation changes. The
+reply is ordinary streamed text and flows back through `stream_chat_reply`
+untouched.
+
+**Proxy surface.** Callers use the OpenAI vision shape unchanged — a `user`
+message whose `content` is a parts array with an `image_url` part
+(`{"url": "data:image/png;base64,..."}`). Only inline `data:` URIs are
+accepted; an `http(s)://` image URL is skipped with a warning, because
+fetching an arbitrary caller-supplied URL server-side is a request-forgery
+footgun the proxy avoids. Images are attached to the **latest user turn**;
+`tools` + images is not supported in one request (the emulated tool-calling
+path runs its own turns) and logs a warning. See `upload_image_to_sydney`,
+`_extract_message_images`, and `tests/test_vision_input.py`.
+
+## Update: Fetching a generated image — SOLVED, and it needs no cookie (2026-08-02)
+
+This section supersedes the "Can the image be delivered instead?" claim above.
+Image **output** — downloading the PNG Sydney's `image_gen` produces — is a
+solved problem on the wire, and is now **implemented**: see "This is now
+implemented — and where" at the end of this section.
+
+It was solved by reverse-engineering the `26-08-02 15-06-28` HAR and then
+verified end-to-end live against a real account. This section records the
+mechanism in full, including the controls, because the throwaway probe that
+proved it (`scripts/probe_image_io.py`) has been deleted — everything it knew
+is written down here.
+
+### Where the image lives
+
+A completed image turn's `contentGenerationProgressList` entry carries
+`status: 2` and an `ImageReferenceUrls[0]` of this shape (~490 chars):
+
+```
+https://designerapp.officeapps.live.com/designerapp/document.ashx
+  ?path=%2F<guid>%2FDallEGeneratedImages%2Fdalle-<guid><digits>.png
+  &dcHint=WestEurope            # or FranceCentral, etc. -- the storage region
+  &speCId=<guid>
+  &speType=Image
+  &speIdx=0
+  &fileToken=<base64 JSON>      # NOTE: must be MOVED to a header, see below
+```
+
+`fileToken` base64-decodes to a small JSON object:
+
+```json
+{"TokenPrefix": "AAD-<guid>",
+ "UserObjectId": "<oid>",
+ "ClientName": "CopilotSydney"}
+```
+
+The `AAD-` prefix is the tell that got this solved: it says the endpoint
+expects an **AAD bearer token**, not a cookie session. The CORS preflight
+says the same thing outright —
+`access-control-allow-headers: authorization,filetoken`.
+
+### The token: one more FOCI resource
+
+The browser mints a *separate* access token for this host, from the **same
+FOCI refresh token** that mints the Sydney/Chathub one. Extend the resource
+list in the "one refresh token, redeemed across 3 client_ids and 10
+resources" section above with:
+
+```
+POST login.microsoftonline.com/{tenant}/oauth2/v2.0/token
+    ?brk_client_id=4765445b-32c6-49b0-83e6-1d93765276ca
+    &brk_redirect_uri=https://m365.cloud.microsoft/spalanding
+    &client_id=c0ab8ce9-e9a0-42e7-b064-33d422df41f1
+  grant_type=refresh_token
+  client_id=c0ab8ce9-e9a0-42e7-b064-33d422df41f1
+  redirect_uri=brk-multihub://outlook.office.com
+  scope=https://designerappservice.officeapps.live.com/.default openid profile offline_access
+```
+
+**Every parameter except `scope` is byte-identical to the Sydney token
+request this proxy already makes** (`exchange_refresh_token`) — same
+`client_id`, same `brk_client_id`/`brk_redirect_uri`, same `redirect_uri`,
+same MSAL telemetry fields. Implementing image fetch is therefore a
+one-parameter change to that function, not new auth machinery.
+
+Response (live): `expires_in` 4091, `refresh_token_expires_in` 86300, and
+
+```
+scope: https://designerappservice.officeapps.live.com/designerappservice.all
+       https://designerappservice.officeapps.live.com/.default
+access_token: 2556 chars, FIVE dot-separated parts
+```
+
+Five parts means it is a **JWE (encrypted), not a JWT** — the JOSE header
+decodes to `{"alg":"RSA-OAEP","enc":"A128CBC-HS256","zip":"DEF", ...}`, so
+the audience is not inspectable client-side. Do not try to parse its claims;
+`jwt_claims()` will fail on it.
+
+⚠️ **Each redemption ROTATES the shared refresh token.** Anything minting this
+token must persist the rotation (`CredentialStore.rotate()`) exactly as the
+proxy does at runtime, and must never run concurrently with another
+redemption of the same credential — otherwise the credential is destroyed and
+has to be re-captured from the browser.
+
+### The fetch, and the controls that pin it down
+
+Strip `fileToken` out of the query string and send it as a `filetoken`
+**header**; send the access token as `Authorization`. Live results, one real
+generated image (`scripts/probe_image_io.py image_out`, since deleted):
+
+| attempt | result |
+|---|---|
+| bare `Authorization: <jwe>` + `filetoken:` header | **HTTP 200, `image/png`, 2,693,151 bytes, valid PNG signature** |
+| `Authorization: Bearer <jwe>` (control) | **200** — the `Bearer ` prefix is *optional*; the HAR's cookie-less bare value is not load-bearing |
+| `filetoken` header omitted (control) | **HTTP 400** — the header IS required |
+
+Both controls matter. The first kills the theory that the browser's unusual
+bare-`Authorization` spelling was significant; the second proves the
+`filetoken` header is not redundant with the token.
+
+### This is now implemented — and where
+
+Shipped as `fetch_generated_image()` + `generate_image()`, exposed on **`POST
+/v1/images/generations`** (OpenAI's own image endpoint, whose response format
+is base64 image data) and the MCP **`generate_image`** tool (which returns a
+real MCP image content block).
+
+Deliberately NOT on `/v1/chat/completions`: a chat-completions response can
+only carry text, so the options there would be a markdown link to a URL the
+caller cannot authenticate to, or inlining megabytes of base64 into `content`.
+An image-only chat turn therefore still surfaces as HTTP 502
+`unsupported_upstream_content` — its message now points at the two endpoints
+that do return the image, instead of (wrongly) claiming the file is
+unreachable.
+
+Two implementation notes that matter more than they look:
+
+- **The second token audience shares ONE refresh lock.** `TokenCache` is now
+  keyed by scope, but its `_refresh_lock` is deliberately *not* per-scope: the
+  refresh token is single-use and every redemption rotates it, so two scopes
+  redeeming concurrently would get the second rejected as `invalid_grant` *and*
+  race each other's `CredentialStore.rotate()` writes — corrupting the
+  credential file badly enough to need a fresh browser capture. A per-scope
+  lock would reintroduce exactly the bug the single lock exists to prevent.
+- **The fetch asserts the host before sending anything.** `ImageReferenceUrls`
+  is server-supplied, and this is the only place the proxy attaches a real
+  access token to a URL it did not construct, so the host must equal
+  `DESIGNER_HOST` and redirects are refused (a followed redirect would silently
+  invalidate the assertion). The `fileToken` is treated as a secret: never
+  logged, and never echoed into an error message.
+
+### A daily image-generation cap exists, and metering does not reflect it
+
+Found by exhausting it during this work. Once hit, an image request comes back
+as an ordinary prose answer:
+
+> Sorry, I can't generate any more images today. Try again tomorrow, or ask me
+> to find similar images on the web instead.
+
+That is Sydney's *only* signal — no error frame, no `turnState: "Failed"`, no
+distinct `messageType`. So the proxy passes Sydney's own wording through in its
+`502 upstream_no_image` message rather than substituting a generic one; without
+that, this condition is indistinguishable from "the prompt was refused" or
+"Copilot answered in prose".
+
+**Crucially, `throttling.metering` still read `ImageGeneration: 100` with the
+cap already exhausted.** That is the third independent data point (after
+`CodeInterpreter: 0` on a turn whose interpreter ran, and every value being
+static across 8 turns) that those `remainingAllowance` numbers do not mean
+availability. Anyone tempted to branch on them should read this section first.
+
+The cap's exact size was not measured — roughly a dozen images across the day's
+testing was enough to hit it, but that count includes turns from several
+separate probes and is not a controlled figure.
+
+## Update: Vision input — the negative results and method behind it
+
+The "Vision input" section above documents the mechanism that works. This
+records what was ruled out on the way there, so nobody re-derives it — this
+too lived only in the deleted probe.
+
+### Guess-proof test methodology
+
+Asking "what colour is this?" is a weak test: a model can guess a colour and
+be right by luck. The probe generated PNGs with a **pure-stdlib writer** (a
+5x7 bitmap font rasterized into a `zlib`-compressed IDAT — no Pillow, so it
+runs anywhere the proxy does) rendering a **random 4-digit number**, then
+asked Sydney to read it back and string-matched the exact digits. A model
+cannot guess 4 digits at 1-in-10,000, so a hit is proof it genuinely
+processed the pixels.
+
+Two traps that this found, both worth remembering:
+
+- **A 4-digit number on white looks exactly like a CAPTCHA.** One run got
+  *"Sorry, I can't help solve or transcribe a CAPTCHA"* — which is a content
+  refusal, i.e. the mechanism **worked** and the test read as a failure.
+  Later runs used solid colour bands / solid-colour PNGs to remove the
+  confound.
+- The `fileName` in the annotation metadata is free-form: an arbitrary name
+  works exactly as well as the server-generated one, confirmed by running
+  both.
+
+### `conversationId` alone is NOT enough (and nine shapes that don't work)
+
+Uploading an image bound to a `conversationId` and then chatting on that same
+`ConversationId` gets a flat **`NO IMAGE`**. The binding is not implicit; the
+chat invocation must carry an explicit reference.
+
+Before the real answer was recovered from a Chrome WebSocket capture, nine
+candidate payload shapes were swept live by injecting extra fields into the
+proxy's own serialized `chat` frame. **All nine missed** (each got
+`NO IMAGE`):
+
+`message.imageUrl` = docId · `message.imageUrl` = a Bing blob URL ·
+`message.imageUrl` + `message.originalImageUrl` · `message.fileInfo` ·
+`message.attachedFileInfo` · `arg.fileInfo` · `message.attachments[]` ·
+`message.imageUrl` + the `cwcgptvsan` optionsSet · `message.documentReferences[]`
+
+The answer — `message.messageAnnotations[]` with
+`messageAnnotationType: "ImageFile"` — is in the "Vision input" section. The
+lesson: guessing field names against this protocol has a poor hit rate, and
+the `docId` appears in **no** subsequent HTTP request, so only a WebSocket
+capture could settle it. **Firefox HAR exports do not record WebSocket
+payloads; Chrome DevTools exports do** (`_webSocketMessages`) — that
+difference is what unblocked it.
+
+### Reproducing any of this
+
+No dedicated probe script is kept anymore; both halves are reproducible from
+the shipped code plus a few lines:
+
+- **image in** — just use the proxy: send an OpenAI `image_url` content part
+  with a `data:` URI (see the "Vision input" section and
+  `tests/test_vision_input.py`).
+- **image out** — three steps, all on shipped code plus a few lines:
+  1. **Get the URL from the RAW FRAMES, not from the log.** Drive one image
+     turn with `open_chathub()` / `send_chat_message()` / `SignalRBuffer`
+     (`scripts/dump_frames.py` is exactly this, with its prompt changed) and
+     read `messages[].contentGenerationProgressList[].ImageReferenceUrls[]`.
+
+     ⚠️ An earlier version of this recipe said to pull the URL out of
+     `m365_openai_proxy.log` at DEBUG. **That does not work and never did** —
+     measured on 2026-08-02, a DEBUG log of the exact turn that produced an
+     image contains *zero* occurrences of `designerapp`,
+     `ImageReferenceUrls`, or `fileToken`. `_note_generated_content` only
+     tallies generated-content *kinds* (`image x3`); it deliberately never
+     logs the item, and it should stay that way — the `fileToken` is an
+     access-granting capability for that file, so logging it verbatim would
+     break this project's "never log secrets" rule (see the module
+     docstring's LOGGING section).
+  2. Mint the designer token by calling `exchange_refresh_token()` with
+     `SYDNEY_SCOPE` temporarily swapped for the designer scope above, and
+     **persist the rotation with `CredentialStore.rotate()`** — not optional.
+  3. GET the URL with `fileToken` moved out of the query string and into a
+     `filetoken` header.
+
+  Re-verified end to end on 2026-08-02 after the probe script was deleted,
+  precisely to confirm the deletion lost nothing: raw frames → URL on
+  `designerapp.officeapps.live.com`, scope swap → a 2513-char 5-part JWE, and
+  the fetch → **HTTP 200, `image/png`, 3,217,818 bytes, valid PNG**, with both
+  controls reproducing (the `Bearer ` prefix optional, the `filetoken` header
+  required — omitting it still gives 400).
+- **raw frames** — `scripts/dump_frames.py` still dumps every SignalR frame
+  of one turn, which is what most of this document was built from.
